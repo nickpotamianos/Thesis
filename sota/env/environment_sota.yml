@@ -6,7 +6,6 @@ dependencies:
   - torchvision
   - torchaudio
   - pyg   # PyTorch Geometric, for future GNN
-  - gtsam
   - numpy
   - scipy
   - pandas
@@ -14,6 +13,8 @@ dependencies:
   - tqdm
   - matplotlib
   - scikit-learn
-  - wandb
   - tensorboard
   - jupyter
+  - pip:
+    - gtsam==4.2.0
+    - wandb

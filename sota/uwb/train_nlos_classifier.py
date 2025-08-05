@@ -6,6 +6,7 @@ from sota.uwb.models.cnn_nlos import Conv1dTiny
 import argparse, pathlib
 
 def train(exp_name):
+    torch.backends.cudnn.benchmark = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
@@ -15,7 +16,7 @@ def train(exp_name):
     ds_val   = TensorDataset(torch.from_numpy(d["X_val"]).float(),
                              torch.from_numpy(d["y_cls_val"]).long())
     net = Conv1dTiny(2).to(device)
-    opt = optim.AdamW(net.parameters(), 1e-3)
+    opt = optim.AdamW(net.parameters(), 2e-3, weight_decay=1e-2)
     ce  = nn.CrossEntropyLoss()
     for epoch in range(30):
         net.train()

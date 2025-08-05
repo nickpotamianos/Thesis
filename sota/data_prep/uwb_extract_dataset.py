@@ -17,32 +17,39 @@ def merge_cir_and_range(cir_df, rng_df, max_dt=0.05):
     cir = cir_df[["timestamp", "from_id", "to_id", "cir"]].copy()
     rng = rng_df[["timestamp", "from_id", "to_id", "range", "gt_range"]].copy()
 
-    # we need them sorted for merge_asof
-    cir = cir.sort_values("timestamp")
-    rng = rng.sort_values("timestamp")
+    # add symmetric copy of rng so that (from,to) or (to,from) both match
+    rng_s = rng.rename(columns={"from_id": "to_id", "to_id": "from_id"})
+    rng_all = pd.concat([rng, rng_s], ignore_index=True).sort_values("timestamp")
 
-    # merge within each (from,to) pair independently
+    # delay correction
+    import pickle, pathlib as _pl
+    _delay = pickle.load(open("config/uwb/uwb_calib.pickle","rb"))["delays"]
+    def _delay_correct(f_id, t_id, r):
+        return r - (_delay[f_id] + _delay[t_id])
+
+    pairs = cir.groupby(["from_id", "to_id"])
     merged_chunks = []
-    for (f, t), cir_pair in cir.groupby(["from_id", "to_id"]):
-        if (f, t) not in rng.groupby(["from_id", "to_id"]).groups:
+    for (f, t), cir_pair in pairs:
+        sub_rng = rng_all[(rng_all["from_id"] == f) & (rng_all["to_id"] == t)]
+        if sub_rng.empty:
             continue
-        rng_pair = rng[(rng["from_id"] == f) & (rng["to_id"] == t)]
         m = pd.merge_asof(
-            rng_pair,
-            cir_pair,
+            cir_pair.sort_values("timestamp"),
+            sub_rng,
             on="timestamp",
             by=["from_id", "to_id"],
             direction="nearest",
             tolerance=max_dt,
-        )
-        m = m.dropna(subset=["cir"])  # rows without a nearby CIR
+        ).dropna(subset=["range"])
+        
+        if not m.empty:
+            # apply delay correction
+            m["range_dc"] = m.apply(
+                lambda r: _delay_correct(r["from_id"], r["to_id"], r["range"]),
+                axis=1)
         merged_chunks.append(m)
 
-    if not merged_chunks:
-        return pd.DataFrame()
-
-    merged = pd.concat(merged_chunks, ignore_index=True)
-    return merged.reset_index(drop=True)
+    return pd.concat(merged_chunks, ignore_index=True) if merged_chunks else pd.DataFrame()
 
 
 def build(exp_name: str, exp_root: str | None = None, max_dt: float = 0.05):
@@ -59,12 +66,23 @@ def build(exp_name: str, exp_root: str | None = None, max_dt: float = 0.05):
         cir_df = robot["uwb_cir"]
         rng_df = robot["uwb_range"]
 
-        merged = merge_cir_and_range(cir_df, rng_df, max_dt=max_dt)
+        # adaptive tolerance to handle clock offsets
+        merged = None
+        for tol in (0.05, 0.10, 0.20, 0.40):          # seconds
+            merged = merge_cir_and_range(cir_df, rng_df, max_dt=tol)
+            if len(merged) / len(rng_df) > 0.60:       # keep ≥60 % ?
+                print(f"  ✓ tolerance {tol:0.2f}s gives {len(merged)} matches")
+                break
+            print(f"    tolerance {tol:0.2f}s only {len(merged)} matches")
+        else:
+            print(f"[warn] even 0.4 s tolerance gives few matches → keeping anyway")
+
         if merged.empty:
             print(f"[warn] 0 matches in robot {robot_id}")
             continue
 
-        merged["bias"] = merged["range"] - merged["gt_range"]
+        # use delay-corrected range for bias calculation
+        merged["bias"] = merged["range_dc"] - merged["gt_range"]
         merged["nlos"] = (merged["bias"].abs() > 0.15).astype(np.int8)
         samples.append(merged[["cir", "bias", "nlos"]])
 
@@ -80,7 +98,7 @@ def build(exp_name: str, exp_root: str | None = None, max_dt: float = 0.05):
 
     # build numpy arrays ----------------------------------------------------
     X = np.stack(full["cir"].apply(lambda s: np.asarray(eval(s), dtype=np.float32)[:128]))
-    y_bias = full["bias"].values.astype(np.float32)
+    y_bias = np.clip(full["bias"].values.astype(np.float32), -0.5, 0.5)
     y_cls = full["nlos"].values.astype(np.int8)
 
     # train/val/test split 70‑15‑15 stratified on LOS/NLOS
