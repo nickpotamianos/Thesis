@@ -8,6 +8,7 @@ Welcome to the MILUV devkit page. This Python devkit provides useful functions a
 - [Getting started with MILUV](#getting-started-with-MILUV)
     - [Setting up the dataset](#setting-up-the-dataset)
     - [Examples](#examples)
+- [SotA Pipeline](#sota-pipeline)
 - [Wiki](#wiki)
 - [License](#license)
 
@@ -78,6 +79,55 @@ data_at_timestamps = mv.data_from_timestamps(
     sensors,
 )
 ```
+
+## SotA Pipeline
+
+This repository now includes a complete **State-of-the-Art (SotA) pipeline** implementation in the `sota/` directory. This pipeline integrates:
+
+- **UWB Range Correction**: CNN-based NLOS detection and bias regression
+- **Deep IMU Odometry**: RepILN implementation for inertial navigation
+- **Factor Graph Optimization**: Custom factors with GTSAM backend
+
+### Quick Start with SotA Pipeline
+
+1. **Setup environment**:
+   ```bash
+   conda env create -f sota/env/environment_sota.yml
+   conda activate miluv-sota
+   ```
+
+2. **Train all models**:
+   ```bash
+   # On Windows
+   .\sota\scripts\run_training_all.ps1
+   
+   # On Linux/Mac
+   ./sota/scripts/run_training_all.sh
+   ```
+
+3. **Run online demo**:
+   ```bash
+   # On Windows  
+   .\sota\scripts\run_online_demo.ps1
+   
+   # On Linux/Mac
+   ./sota/scripts/run_online_demo.sh
+   ```
+
+### SotA Pipeline Structure
+```
+sota/
+├── README.md              # Quick-start guide
+├── env/
+│   └── environment_sota.yml
+├── data_prep/             # Dataset extraction
+├── uwb/                   # UWB ML front-end
+├── imu/                   # Deep-IMU odometry
+├── factor_graph/          # Factor graph core
+└── scripts/               # Training and demo scripts
+```
+
+For detailed information, see `sota/README.md`.
 
 ## Wiki
 For more information regarding the MILUV development kit, please refer to the [documentation](https://decargroup.github.io/miluv/).

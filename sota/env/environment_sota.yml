@@ -1,0 +1,19 @@
+name: miluv-sota
+channels: [conda-forge, pytorch]
+dependencies:
+  - python=3.10
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pyg   # PyTorch Geometric, for future GNN
+  - gtsam
+  - numpy
+  - scipy
+  - pandas
+  - pyyaml
+  - tqdm
+  - matplotlib
+  - scikit-learn
+  - wandb
+  - tensorboard
+  - jupyter
