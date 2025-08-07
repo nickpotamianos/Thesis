@@ -8,48 +8,57 @@ import argparse, pathlib, numpy as np, pandas as pd
 from miluv.data import DataLoader
 
 
-def merge_cir_and_range(cir_df, rng_df, max_dt=0.05):
+def merge_cir_and_range(cir_df: pd.DataFrame,
+                        rng_df: pd.DataFrame,
+                        max_dt: float = 0.12) -> pd.DataFrame:
     """
-    Returns dataframe with columns:
-        timestamp, from_id, to_id, cir, range, gt_range
+    Return a table with aligned (CIR, range, gt_range).
+    Handles both      (from,to)  and  (to,from)
+    and allows |Δt| ≤ max_dt  (default 120 ms).
     """
-    # keep only columns we care about
     cir = cir_df[["timestamp", "from_id", "to_id", "cir"]].copy()
     rng = rng_df[["timestamp", "from_id", "to_id", "range", "gt_range"]].copy()
 
-    # add symmetric copy of rng so that (from,to) or (to,from) both match
-    rng_s = rng.rename(columns={"from_id": "to_id", "to_id": "from_id"})
-    rng_all = pd.concat([rng, rng_s], ignore_index=True).sort_values("timestamp")
+    # ------------------------------------------------------------------ #
+    # 1) make every table direction‑agnostic by adding a swapped copy
+    def _swap(df, extra_cols=None):
+        cols = ["timestamp", "from_id", "to_id"] + (extra_cols or [])
+        out = df[cols].copy()
+        out[["from_id", "to_id"]] = out[["to_id", "from_id"]]
+        return out
 
-    # delay correction
-    import pickle, pathlib as _pl
-    _delay = pickle.load(open("config/uwb/uwb_calib.pickle","rb"))["delays"]
-    def _delay_correct(f_id, t_id, r):
-        return r - (_delay[f_id] + _delay[t_id])
+    cir_all = pd.concat([cir, _swap(cir, ["cir"])], ignore_index=True)
+    rng_all = pd.concat([rng, _swap(rng, ["range", "gt_range"])], ignore_index=True)
 
-    pairs = cir.groupby(["from_id", "to_id"])
-    merged_chunks = []
-    for (f, t), cir_pair in pairs:
-        sub_rng = rng_all[(rng_all["from_id"] == f) & (rng_all["to_id"] == t)]
-        if sub_rng.empty:
+    cir_all = cir_all.sort_values("timestamp")
+    rng_all = rng_all.sort_values("timestamp")
+
+    # ------------------------------------------------------------------ #
+    # 2) merge_asof within each *unordered* pair (min(id),max(id))
+    cir_all["pair_key"] = list(zip(cir_all[["from_id", "to_id"]]
+                                        .min(axis=1),
+                                   cir_all[["from_id", "to_id"]]
+                                        .max(axis=1)))
+    rng_all["pair_key"] = list(zip(rng_all[["from_id", "to_id"]]
+                                        .min(axis=1),
+                                   rng_all[["from_id", "to_id"]]
+                                        .max(axis=1)))
+
+    merged = []
+    for key, cir_grp in cir_all.groupby("pair_key"):
+        rng_grp = rng_all[rng_all["pair_key"] == key]
+        if rng_grp.empty:
             continue
-        m = pd.merge_asof(
-            cir_pair.sort_values("timestamp"),
-            sub_rng,
-            on="timestamp",
-            by=["from_id", "to_id"],
-            direction="nearest",
-            tolerance=max_dt,
-        ).dropna(subset=["range"])
-        
-        if not m.empty:
-            # apply delay correction
-            m["range_dc"] = m.apply(
-                lambda r: _delay_correct(r["from_id"], r["to_id"], r["range"]),
-                axis=1)
-        merged_chunks.append(m)
+        m = pd.merge_asof(cir_grp, rng_grp,
+                          on="timestamp",
+                          direction="nearest",
+                          tolerance=max_dt,
+                          suffixes=("_cir", "_rng"))
+        m = m.dropna(subset=["range", "cir"])
+        merged.append(m)
 
-    return pd.concat(merged_chunks, ignore_index=True) if merged_chunks else pd.DataFrame()
+    return (pd.concat(merged, ignore_index=True)
+            if merged else pd.DataFrame())
 
 
 def build(exp_name: str, exp_root: str | None = None, max_dt: float = 0.05):
@@ -80,6 +89,17 @@ def build(exp_name: str, exp_root: str | None = None, max_dt: float = 0.05):
         if merged.empty:
             print(f"[warn] 0 matches in robot {robot_id}")
             continue
+
+        # delay correction
+        import pickle
+        _delay = pickle.load(open("config/uwb/uwb_calib.pickle","rb"))["delays"]
+        def _delay_correct(f_id, t_id, r):
+            return r - (_delay[f_id] + _delay[t_id])
+
+        # apply delay correction - use _rng suffixed columns from merge
+        merged["range_dc"] = merged.apply(
+            lambda row: _delay_correct(row["from_id_rng"], row["to_id_rng"], row["range"]),
+            axis=1)
 
         # use delay-corrected range for bias calculation
         merged["bias"] = merged["range_dc"] - merged["gt_range"]

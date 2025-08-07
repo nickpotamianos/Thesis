@@ -60,3 +60,5 @@ prompt-toolkit==3.0.43
 asttokens==2.4.1
 importlib_resources==6.4.0
 wcwidth==0.2.13
+gtsam
+scikit-learn
