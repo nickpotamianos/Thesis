@@ -11,6 +11,10 @@ from sota.uwb.infer_uwb          import UwbML
 from sota.factor_graph.range_factory_std import RangeFactoryStd
 from sota.factor_graph.utils_io  import ensure_dir, save_estimates, save_graph_values   ### NEW
 
+def frd_to_flu(v):
+    """PX4 FRD -> FLU (keep x, flip y and z). Works for accel and gyro."""
+    return np.array([v[0], -v[1], -v[2]], dtype=float)
+
 def _get_anchor_pos(anchors_dict, anchor_id):
     """
     Return a (3,) float64 numpy array or None.
@@ -80,7 +84,7 @@ class FGCoordinator:
         self.exp  = exp
         self.save_dir = save_dir                               ### NEW
         self.packet_counter = 0                                ### NEW
-        self.mv   = DataLoader(exp, exp_dir="./data/three_robots", cir=True, height=False)   # height unused for now
+        self.mv   = DataLoader(exp, exp_dir="./data/three_robots", cir=True, height=False)   # height unused for now   
         print(f"DataLoader created successfully")
         print(f"Available robots: {list(self.mv.data.keys())}")
         
@@ -93,7 +97,33 @@ class FGCoordinator:
                 print(f"  Anchor {k}: {old_shape} -> {self.mv.anchors[k].shape}, value: {self.mv.anchors[k]}")
         else:
             print("No anchors found in dataset")
-                
+            
+        # Complete initialization
+        self.__init_rest__()
+
+    def _estimate_initial_orientation(self, ridx: int, seconds: float = 0.5) -> gtsam.Rot3:
+        """
+        Estimate roll/pitch from the average accelerometer (gravity) of the first
+        'seconds' seconds. Assumes IMU is FRD; we convert to FLU first.
+        """
+        name = list(self.mv.data.keys())[ridx]
+        imu_df = self.mv.data[name]["imu_px4"].sort_values("timestamp")
+        t0 = float(imu_df["timestamp"].iloc[0])
+        window = imu_df[imu_df["timestamp"] <= t0 + seconds]
+
+        ax = window["linear_acceleration.x"].to_numpy().mean()
+        ay = window["linear_acceleration.y"].to_numpy().mean()
+        az = window["linear_acceleration.z"].to_numpy().mean()
+        a = frd_to_flu(np.array([ax, ay, az], dtype=float))  # now FLU
+
+        # Expected at rest (FLU, z up): a ≈ [0, 0, -g]
+        # Roll/pitch that align body z with world z:
+        roll  = np.arctan2(a[1], a[2])
+        pitch = np.arctan2(-a[0], np.sqrt(a[1]**2 + a[2]**2))
+        yaw   = 0.0
+        return gtsam.Rot3.Ypr(yaw, pitch, roll)  # GTSAM uses Y,P,R order here
+        
+    def __init_rest__(self):
         # IMU pre‑integration parameters (calibrated once)
         print("=== SETTING UP IMU PRE-INTEGRATION ===")
         imu_params = gtsam.PreintegrationParams.MakeSharedU(9.81)
@@ -117,8 +147,8 @@ class FGCoordinator:
             print(f"  Robot {r}: IMU preintegrator initialized")
         
         print("=== SETTING UP UWB ML FRONTEND ===")
-        self.rng_factory = RangeFactoryStd(UwbML(exp))          # pre‑trained CNNs
-        print(f"RangeFactoryStd created for experiment: {exp}")
+        self.rng_factory = RangeFactoryStd(UwbML(self.exp))          # pre‑trained CNNs
+        print(f"RangeFactoryStd created for experiment: {self.exp}")
         
         # Debug: check what anchors are loaded
         print("=== ANCHOR SUMMARY ===")
@@ -158,10 +188,82 @@ class FGCoordinator:
         k0 = 0
         for ridx, robot in enumerate(self.mv.data.keys()):
             k = POSE_KEY(ridx, k0)
-            print(f"  Robot {ridx} ({robot}): pose key = {k}")
-            self.values.insert(k, gtsam.Pose3())             # identity
-            self.graph.add(gtsam.PriorFactorPose3(k,
-                         gtsam.Pose3(), prior_noise))
+            R0 = self._estimate_initial_orientation(ridx)    # <- NEW
+            P0 = gtsam.Pose3(R0, gtsam.Point3(0, 0, 0))
+            print(f"  Robot {ridx} ({robot}): pose key = {k}, init tilt from accel")
+            self.values.insert(k, P0)
+            self.graph.add(gtsam.PriorFactorPose3(k, P0, prior_noise))
+            print(f"    Added pose prior factor for robot {ridx}")
+
+        # velocity and bias priors
+        print("=== ADDING VELOCITY AND BIAS PRIORS ===")
+        for ridx in range(3):
+            vel_key = VEL_KEY(ridx,0)
+            bias_key = BIAS_KEY(ridx,0)
+            print(f"  Robot {ridx}: vel_key = {vel_key}, bias_key = {bias_key}")
+            
+            self.values.insert( vel_key, np.zeros(3) )
+            self.values.insert( bias_key, gtsam.imuBias.ConstantBias() )
+            
+            v_noise = gtsam.noiseModel.Isotropic.Sigma(3, 1e-3)
+            b_noise = gtsam.noiseModel.Isotropic.Sigma(6, 1e-3)
+            
+            self.graph.add(gtsam.PriorFactorVector( vel_key, np.zeros(3), v_noise))
+            self.graph.add(gtsam.PriorFactorConstantBias( bias_key,
+                                                          gtsam.imuBias.ConstantBias(),
+                                                          b_noise))
+            print(f"    Added velocity and bias priors for robot {ridx}")
+
+        print(f"Initial graph size: {self.graph.size()} factors")
+        print(f"Initial values size: {self.values.size()} variables")
+
+        # bookkeeping
+        self.last_key = {r: k0 for r in range(3)}
+        print(f"Initial last_key mapping: {self.last_key}")
+        
+        print("=== BUILDING TIMELINE ===")
+        self.iterator   = self._make_timeline()
+        print("Timeline iterator created")
+        print("=== INITIALIZATION COMPLETE ===\n")
+            for k, v in self.mv.anchors.items():
+                print(f"  Anchor {k}: {v} (type: {type(v)}, shape: {v.shape})")
+        
+        print("=== SETTING UP FACTOR GRAPH ===")
+        self.graph  = gtsam.NonlinearFactorGraph()
+        self.values = gtsam.Values()
+        self.isam   = gtsam.ISAM2()
+
+        # Load anchors into the factory (creates Point3 variables with tight priors)
+        if self.mv.anchors:
+            print("Loading anchors into RangeFactoryStd...")
+            # Convert anchors to the required format: dict[int, np.ndarray]
+            anchors_xyz = {}
+            for aid, pos in self.mv.anchors.items():
+                anchors_xyz[aid] = np.asarray(pos, dtype=float).reshape(3)
+            
+            self.rng_factory.load_anchors(
+                self.graph,      # NonlinearFactorGraph
+                self.values,     # gtsam.Values (initial values container)
+                anchors_xyz=anchors_xyz
+            )
+            print(f"Loaded {len(anchors_xyz)} anchors as Point3 variables with tight priors")
+        else:
+            print("No anchors found - skipping anchor setup")
+        print("GTSAM objects created: NonlinearFactorGraph, Values, ISAM2")
+
+        # --- priors -------------------------------------------------------
+        print("=== ADDING POSE PRIORS ===")
+        prior_noise = gtsam.noiseModel.Diagonal.Sigmas(
+            np.array([1e-3]*6))                              # pose6d
+        print(f"Prior noise model: {prior_noise}")
+        k0 = 0
+        for ridx, robot in enumerate(self.mv.data.keys()):
+            k = POSE_KEY(ridx, k0)
+            R0 = self._estimate_initial_orientation(ridx)    # <- NEW
+            P0 = gtsam.Pose3(R0, gtsam.Point3(0, 0, 0))
+            print(f"  Robot {ridx} ({robot}): pose key = {k}, init tilt from accel")
+            self.values.insert(k, P0)
+            self.graph.add(gtsam.PriorFactorPose3(k, P0, prior_noise))
             print(f"    Added pose prior factor for robot {ridx}")
 
         # velocity and bias priors
@@ -321,12 +423,15 @@ class FGCoordinator:
         # integrate one raw measurement into the running pre‑integrator
         if self.prev_imu_t[r] is not None:
             dt = pkt["timestamp"] - self.prev_imu_t[r]
-            accel = np.array([pkt["linear_acceleration.x"],
-                              pkt["linear_acceleration.y"],
-                              pkt["linear_acceleration.z"]])
-            gyro = np.array([pkt["angular_velocity.x"],
-                             pkt["angular_velocity.y"],
-                             pkt["angular_velocity.z"]])
+            accel_frd = np.array([pkt["linear_acceleration.x"],
+                                  pkt["linear_acceleration.y"],
+                                  pkt["linear_acceleration.z"]], dtype=float)
+            gyro_frd  = np.array([pkt["angular_velocity.x"],
+                                  pkt["angular_velocity.y"],
+                                  pkt["angular_velocity.z"]], dtype=float)
+
+            accel = frd_to_flu(accel_frd)   # <- FIX
+            gyro  = frd_to_flu(gyro_frd)    # <- FIX
             
             if r == 0 and self.preint[r].deltaTij() < 0.1:  # Debug first robot, first few measurements
                 print(f"      IMU integration robot {r}: dt={dt:.6f}, accel={accel}, gyro={gyro}")
@@ -401,12 +506,21 @@ class FGCoordinator:
             raise
 
         # reset pre‑integrator for next window
-        self.preint[r].resetIntegrationAndSetBias(imuBias.ConstantBias())
+        # self.preint[r].resetIntegrationAndSetBias(imuBias.ConstantBias())
         self.last_key[r] = k_new
         print(f"      IMU factor creation complete for robot {r}, new last_key: {k_new}")
         
         # Flush graph to ISAM2 after completing IMU factor
         self._flush_graph()
+        
+        # After flushing we can read the latest bias estimate safely
+        try:
+            est_vals = self.isam.calculateEstimate()
+            b_est = est_vals.atConstantBias(bias_key_new)
+        except Exception:
+            b_est = gtsam.imuBias.ConstantBias()
+
+        self.preint[r].resetIntegrationAndSetBias(b_est)
 
     # add range factor -----------------------------------------------------
     def _handle_uwb(self, pkt):
