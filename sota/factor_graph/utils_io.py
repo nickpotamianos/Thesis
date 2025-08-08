@@ -113,41 +113,6 @@ def save_graph_values(graph: gtsam.NonlinearFactorGraph,
         _values_save_txt(values, values_path.with_suffix(".txt"))
 
 # --------- export final ISAM2 estimates to CSV ------------------------------
-def save_estimates(isam: gtsam.ISAM2, csv_path: str | os.PathLike) -> None:
-    csv_path = pathlib.Path(csv_path)
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-
-    values = isam.calculateEstimate()
-    if values.size() == 0:
-        print("[save_estimates] WARNING – ISAM2 has no variables")
-        return
-
-    with csv_path.open("w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["key","sym","idx","x","y","z","qx","qy","qz","qw"])
-
-        for k in values.keys():
-            try:
-                pose: gtsam.Pose3 = values.atPose3(k)
-            except RuntimeError:
-                continue
-
-            s = gtsam.Symbol(k)
-            try:
-                _c = s.chr()
-                sym_char = chr(_c) if isinstance(_c, int) else _c
-                sym_idx  = s.index()
-            except AttributeError:
-                txt = str(s); m = re.search(r"([A-Za-z])\s*,?\s*(\d+)", txt)
-                sym_char, sym_idx = (m.group(1), int(m.group(2))) if m else ("?", 0)
-
-            t = pose.translation(); q = pose.rotation().toQuaternion()
-            w.writerow([k, sym_char, sym_idx,
-                        t.x(), t.y(), t.z(),
-                        q.x(), q.y(), q.z(), q.w()])
-    print(f"[save_estimates] wrote {csv_path.resolve()}")
-
-# --------------------------------------------------------------------------- #
 def save_estimates(isam: gtsam.ISAM2,
                    csv_path: str | os.PathLike) -> None:
     """

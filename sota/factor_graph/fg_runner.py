@@ -11,6 +11,16 @@ from sota.uwb.infer_uwb          import UwbML
 from sota.factor_graph.range_factory_std import RangeFactoryStd
 from sota.factor_graph.utils_io  import ensure_dir, save_estimates, save_graph_values   ### NEW
 
+# put near the top of fg_runner.py
+def frd_to_flu(v):
+    """PX4 FRD -> FLU (keep x, flip y and z). Works for accel and gyro."""
+    return np.array([v[0], -v[1], -v[2]], dtype=float)
+
+def _tag_to_robot(tag_id: int):
+    """Map 10/20/30 → robot 0/1/2. Return None if not a robot tag."""
+    base = (tag_id // 10) * 10
+    return {10: 0, 20: 1, 30: 2}.get(base, None)
+
 def _get_anchor_pos(anchors_dict, anchor_id):
     """
     Return a (3,) float64 numpy array or None.
@@ -40,12 +50,10 @@ def _get_anchor_pos(anchors_dict, anchor_id):
     return a
 
 # ----------------------------------------------------------------------
-def fuse_range_and_cir(robot_table, max_dt=0.05):
+def fuse_range_and_cir(robot_table, max_dt=0.15, return_unfused=False):
     """
-    Return a DataFrame that contains   timestamp, from_id, to_id,
-    range, gt_range, cir    – i.e. every range sample augmented with
-    the closest CIR sample that has the *same link direction* and is
-    within ±max_dt seconds (default 50 ms).
+    Merge UWB range with closest CIR within ±max_dt (s), direction-aware.
+    If return_unfused=True, also return the range rows that had no CIR match.
     """
     rng = robot_table["uwb_range"][["timestamp",
                                     "from_id", "to_id",
@@ -57,7 +65,7 @@ def fuse_range_and_cir(robot_table, max_dt=0.05):
     rng = rng.sort_values("timestamp")
     cir = cir.sort_values("timestamp")
 
-    fused = pd.merge_asof(
+    merged = pd.merge_asof(
         rng, cir,
         on       = "timestamp",
         by       = ["from_id", "to_id"],
@@ -65,24 +73,29 @@ def fuse_range_and_cir(robot_table, max_dt=0.05):
         direction= "nearest"
     )
 
-    # drop rows where no CIR was found
-    fused = fused.dropna(subset=["cir"])
+    fused = merged.dropna(subset=["cir"])
+    if not return_unfused:
+        return fused
 
-    return fused
+    rng_only = merged[merged["cir"].isna()].drop(columns=["cir"])
+    return fused, rng_only
 
 POSE_KEY   = lambda r, k: gtsam.symbol(chr(ord('P') + r), k)   # P,Q,R
 VEL_KEY    = lambda r, k: gtsam.symbol(chr(ord('V') + r), k)   # V,W,X
 BIAS_KEY   = lambda r, k: gtsam.symbol(chr(ord('B') + r), k)   # B,C,D
 
 class FGCoordinator:
-    def __init__(self, exp, save_dir=None):                    ### NEW
+    def __init__(self, exp, save_dir=None, cir_dt=0.15, uwb_sigma=0.25):                    ### NEW
         print(f"=== INITIALIZING FGCoordinator for experiment: {exp} ===")
         self.exp  = exp
         self.save_dir = save_dir                               ### NEW
+        self.cir_dt = cir_dt                                   ### NEW
+        self.uwb_sigma = uwb_sigma                             ### NEW
         self.packet_counter = 0                                ### NEW
-        self.mv   = DataLoader(exp, exp_dir="./data/three_robots", cir=True, height=False)   # height unused for now
+        self.mv   = DataLoader(exp, exp_dir="data/three_robots", cir=True, height=False)   # height unused for now
         print(f"DataLoader created successfully")
         print(f"Available robots: {list(self.mv.data.keys())}")
+        print(f"Using CIR tolerance: {self.cir_dt}s, UWB sigma: {self.uwb_sigma}m")
         
         # flatten all anchor vectors in place
         if self.mv.anchors:
@@ -96,25 +109,39 @@ class FGCoordinator:
                 
         # IMU pre‑integration parameters (calibrated once)
         print("=== SETTING UP IMU PRE-INTEGRATION ===")
-        imu_params = gtsam.PreintegrationParams.MakeSharedU(9.81)
-        imu_params.setGyroscopeCovariance(
-            np.eye(3)* (0.015**2))      # rad²/s²
-        imu_params.setAccelerometerCovariance(
-            np.eye(3)* (0.019**2))      # (m/s²)²
-        imu_params.setIntegrationCovariance(
-            np.eye(3)* (0.0001**2))
-        print(f"IMU params created with gravity: {9.81}")
-        print(f"Gyro covariance: {0.015**2}")
-        print(f"Accel covariance: {0.019**2}")
+        # --- IMU preintegration params (Combined) ---
+        g = 9.81
+        params = gtsam.PreintegrationCombinedParams.MakeSharedU(g)  # gravity magnitude; -Z in world
 
-        self.preint      = {}
-        self.prev_imu_t  = {}
+        # Not all builds have setGravityVector; MakeSharedU already sets gravity.
+        if hasattr(params, "setGravityVector"):
+            params.setGravityVector(np.array([0.0, 0.0, -g], dtype=float))
+
+        # Sensor noise (tune to your IMU)
+        params.setAccelerometerCovariance(np.eye(3) * (0.03**2))   # (m/s^2)^2
+        params.setGyroscopeCovariance(np.eye(3) * (0.002**2))      # (rad/s)^2
+        params.setIntegrationCovariance(np.eye(3) * ((1e-3)**2))   # be explicit with parentheses
+
+        # Bias random walk (some older wrappers miss one or more; guard them)
+        if hasattr(params, "setBiasAccCovariance"):
+            params.setBiasAccCovariance(np.eye(3) * 1e-4)
+        if hasattr(params, "setBiasOmegaCovariance"):
+            params.setBiasOmegaCovariance(np.eye(3) * 1e-6)
+        if hasattr(params, "setBiasAccOmegaIntCovariance"):
+            params.setBiasAccOmegaIntCovariance(np.eye(6) * 1e-5)
+
+        print(f"Combined IMU params created with gravity: {g}")
+        print(f"Gyro covariance: {0.002**2}")
+        print(f"Accel covariance: {0.03**2}")
+
+        # Initializers per robot
+        self.preint = {}
+        self.prev_imu_t = {}
+        self.body_is_frd = {0: True, 1: True, 2: True}
         for r in range(3):
-            self.preint[r]     = PreintegratedImuMeasurements(
-                                    imu_params,
-                                    imuBias.ConstantBias())
+            self.preint[r] = gtsam.PreintegratedCombinedMeasurements(params, imuBias.ConstantBias())
             self.prev_imu_t[r] = None
-            print(f"  Robot {r}: IMU preintegrator initialized")
+            print(f"  Robot {r}: Combined IMU preintegrator initialized")
         
         print("=== SETTING UP UWB ML FRONTEND ===")
         self.rng_factory = RangeFactoryStd(UwbML(exp))          # pre‑trained CNNs
@@ -130,7 +157,20 @@ class FGCoordinator:
         print("=== SETTING UP FACTOR GRAPH ===")
         self.graph  = gtsam.NonlinearFactorGraph()
         self.values = gtsam.Values()
-        self.isam   = gtsam.ISAM2()
+        
+        # Create ISAM2 with more conservative parameters for numerical stability
+        params = gtsam.ISAM2Params()
+        if hasattr(gtsam.ISAM2Params, 'QR'):
+            params.setFactorization(gtsam.ISAM2Params.QR)
+        if hasattr(params, 'setRelinearizeThreshold'):
+            params.setRelinearizeThreshold(0.01)   # smaller threshold for more frequent relinearization
+        elif hasattr(params, 'relinearizeThreshold'):
+            params.relinearizeThreshold = 0.01
+        if hasattr(params, 'setRelinearizeSkip'):
+            params.setRelinearizeSkip(1)           # relinearize every update
+        elif hasattr(params, 'relinearizeSkip'):
+            params.relinearizeSkip = 1
+        self.isam = gtsam.ISAM2(params)
 
         # Load anchors into the factory (creates Point3 variables with tight priors)
         if self.mv.anchors:
@@ -152,16 +192,29 @@ class FGCoordinator:
 
         # --- priors -------------------------------------------------------
         print("=== ADDING POSE PRIORS ===")
-        prior_noise = gtsam.noiseModel.Diagonal.Sigmas(
-            np.array([1e-3]*6))                              # pose6d
-        print(f"Prior noise model: {prior_noise}")
+        
+        def pose_prior_noise(t_sigma=0.5, rp_sigma=0.05, yaw_sigma=np.pi/3):
+            """Create pose prior noise with different sigmas for translation and rotation."""
+            # [roll, pitch, yaw, x, y, z]
+            sig = np.array([rp_sigma, rp_sigma, yaw_sigma, t_sigma, t_sigma, t_sigma], float)
+            return gtsam.noiseModel.Diagonal.Sigmas(sig)
+        
         k0 = 0
         for ridx, robot in enumerate(self.mv.data.keys()):
             k = POSE_KEY(ridx, k0)
-            print(f"  Robot {ridx} ({robot}): pose key = {k}")
-            self.values.insert(k, gtsam.Pose3())             # identity
-            self.graph.add(gtsam.PriorFactorPose3(k,
-                         gtsam.Pose3(), prior_noise))
+            R0 = self._estimate_initial_orientation(ridx)    # <- NEW
+            P0 = gtsam.Pose3(R0, gtsam.Point3(0, 0, 0))
+            
+            # Robot 0 gets tight prior, others get looser priors to avoid conflicts with ranges
+            if ridx == 0:
+                prior_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([1e-3]*6))  # tight
+                print(f"  Robot {ridx} ({robot}): TIGHT pose prior, key = {k}")
+            else:
+                prior_noise = pose_prior_noise(t_sigma=1.0, rp_sigma=0.05, yaw_sigma=np.pi/3)  # looser
+                print(f"  Robot {ridx} ({robot}): SOFT pose prior, key = {k}")
+            
+            self.values.insert(k, P0)
+            self.graph.add(gtsam.PriorFactorPose3(k, P0, prior_noise))
             print(f"    Added pose prior factor for robot {ridx}")
 
         # velocity and bias priors
@@ -193,7 +246,76 @@ class FGCoordinator:
         print("=== BUILDING TIMELINE ===")
         self.iterator   = self._make_timeline()
         print("Timeline iterator created")
+        
+        print("=== BOOTSTRAP: committing priors & anchors to ISAM2 ===")
+        self._flush_graph()           # pushes pose/vel/bias priors and anchor priors
+        print("=== BOOTSTRAP DONE ===")
         print("=== INITIALIZATION COMPLETE ===\n")
+
+    def _estimate_initial_orientation(self, ridx: int, seconds: float = 0.5) -> gtsam.Rot3:
+        """
+        Estimate roll/pitch from the average accelerometer (gravity) of the first
+        'seconds' seconds. Assumes IMU is FRD; we convert to FLU first.
+        """
+        name = list(self.mv.data.keys())[ridx]
+        imu_df = self.mv.data[name]["imu_px4"].sort_values("timestamp")
+        t0 = float(imu_df["timestamp"].iloc[0])
+        window = imu_df[imu_df["timestamp"] <= t0 + seconds]
+
+        ax = window["linear_acceleration.x"].to_numpy().mean()
+        ay = window["linear_acceleration.y"].to_numpy().mean()
+        az = window["linear_acceleration.z"].to_numpy().mean()
+        a_raw = np.array([ax, ay, az], dtype=float)
+
+        # Convert PX4 FRD -> FLU
+        a = self._maybe_convert(a_raw, is_gyro=False, robot=ridx)
+
+        # FLU at rest: a ≈ [0, 0, -g]
+        roll  = np.arctan2(a[1], -a[2])                           # <-- sign fix
+        pitch = np.arctan2(a[0],  np.sqrt(a[1]**2 + a[2]**2))     # <-- sign fix
+        yaw   = 0.0
+        return gtsam.Rot3.Ypr(yaw, pitch, roll)  # GTSAM uses Y,P,R order here
+
+    def _maybe_convert(self, v, is_gyro=False, robot=0):
+        if self.body_is_frd[robot]:
+            return frd_to_flu(v)  # x, -y, -z
+        return v
+
+    def _isam_has(self, key):
+        """Check if ISAM2 already contains a variable with this key."""
+        try:
+            return self.isam.calculateEstimate().exists(key)
+        except Exception:
+            return False
+
+    def _keys_in_factors(self, graph):
+        """Extract all keys referenced by factors in the graph."""
+        ks = set()
+        for i in range(graph.size()):
+            f = graph.at(i)
+            klist = f.keys()
+            # Handle both KeyVector and list types
+            if hasattr(klist, 'size'):
+                for j in range(klist.size()):
+                    ks.add(int(klist.at(j)))
+            else:
+                for key in klist:
+                    ks.add(int(key))
+        return ks
+
+    def _keys_in_values(self, values):
+        """Extract all keys present in the values container."""
+        ks = set()
+        it = values.keys()
+        # Handle KeyVector iteration
+        try:
+            for j in range(len(it)):
+                ks.add(int(it[j]))
+        except:
+            # Fallback for different GTSAM versions
+            for key in it:
+                ks.add(int(key))
+        return ks
 
     def _flush_graph(self):
         """
@@ -204,6 +326,18 @@ class FGCoordinator:
             return                                             # nothing to do
 
         print(f"    Flushing graph with {self.graph.size()} factors, {self.values.size()} values to ISAM2")
+        
+        # Connectivity check: verify all factors reference known variables
+        ks_graph = self._keys_in_factors(self.graph)
+        ks_values = self._keys_in_values(self.values)
+        try:
+            ks_isam = set(int(k) for k in self.isam.calculateEstimate().keys())
+        except Exception:
+            ks_isam = set()
+
+        unknown = ks_graph - (ks_isam | ks_values)
+        if unknown:
+            print("WARNING: factors reference keys unknown to ISAM and not in this batch:", unknown)
         
         # 1) update ISAM2
         self.isam.update(self.graph, self.values)
@@ -247,12 +381,21 @@ class FGCoordinator:
 
             # ----------  UWB  (range + CIR)  ---------------------------------
             print(f"      Fusing UWB range and CIR data...")
-            uwb = fuse_range_and_cir(rob)           # <‑‑ new helper
-            uwb["sensor"] = "uwb"
+            fused, rng_only = fuse_range_and_cir(rob, max_dt=self.cir_dt, return_unfused=True)
+
+            uwb = fused.copy()
+            uwb["sensor"] = "uwb"                # fused with CIR
             uwb["robot"]  = ridx
-            print(f"      UWB fused packets: {len(uwb)}")
-            total_uwb_packets += len(uwb)
+            print(f"      UWB fused (with CIR): {len(uwb)}")
             rows.append(uwb)
+
+            uwb_ro = rng_only.copy()
+            uwb_ro["sensor"] = "uwb_range_only"  # range-only fallback
+            uwb_ro["robot"]  = ridx
+            print(f"      UWB range-only (no CIR): {len(uwb_ro)}")
+            rows.append(uwb_ro)
+
+            total_uwb_packets += len(uwb) + len(uwb_ro)
 
         print(f"  Timeline summary:")
         print(f"    Total IMU packets: {total_imu_packets}")
@@ -288,16 +431,18 @@ class FGCoordinator:
                 if imu_count <= 5:  # Detailed debug for first few IMU packets
                     print(f"    IMU packet {imu_count}: robot={pkt['robot']}, t={pkt['timestamp']:.6f}")
                 self._handle_imu(pkt)
-            else:
+            elif pkt["sensor"] in ["uwb", "uwb_range_only"]:
                 uwb_count += 1
                 if uwb_count <= 5:  # Detailed debug for first few UWB packets
-                    print(f"    UWB packet {uwb_count}: robot={pkt['robot']}, from={pkt['from_id']}, to={pkt['to_id']}, range={pkt['range']:.3f}")
+                    print(f"    UWB packet {uwb_count}: robot={pkt['robot']}, from={pkt['from_id']}, to={pkt['to_id']}, range={pkt['range']:.3f}, type={pkt['sensor']}")
                 try:
                     self._handle_uwb(pkt)
                 except Exception as e:
                     print(f"    ERROR in _handle_uwb: {e}")
                     print(f"    Packet details: {pkt}")
                     raise
+            else:
+                print(f"    Unknown sensor type: {pkt['sensor']}, skipping")
             
             # incremental optimisation - removed from here, now done in _flush_graph()
             
@@ -321,15 +466,22 @@ class FGCoordinator:
         # integrate one raw measurement into the running pre‑integrator
         if self.prev_imu_t[r] is not None:
             dt = pkt["timestamp"] - self.prev_imu_t[r]
-            accel = np.array([pkt["linear_acceleration.x"],
-                              pkt["linear_acceleration.y"],
-                              pkt["linear_acceleration.z"]])
-            gyro = np.array([pkt["angular_velocity.x"],
-                             pkt["angular_velocity.y"],
-                             pkt["angular_velocity.z"]])
+            accel_raw = np.array([pkt["linear_acceleration.x"],
+                                  pkt["linear_acceleration.y"],
+                                  pkt["linear_acceleration.z"]], dtype=float)
+            gyro_raw  = np.array([pkt["angular_velocity.x"],
+                                  pkt["angular_velocity.y"],
+                                  pkt["angular_velocity.z"]], dtype=float)
+
+            accel = self._maybe_convert(accel_raw, is_gyro=False, robot=r)
+            gyro  = self._maybe_convert(gyro_raw, is_gyro=True, robot=r)
+            
+            # Specific force expected by GTSAM preintegration:
+            # at rest, accel (body FLU) should be ≈ [0, 0, +g]
+            accel = -accel
             
             if r == 0 and self.preint[r].deltaTij() < 0.1:  # Debug first robot, first few measurements
-                print(f"      IMU integration robot {r}: dt={dt:.6f}, accel={accel}, gyro={gyro}")
+                print(f"      IMU integration robot {r}: dt={dt:.6f}, accel_raw={accel_raw}, accel_final={accel}")
             
             self.preint[r].integrateMeasurement(accel, gyro, dt)
         else:
@@ -337,9 +489,9 @@ class FGCoordinator:
             
         self.prev_imu_t[r] = pkt["timestamp"]
 
-        # every 200 samples (≈2 s at 100 Hz) create a factor
+        # every 100 samples (≈1 s at 100 Hz) create a factor
         delta_t = self.preint[r].deltaTij()
-        if delta_t < 2.0:
+        if delta_t < 1.0:
             return
 
         print(f"    Creating IMU factor for robot {r} after {delta_t:.3f} seconds of integration")
@@ -356,6 +508,33 @@ class FGCoordinator:
         
         print(f"      Keys: pose {pose_key_prev}->{pose_key_new}, vel {vel_key_prev}->{vel_key_new}, bias {bias_key_prev}->{bias_key_new}")
 
+        # CRITICAL DEBUG: Check gravity-cancelled residuals at rest
+        if r == 0:  # Only debug robot 0 to avoid spam
+            try:
+                # --- gravity-aware sanity check (should be ~0 at rest) ---
+                dt_win = float(self.preint[r].deltaTij())
+                dP = np.asarray(self.preint[r].deltaPij()).reshape(3)
+                dV = np.asarray(self.preint[r].deltaVij()).reshape(3)
+
+                # Orientation at the start of the window
+                try:
+                    R_i = self.isam.calculateEstimatePose3(pose_key_prev).rotation()
+                except Exception:
+                    R_i = gtsam.Rot3()  # fallback to identity
+
+                R = R_i.matrix()
+                g_nav = np.array([0.0, 0.0, -9.81], dtype=float)
+
+                res_v = R @ dV + g_nav * dt_win
+                res_p = R @ dP + 0.5 * g_nav * (dt_win**2)
+
+                print(f"      gravity-cancelled residuals: "
+                      f"|res_v|={np.linalg.norm(res_v):.3f} m/s, "
+                      f"|res_p|={np.linalg.norm(res_p):.3f} m")
+                # Heuristics: at rest expect |res_v| ≲ 0.1 m/s, |res_p| ≲ 0.05 m (tune for your noise)
+            except Exception as e:
+                print(f"      Could not get preintegration residuals: {e}")
+
         # add new pose & velocity nodes initialised from previous estimates
         try:
             pose_prev = self.isam.calculateEstimatePose3(pose_key_prev)
@@ -371,53 +550,55 @@ class FGCoordinator:
         self.values.insert(vel_key_new, vel_prev )
         self.values.insert(bias_key_new, gtsam.imuBias.ConstantBias())
         
-        print(f"      Added new variables to values")
+        # Add ultra-weak priors for numerical stability (regularization)
+        weak_v = gtsam.noiseModel.Isotropic.Sigma(3, 50.0)   # VERY weak velocity prior
+        weak_b = gtsam.noiseModel.Isotropic.Sigma(6, 50.0)   # VERY weak bias prior
+        self.graph.add(gtsam.PriorFactorVector(vel_key_new, np.zeros(3), weak_v))
+        self.graph.add(gtsam.PriorFactorConstantBias(bias_key_new, gtsam.imuBias.ConstantBias(), weak_b))
+        
+        print(f"      Added new variables to values with weak priors")
 
-        # factor graph edges
-        print(f"      Creating ImuFactor...")
+        # factor graph edges - use CombinedImuFactor instead of separate ImuFactor + bias between
+        print(f"      Creating CombinedImuFactor...")
         try:
-            imu_factor = ImuFactor(
+            imu_factor = CombinedImuFactor(
                 pose_key_prev, vel_key_prev,
                 pose_key_new,  vel_key_new,
-                bias_key_prev,
-                self.preint[r])
+                bias_key_prev, bias_key_new,
+                self.preint[r]
+            )
             self.graph.add(imu_factor)
-            print(f"      ImuFactor added successfully")
+            print(f"      CombinedImuFactor added successfully")
         except Exception as e:
-            print(f"      Error creating ImuFactor: {e}")
+            print(f"      Error creating CombinedImuFactor: {e}")
             raise
 
-        # bias random‑walk
-        print(f"      Creating bias factor...")
-        try:
-            bias_covar = noiseModel.Isotropic.Sigma(6, 0.0001)
-            bias_factor = gtsam.BetweenFactorConstantBias(
-                bias_key_prev, bias_key_new,
-                imuBias.ConstantBias(), bias_covar)
-            self.graph.add(bias_factor)
-            print(f"      Bias factor added successfully")
-        except Exception as e:
-            print(f"      Error creating bias factor: {e}")
-            raise
+        # No separate bias factor needed - it's built into CombinedImuFactor
 
         # reset pre‑integrator for next window
-        self.preint[r].resetIntegrationAndSetBias(imuBias.ConstantBias())
+        # self.preint[r].resetIntegrationAndSetBias(imuBias.ConstantBias())
         self.last_key[r] = k_new
         print(f"      IMU factor creation complete for robot {r}, new last_key: {k_new}")
         
         # Flush graph to ISAM2 after completing IMU factor
         self._flush_graph()
+        
+        # After flushing we can read the latest bias estimate safely
+        try:
+            est_vals = self.isam.calculateEstimate()
+            b_est = est_vals.atConstantBias(bias_key_new)
+        except Exception:
+            b_est = imuBias.ConstantBias()
+
+        self.preint[r].resetIntegrationAndSetBias(b_est)
 
     # add range factor -----------------------------------------------------
     def _handle_uwb(self, pkt):
-        print(f"    Processing UWB packet: robot={pkt['robot']}, from={pkt['from_id']}, to={pkt['to_id']}, range={pkt['range']:.3f}")
+        sensor_kind = pkt["sensor"]   # "uwb" or "uwb_range_only"
+        raw_range   = pkt["range"]
+        f_id, t_id  = int(pkt["from_id"]), int(pkt["to_id"])
         
-        cir        = pkt["cir"]
-        raw_range  = pkt["range"]
-        f_id, t_id = int(pkt["from_id"]), int(pkt["to_id"])
-
-        key_from = POSE_KEY(pkt["robot"], self.last_key[pkt["robot"]])
-        print(f"      From key: {key_from} (robot {pkt['robot']}, pose_idx {self.last_key[pkt['robot']]})")
+        print(f"    Processing UWB packet: robot={pkt['robot']}, from={f_id}, to={t_id}, range={raw_range:.3f}, type={sensor_kind}")
 
         # -------- A) anchor packet ------------------------------------
         if t_id <= 5:                                   # anchor IDs 0‑5
@@ -428,29 +609,58 @@ class FGCoordinator:
                 return
             print(f"      Anchor {t_id} position: {anchor_pos}")
             
-            print(f"      Creating range factor (anchor)...")
-            try:
-                self.rng_factory.add_factor(
-                    self.graph,
-                    key_i=key_from,
-                    to_id=t_id,          # anchor id
-                    cir_blob=cir,
-                    raw_range=raw_range
-                )
-                print(f"      Anchor range factor added successfully")
-                self._flush_graph()  # Flush after adding anchor range factor
-            except Exception as e:
-                print(f"      Error creating anchor range factor: {e}")
-                print(f"      CIR type: {type(cir)}, shape: {getattr(cir, 'shape', 'N/A')}")
-                print(f"      Raw range: {raw_range}")
-                print(f"      Anchor pos: {anchor_pos}")
-                raise
+            # Use from_id to determine robot for anchor ranging
+            r_from = _tag_to_robot(f_id)
+            if r_from is None:
+                print(f"      Unknown from tag {f_id} -> skipping")
+                return
+            
+            key_from = POSE_KEY(r_from, self.last_key[r_from])
+            print(f"      From key: {key_from} (robot {r_from}, pose_idx {self.last_key[r_from]})")
+            
+            if sensor_kind == "uwb":
+                cir = pkt["cir"]
+                print(f"      Creating range factor (anchor, with CIR)...")
+                try:
+                    self.rng_factory.add_factor(
+                        self.graph,
+                        key_i=key_from,
+                        to_id=t_id,          # anchor id
+                        cir_blob=cir,
+                        raw_range=raw_range
+                    )
+                    print(f"      Anchor range factor added successfully")
+                except Exception as e:
+                    print(f"      Error creating anchor range factor: {e}")
+                    raise
+            else:
+                # range-only fallback
+                print(f"      Creating range factor (anchor, range-only)...")
+                try:
+                    self.rng_factory.add_range_only_factor(
+                        self.graph, 
+                        key_i=key_from, 
+                        to_id=t_id, 
+                        raw_range=raw_range, 
+                        sigma_m=self.uwb_sigma
+                    )
+                    print(f"      Anchor range-only factor added successfully")
+                except Exception as e:
+                    print(f"      Error creating anchor range-only factor: {e}")
+                    raise
             return
 
         # -------- B) robot‑to‑robot -----------------------------------
         print(f"      Robot-to-robot packet detected")
-        r_to = [0, 1, 2][[10, 20, 30].index(t_id//10*10)]
-        key_to = POSE_KEY(r_to, self.last_key[r_to])
+        r_from = _tag_to_robot(f_id)
+        r_to   = _tag_to_robot(t_id)
+        if r_from is None or r_to is None:
+            print(f"      Unknown tag mapping (from_id={f_id},to_id={t_id}) -> skipping")
+            return
+
+        key_from = POSE_KEY(r_from, self.last_key[r_from])
+        key_to   = POSE_KEY(r_to,   self.last_key[r_to])
+        print(f"      From robot: {r_from}, key: {key_from} (pose_idx {self.last_key[r_from]})")
         print(f"      To robot: {r_to}, key: {key_to} (pose_idx {self.last_key[r_to]})")
 
         # **Skip self‑range** (two tags on the same body frame)
@@ -458,23 +668,146 @@ class FGCoordinator:
             print(f"      Self-range detected (same keys), skipping")
             return            # nothing useful to add to the graph
 
-        print(f"      Creating range factor (robot-to-robot)...")
-        try:
-            self.rng_factory.add_factor(
-                self.graph,
-                key_i=key_from,
-                to_id=key_to,        # pose key
-                cir_blob=cir,
-                raw_range=raw_range
-            )
-            print(f"      Robot-to-robot range factor added successfully")
-            self._flush_graph()  # Flush after adding robot-to-robot range factor
-        except Exception as e:
-            print(f"      Error creating robot-to-robot range factor: {e}")
-            print(f"      CIR type: {type(cir)}, shape: {getattr(cir, 'shape', 'N/A')}")
-            print(f"      Raw range: {raw_range}")
-            print(f"      From key: {key_from}, To key: {key_to}")
-            raise
+        if sensor_kind == "uwb":
+            cir = pkt["cir"]
+            print(f"      Creating range factor (robot-to-robot, with CIR)...")
+            try:
+                self.rng_factory.add_factor(
+                    self.graph,
+                    key_i=key_from,
+                    to_id=key_to,        # pose key
+                    cir_blob=cir,
+                    raw_range=raw_range
+                )
+                print(f"      Robot-to-robot range factor added successfully")
+            except Exception as e:
+                print(f"      Error creating robot-to-robot range factor: {e}")
+                raise
+        else:
+            # range-only fallback
+            print(f"      Creating range factor (robot-to-robot, range-only)...")
+            try:
+                self.rng_factory.add_range_only_factor(
+                    self.graph, 
+                    key_i=key_from, 
+                    to_id=key_to, 
+                    raw_range=raw_range, 
+                    sigma_m=self.uwb_sigma
+                )
+                print(f"      Robot-to-robot range-only factor added successfully")
+            except Exception as e:
+                print(f"      Error creating robot-to-robot range-only factor: {e}")
+                raise
+
+# -------------------------------------------------------------------------
+def diagnose_first_seconds(mv, seconds=10.0, robot_idx=0,
+                           gyro_thr=0.02, acc_norm_thr=0.15, acc_z_thr=0.15):
+    """
+    Report how 'static' the first window is, and flag sustained upward proper accel.
+    Uses the same accel convention as preintegration (z ≈ +g at rest).
+    """
+    name = list(mv.data.keys())[robot_idx]
+    imu = mv.data[name]["imu_px4"].sort_values("timestamp").copy()
+    if imu.empty:
+        print(f"[robot {robot_idx}] no IMU data")
+        return {}
+
+    t0 = float(imu["timestamp"].iloc[0])
+    imu10 = imu[imu["timestamp"] <= t0 + seconds].copy()
+    if imu10.empty:
+        print(f"[robot {robot_idx}] no IMU data in first {seconds}s")
+        return {}
+
+    a_raw = imu10[["linear_acceleration.x","linear_acceleration.y","linear_acceleration.z"]].to_numpy()
+    w_raw = imu10[["angular_velocity.x","angular_velocity.y","angular_velocity.z"]].to_numpy()
+
+    # FRD -> FLU, then flip sign so z ≈ +g at rest (matching your preintegration)
+    a_flu   = np.stack([a_raw[:,0], -a_raw[:,1], -a_raw[:,2]], axis=1)
+    a_final = -a_flu
+    g = 9.81
+
+    gyro_norm = np.linalg.norm(w_raw, axis=1)
+    acc_norm  = np.linalg.norm(a_final, axis=1)
+    acc_dev   = np.abs(acc_norm - g)
+    az_dev    = a_final[:,2] - g  # >0 means net upward proper acceleration
+
+    static_mask = (gyro_norm < gyro_thr) & (acc_dev < acc_norm_thr) & (np.abs(az_dev) < acc_z_thr)
+    pct_static  = float(static_mask.mean()*100.0)
+
+    # crude takeoff detection: moving average of az_dev > 0.5 m/s^2
+    ts = imu10["timestamp"].to_numpy()
+    dt = np.median(np.diff(ts)) if len(ts) > 1 else 0.01
+    win = max(1, int(round(0.25 / max(dt, 1e-3))))  # ~0.25 s window
+    kern = np.ones(win)/win
+    az_ma = np.convolve(az_dev, kern, mode="same")
+    idx = np.where(az_ma > 0.5)[0]
+    t_takeoff = float(ts[idx[0]] - t0) if idx.size else None
+
+    print(f"[robot {robot_idx}] first {seconds:.1f}s: static ≈ {pct_static:4.1f}%"
+          f" | (az-g) min/mean/max = {az_dev.min():+.3f}/{az_dev.mean():+.3f}/{az_dev.max():+.3f} m/s^2")
+    if t_takeoff is None:
+        print(f"[robot {robot_idx}] no sustained upward accel (>+0.5 m/s^2) detected.")
+    else:
+        print(f"[robot {robot_idx}] likely takeoff at ~{t_takeoff:.2f} s.")
+
+    return {"pct_static": pct_static, "takeoff_time_s": t_takeoff,
+            "az_minus_g_min": float(az_dev.min()),
+            "az_minus_g_mean": float(az_dev.mean()),
+            "az_minus_g_max": float(az_dev.max())}
+
+def range_trend_first_seconds(mv, seconds=10.0, robot_idx=0, min_samples=10):
+    """
+    Print Δ(gt_range) per anchor in the first 'seconds' seconds.
+    Consistent non-zero deltas across multiple anchors imply motion.
+    """
+    name = list(mv.data.keys())[robot_idx]
+    rng = mv.data[name]["uwb_range"].sort_values("timestamp").copy()
+    if rng.empty:
+        print(f"[robot {robot_idx}] no UWB ranges.")
+        return
+
+    t0 = float(rng["timestamp"].iloc[0])
+    r10 = rng[(rng["timestamp"] >= t0) & (rng["timestamp"] <= t0 + seconds)].copy()
+    if r10.empty:
+        print(f"[robot {robot_idx}] no UWB ranges in first {seconds}s.")
+        return
+
+    for aid in sorted(r10["to_id"].unique()):
+        # only anchors 0..5
+        if int(aid) > 5:
+            continue
+        rr = r10[r10["to_id"] == aid]["gt_range"].dropna()
+        if len(rr) < min_samples:
+            continue
+        delta = float(rr.iloc[-1] - rr.iloc[0])
+        print(f"[robot {robot_idx}] anchor {int(aid)}: Δgt_range ≈ {delta:+.2f} m over {seconds}s (n={len(rr)})")
+
+def rr_trend_first_seconds(mv, seconds=10.0, robot_idx=0, min_samples=10):
+    """
+    Δ(gt_range) for robot-to-robot links in the first 'seconds'.
+    Non-zero consistent deltas across multiple links => motion.
+    """
+    name = list(mv.data.keys())[robot_idx]
+    rng = mv.data[name]["uwb_range"].sort_values("timestamp").copy()
+    if rng.empty:
+        print(f"[robot {robot_idx}] no UWB ranges."); return
+
+    t0 = float(rng["timestamp"].iloc[0])
+    r10 = rng[(rng["timestamp"] >= t0) & (rng["timestamp"] <= t0 + seconds)].copy()
+    if r10.empty:
+        print(f"[robot {robot_idx}] no UWB ranges in first {seconds}s."); return
+
+    # robot tags are 10/20/30; keep only robot-to-robot
+    r10 = r10[(r10["to_id"] >= 10)]
+    if r10.empty:
+        print(f"[robot {robot_idx}] no robot-to-robot links in first {seconds}s."); return
+
+    for peer in sorted(r10["to_id"].unique()):
+        rr = r10[r10["to_id"] == peer]["gt_range"].dropna()
+        if len(rr) < min_samples:
+            continue
+        delta = float(rr.iloc[-1] - rr.iloc[0])
+        print(f"[robot {robot_idx}] to tag {int(peer)}: Δgt_range ≈ {delta:+.02f} m over {seconds}s (n={len(rr)})")
 
 # -------------------------------------------------------------------------
 def build_arg_parser():
@@ -490,6 +823,10 @@ def build_arg_parser():
                    help="dump every incremental graph/values here")
     p.add_argument("--csv-out", type=str, default=None,           ### NEW
                    help="CSV file to store final ISAM2 poses")
+    p.add_argument("--cir-dt", type=float, default=0.15,
+                   help="CIR/Range fuse tolerance in seconds (default 0.15)")
+    p.add_argument("--uwb-sigma", type=float, default=0.25,
+                   help="Std dev for range-only factors in meters (default 0.25)")
     return p
 
 if __name__ == "__main__":
@@ -501,7 +838,19 @@ if __name__ == "__main__":
     if args.save_dir:
         args.save_dir = ensure_dir(args.save_dir)
     
-    coord = FGCoordinator(args.exp, save_dir=args.save_dir)
+    coord = FGCoordinator(args.exp, save_dir=args.save_dir, cir_dt=args.cir_dt, uwb_sigma=args.uwb_sigma)
+    
+    # Run diagnostics before factor graph processing
+    print("\n=== DIAGNOSTICS: First 10 seconds analysis ===")
+    for ridx in (0,1,2):
+        print(f"\n--- Robot {ridx} IMU Analysis ---")
+        diagnose_first_seconds(coord.mv, seconds=10.0, robot_idx=ridx)
+        print(f"\n--- Robot {ridx} Anchor Range Trend Analysis ---")
+        range_trend_first_seconds(coord.mv, seconds=10.0, robot_idx=ridx)
+        print(f"\n--- Robot {ridx} Robot-to-Robot Range Trend Analysis ---")
+        rr_trend_first_seconds(coord.mv, seconds=10.0, robot_idx=ridx)
+    print("\n=== Starting Factor Graph Processing ===")
+    
     t0 = time.time()
     coord.run(max_sec=args.max_sec)
     dt = time.time() - t0
