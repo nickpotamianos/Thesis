@@ -85,12 +85,15 @@ VEL_KEY    = lambda r, k: gtsam.symbol(chr(ord('V') + r), k)   # V,W,X
 BIAS_KEY   = lambda r, k: gtsam.symbol(chr(ord('B') + r), k)   # B,C,D
 
 class FGCoordinator:
-    def __init__(self, exp, save_dir=None, cir_dt=0.15, uwb_sigma=0.25):                    ### NEW
+    def __init__(self, exp, save_dir=None, cir_dt=0.15, uwb_sigma=0.25, uwb_min=0.05, uwb_max=25.0, rr_dedup_dt=0.02):                    ### NEW
         print(f"=== INITIALIZING FGCoordinator for experiment: {exp} ===")
         self.exp  = exp
         self.save_dir = save_dir                               ### NEW
         self.cir_dt = cir_dt                                   ### NEW
         self.uwb_sigma = uwb_sigma                             ### NEW
+        self.uwb_min = uwb_min                                 ### NEW
+        self.uwb_max = uwb_max                                 ### NEW
+        self.rr_dedup_dt = rr_dedup_dt                         ### NEW
         self.packet_counter = 0                                ### NEW
         self.mv   = DataLoader(exp, exp_dir="data/three_robots", cir=True, height=False)   # height unused for now
         print(f"DataLoader created successfully")
@@ -143,9 +146,35 @@ class FGCoordinator:
             self.prev_imu_t[r] = None
             print(f"  Robot {r}: Combined IMU preintegrator initialized")
         
+        print("=== SETTING UP TIME-BASED KEY TRACKING ===")
+        from bisect import bisect_right
+        
+        # Make bisect_right available to other methods
+        import bisect
+        self.bisect_right = bisect.bisect_right
+        
+        # --- per-robot key-time index ---
+        self.key_times = {r: [] for r in range(3)}   # monotonically increasing times
+        self.key_ids   = {r: [] for r in range(3)}   # matching pose index numbers
+
+        # seed with the first IMU time per robot (key 0)
+        for ridx, (name, rob) in enumerate(self.mv.data.items()):
+            imu_df = rob["imu_px4"].sort_values("timestamp")
+            if imu_df.empty:
+                raise RuntimeError(f"Robot {ridx} has no IMU data; cannot seed key timeline.")
+            t0 = float(imu_df["timestamp"].iloc[0])
+            self.key_times[ridx].append(t0)
+            self.key_ids[ridx].append(0)
+            print(f"  Robot {ridx} ({name}): seeded key timeline with t0={t0:.3f}s")
+
         print("=== SETTING UP UWB ML FRONTEND ===")
         self.rng_factory = RangeFactoryStd(UwbML(exp))          # pre‑trained CNNs
         print(f"RangeFactoryStd created for experiment: {exp}")
+        
+        # RR dedup within small dt
+        self.rr_last_seen = {}   # dict[(key_low, key_high)] = last_time
+        print(f"Robot-to-robot deduplication window: {self.rr_dedup_dt}s")
+        print(f"UWB range gating: [{self.uwb_min}, {self.uwb_max}] meters")
         
         # Debug: check what anchors are loaded
         print("=== ANCHOR SUMMARY ===")
@@ -280,6 +309,21 @@ class FGCoordinator:
         if self.body_is_frd[robot]:
             return frd_to_flu(v)  # x, -y, -z
         return v
+
+    def _key_for_time(self, robot: int, t: float) -> int:
+        """
+        Return the pose Key for 'robot' that is current at time t:
+        the last key whose birth time <= t. Falls back to last_key if needed.
+        """
+        ts = self.key_times[robot]
+        ks = self.key_ids[robot]
+        if not ts:
+            # shouldn't happen, but be defensive
+            return POSE_KEY(robot, self.last_key[robot])
+        idx = self.bisect_right(ts, t) - 1
+        if idx < 0:  # measurement before first key time
+            idx = 0
+        return POSE_KEY(robot, ks[idx])
 
     def _isam_has(self, key):
         """Check if ISAM2 already contains a variable with this key."""
@@ -489,9 +533,9 @@ class FGCoordinator:
             
         self.prev_imu_t[r] = pkt["timestamp"]
 
-        # every 100 samples (≈1 s at 100 Hz) create a factor
+        # every 100 samples (≈0.75 s at 100 Hz) create a factor
         delta_t = self.preint[r].deltaTij()
-        if delta_t < 1.0:
+        if delta_t < 0.75:    # ~0.75 s windows for better linearization
             return
 
         print(f"    Creating IMU factor for robot {r} after {delta_t:.3f} seconds of integration")
@@ -578,6 +622,12 @@ class FGCoordinator:
         # reset pre‑integrator for next window
         # self.preint[r].resetIntegrationAndSetBias(imuBias.ConstantBias())
         self.last_key[r] = k_new
+        
+        # Record the time when this new key was created for time-based UWB attachment
+        t_new = float(self.prev_imu_t[r]) if self.prev_imu_t[r] is not None else 0.0
+        self.key_times[r].append(t_new)
+        self.key_ids[r].append(k_new)
+        
         print(f"      IMU factor creation complete for robot {r}, new last_key: {k_new}")
         
         # Flush graph to ISAM2 after completing IMU factor
@@ -600,6 +650,13 @@ class FGCoordinator:
         
         print(f"    Processing UWB packet: robot={pkt['robot']}, from={f_id}, to={t_id}, range={raw_range:.3f}, type={sensor_kind}")
 
+        # Simple physical gate
+        if not (self.uwb_min <= raw_range <= self.uwb_max):
+            print(f"      Range {raw_range:.3f}m outside bounds [{self.uwb_min}, {self.uwb_max}], dropping")
+            return
+
+        t_meas = float(pkt["timestamp"])
+
         # -------- A) anchor packet ------------------------------------
         if t_id <= 5:                                   # anchor IDs 0‑5
             print(f"      Anchor packet detected (to_id={t_id})")
@@ -615,8 +672,14 @@ class FGCoordinator:
                 print(f"      Unknown from tag {f_id} -> skipping")
                 return
             
-            key_from = POSE_KEY(r_from, self.last_key[r_from])
-            print(f"      From key: {key_from} (robot {r_from}, pose_idx {self.last_key[r_from]})")
+            key_from = self._key_for_time(r_from, t_meas)
+            # Get pose index for debugging
+            try:
+                idx = self.bisect_right(self.key_times[r_from], t_meas) - 1
+                pose_idx = self.key_ids[r_from][idx] if idx >= 0 else 'unknown'
+            except (IndexError, KeyError):
+                pose_idx = 'unknown'
+            print(f"      From key: {key_from} (robot {r_from}, pose_idx {pose_idx})")
             
             if sensor_kind == "uwb":
                 cir = pkt["cir"]
@@ -658,15 +721,36 @@ class FGCoordinator:
             print(f"      Unknown tag mapping (from_id={f_id},to_id={t_id}) -> skipping")
             return
 
-        key_from = POSE_KEY(r_from, self.last_key[r_from])
-        key_to   = POSE_KEY(r_to,   self.last_key[r_to])
-        print(f"      From robot: {r_from}, key: {key_from} (pose_idx {self.last_key[r_from]})")
-        print(f"      To robot: {r_to}, key: {key_to} (pose_idx {self.last_key[r_to]})")
+        key_from = self._key_for_time(r_from, t_meas)
+        key_to   = self._key_for_time(r_to, t_meas)
+        
+        # Get pose indices for debugging
+        try:
+            idx_from = self.bisect_right(self.key_times[r_from], t_meas) - 1
+            pose_idx_from = self.key_ids[r_from][idx_from] if idx_from >= 0 else 'unknown'
+        except (IndexError, KeyError):
+            pose_idx_from = 'unknown'
+        try:
+            idx_to = self.bisect_right(self.key_times[r_to], t_meas) - 1
+            pose_idx_to = self.key_ids[r_to][idx_to] if idx_to >= 0 else 'unknown'
+        except (IndexError, KeyError):
+            pose_idx_to = 'unknown'
+            
+        print(f"      From robot: {r_from}, key: {key_from} (pose_idx {pose_idx_from})")
+        print(f"      To robot: {r_to}, key: {key_to} (pose_idx {pose_idx_to})")
 
         # **Skip self‑range** (two tags on the same body frame)
         if key_to == key_from:
             print(f"      Self-range detected (same keys), skipping")
             return            # nothing useful to add to the graph
+
+        # De-duplicate mirrored robot-to-robot factors
+        pair = tuple(sorted([int(key_from), int(key_to)]))
+        last_t = self.rr_last_seen.get(pair)
+        if last_t is not None and abs(t_meas - last_t) < self.rr_dedup_dt:
+            print(f"      Skipping near-duplicate RR factor (dt={abs(t_meas - last_t):.3f}s < {self.rr_dedup_dt}s)")
+            return
+        self.rr_last_seen[pair] = t_meas
 
         if sensor_kind == "uwb":
             cir = pkt["cir"]
@@ -827,6 +911,12 @@ def build_arg_parser():
                    help="CIR/Range fuse tolerance in seconds (default 0.15)")
     p.add_argument("--uwb-sigma", type=float, default=0.25,
                    help="Std dev for range-only factors in meters (default 0.25)")
+    p.add_argument("--uwb-min", type=float, default=0.05,
+                   help="Min plausible UWB range in meters (default: 0.05)")
+    p.add_argument("--uwb-max", type=float, default=25.0,
+                   help="Max plausible UWB range in meters (default: 25.0)")
+    p.add_argument("--rr-dedup-dt", type=float, default=0.02,
+                   help="Time window (s) to deduplicate mirrored RR ranges")
     return p
 
 if __name__ == "__main__":
@@ -838,7 +928,8 @@ if __name__ == "__main__":
     if args.save_dir:
         args.save_dir = ensure_dir(args.save_dir)
     
-    coord = FGCoordinator(args.exp, save_dir=args.save_dir, cir_dt=args.cir_dt, uwb_sigma=args.uwb_sigma)
+    coord = FGCoordinator(args.exp, save_dir=args.save_dir, cir_dt=args.cir_dt, uwb_sigma=args.uwb_sigma,
+                          uwb_min=args.uwb_min, uwb_max=args.uwb_max, rr_dedup_dt=args.rr_dedup_dt)
     
     # Run diagnostics before factor graph processing
     print("\n=== DIAGNOSTICS: First 10 seconds analysis ===")

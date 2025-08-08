@@ -24,6 +24,12 @@ from sota.uwb.infer_uwb import UwbML
 # Capability probe
 _HAS_POSE_POINT = hasattr(gtsam, "RangeFactorPose3Point3")
 
+def _robust_sigma(sigma):
+    """Create a robust noise model with Huber kernel for outlier tolerance."""
+    base = gtsam.noiseModel.Isotropic.Sigma(1, sigma)
+    huber = gtsam.noiseModel.mEstimator.Huber(1.345)  # classic choice
+    return gtsam.noiseModel.Robust.Create(huber, base)
+
 
 class RangeFactoryStd:
     """Handles ML correction + factor creation with a build-compatible anchor backend."""
@@ -125,8 +131,9 @@ class RangeFactoryStd:
     ) -> None:
         """
         Plain (non-ML) range factor. Uses same anchor backend selection.
+        Now with robust loss for outlier tolerance.
         """
-        model = noiseModel.Isotropic.Sigma(1, float(sigma_m))
+        model = _robust_sigma(float(sigma_m))  # Use robust noise model
         r = float(raw_range)
 
         # Anchor target?
