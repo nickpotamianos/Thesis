@@ -1,6 +1,7 @@
 # sota/factor_graph/fg_runner.py
 import time, yaml, gtsam, numpy as np
 import pandas as pd
+import os
 from pathlib import Path
 from miluv.data import DataLoader
 from gtsam import (
@@ -10,6 +11,11 @@ from gtsam import (
 from sota.uwb.infer_uwb          import UwbML
 from sota.factor_graph.range_factory_std import RangeFactoryStd
 from sota.factor_graph.utils_io  import ensure_dir, save_estimates, save_graph_values   ### NEW
+
+try:
+    from sota.miluv.loader import MiluvAdapter
+except Exception:
+    MiluvAdapter = None
 
 # put near the top of fg_runner.py
 def frd_to_flu(v):
@@ -894,13 +900,323 @@ def rr_trend_first_seconds(mv, seconds=10.0, robot_idx=0, min_samples=10):
         print(f"[robot {robot_idx}] to tag {int(peer)}: Δgt_range ≈ {delta:+.02f} m over {seconds}s (n={len(rr)})")
 
 # -------------------------------------------------------------------------
+class MiluvFGCoordinator:
+    """Simplified coordinator that uses MILUV adapter events with existing factor graph logic."""
+    
+    def __init__(self, adapter, save_dir=None):
+        self.adapter = adapter
+        self.save_dir = save_dir
+        self.static = adapter.get_static()
+        
+        # Initialize the same factor graph components as FGCoordinator
+        print(f"=== INITIALIZING MiluvFGCoordinator ===")
+        
+        # IMU preintegration setup (same as FGCoordinator)
+        g = 9.81
+        params = gtsam.PreintegrationCombinedParams.MakeSharedU(g)
+        if hasattr(params, "setGravityVector"):
+            params.setGravityVector(np.array([0.0, 0.0, -g], dtype=float))
+        params.setAccelerometerCovariance(np.eye(3) * (0.03**2))
+        params.setGyroscopeCovariance(np.eye(3) * (0.002**2))
+        params.setIntegrationCovariance(np.eye(3) * ((1e-3)**2))
+        if hasattr(params, "setBiasAccCovariance"):
+            params.setBiasAccCovariance(np.eye(3) * 1e-4)
+        if hasattr(params, "setBiasOmegaCovariance"):
+            params.setBiasOmegaCovariance(np.eye(3) * 1e-6)
+        if hasattr(params, "setBiasAccOmegaIntCovariance"):
+            params.setBiasAccOmegaIntCovariance(np.eye(6) * 1e-5)
+        
+        self.preint = {}
+        self.prev_imu_t = {}
+        robot_count = self.static['robot_count']
+        for r in range(robot_count):
+            self.preint[r] = gtsam.PreintegratedCombinedMeasurements(params, imuBias.ConstantBias())
+            self.prev_imu_t[r] = None
+        
+        # Key tracking
+        import bisect
+        self.bisect_right = bisect.bisect_right
+        self.key_times = {r: [] for r in range(robot_count)}
+        self.key_ids = {r: [] for r in range(robot_count)}
+        
+        # Initialize with t=0 keys
+        for r in range(robot_count):
+            self.key_times[r].append(0.0)
+            self.key_ids[r].append(0)
+        
+        # Range factory with UWB ML
+        exp_name = self.adapter.exp_name
+        self.rng_factory = RangeFactoryStd(UwbML(exp_name))
+        
+        # RR dedup
+        self.rr_last_seen = {}
+        self.rr_dedup_dt = self.adapter.rr_dedup_dt
+        
+        # Factor graph
+        self.graph = gtsam.NonlinearFactorGraph()
+        self.values = gtsam.Values()
+        
+        params = gtsam.ISAM2Params()
+        if hasattr(gtsam.ISAM2Params, 'QR'):
+            params.setFactorization(gtsam.ISAM2Params.QR)
+        if hasattr(params, 'setRelinearizeThreshold'):
+            params.setRelinearizeThreshold(0.01)
+        elif hasattr(params, 'relinearizeThreshold'):
+            params.relinearizeThreshold = 0.01
+        if hasattr(params, 'setRelinearizeSkip'):
+            params.setRelinearizeSkip(1)
+        elif hasattr(params, 'relinearizeSkip'):
+            params.relinearizeSkip = 1
+        self.isam = gtsam.ISAM2(params)
+        
+        # Load anchors
+        if self.static['anchors']:
+            self.rng_factory.load_anchors(self.graph, self.values, self.static['anchors'])
+        
+        # Add priors
+        self._add_priors()
+        
+        # Initialize last_key tracking
+        self.last_key = {r: 0 for r in range(robot_count)}
+        
+        # Bootstrap
+        self._flush_graph()
+        print("=== MiluvFGCoordinator INITIALIZED ===")
+    
+    def _add_priors(self):
+        """Add pose, velocity, and bias priors."""
+        robot_count = self.static['robot_count']
+        
+        for ridx in range(robot_count):
+            k = POSE_KEY(ridx, 0)
+            R0 = gtsam.Rot3()  # Identity rotation for simplicity
+            P0 = gtsam.Pose3(R0, gtsam.Point3(0, 0, 0))
+            
+            if ridx == 0:
+                prior_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([1e-3]*6))
+            else:
+                sig = np.array([0.05, 0.05, np.pi/3, 1.0, 1.0, 1.0], float)
+                prior_noise = gtsam.noiseModel.Diagonal.Sigmas(sig)
+            
+            self.values.insert(k, P0)
+            self.graph.add(gtsam.PriorFactorPose3(k, P0, prior_noise))
+            
+            # Velocity and bias priors
+            vel_key = VEL_KEY(ridx, 0)
+            bias_key = BIAS_KEY(ridx, 0)
+            
+            self.values.insert(vel_key, np.zeros(3))
+            self.values.insert(bias_key, gtsam.imuBias.ConstantBias())
+            
+            v_noise = gtsam.noiseModel.Isotropic.Sigma(3, 1e-3)
+            b_noise = gtsam.noiseModel.Isotropic.Sigma(6, 1e-3)
+            
+            self.graph.add(gtsam.PriorFactorVector(vel_key, np.zeros(3), v_noise))
+            self.graph.add(gtsam.PriorFactorConstantBias(bias_key, gtsam.imuBias.ConstantBias(), b_noise))
+    
+    def _flush_graph(self):
+        """Push accumulated factors to ISAM2."""
+        if self.graph.size() == 0:
+            return
+        self.isam.update(self.graph, self.values)
+        self.graph = gtsam.NonlinearFactorGraph()
+        self.values = gtsam.Values()
+    
+    def _key_for_time(self, robot: int, t: float) -> int:
+        """Get the pose key for robot at time t."""
+        ts = self.key_times[robot]
+        ks = self.key_ids[robot]
+        if not ts:
+            return POSE_KEY(robot, self.last_key[robot])
+        idx = self.bisect_right(ts, t) - 1
+        if idx < 0:
+            idx = 0
+        return POSE_KEY(robot, ks[idx])
+    
+    def run_miluv_events(self, event_stream, max_sec=30):
+        """Process MILUV events through the factor graph."""
+        print(f"\n=== STARTING MILUV FACTOR GRAPH PROCESSING (max {max_sec} seconds) ===")
+        
+        t0 = time.time()
+        packet_count = 0
+        imu_count = 0
+        uwb_count = 0
+        height_count = 0
+        
+        for typ, pkt in event_stream:
+            packet_count += 1
+            elapsed = time.time() - t0
+            
+            if packet_count % 100 == 0:
+                print(f"  Processed {packet_count} packets in {elapsed:.2f}s (IMU: {imu_count}, UWB: {uwb_count}, HEIGHT: {height_count})")
+                print(f"    Current graph size: {self.graph.size()} factors")
+            
+            if typ == "IMU":
+                imu_count += 1
+                self._handle_miluv_imu(pkt)
+            elif typ == "UWB":
+                uwb_count += 1
+                self._handle_miluv_uwb(pkt)
+            elif typ == "HEIGHT":
+                height_count += 1
+                # TODO: implement height handling if needed
+                pass
+            
+            if time.time() - t0 > max_sec:
+                print(f"  Time limit reached after {packet_count} packets")
+                break
+        
+        # Final flush
+        self._flush_graph()
+        
+        print(f"=== MILUV FACTOR GRAPH PROCESSING COMPLETE ===")
+        print(f"  Total packets processed: {packet_count} (IMU: {imu_count}, UWB: {uwb_count}, HEIGHT: {height_count})")
+        print(f"  Final ISAM2 estimates: {self.isam.calculateEstimate().size()} variables")
+    
+    def _handle_miluv_imu(self, pkt):
+        """Handle IMU events from MILUV adapter."""
+        # Convert ImuEvent to the format expected by existing logic
+        r = pkt.robot
+        
+        if self.prev_imu_t[r] is not None:
+            dt = pkt.t - self.prev_imu_t[r]
+            
+            # Convert PX4 FRD → FLU (match non-MILUV path)
+            accel_body = frd_to_flu(pkt.accel)
+            gyro_body = frd_to_flu(pkt.omega)
+            
+            # Specific force expected by our preintegration pipeline:
+            # at rest (body FLU), accel ≈ [0, 0, +g]
+            accel_meas = -accel_body
+            gyro_meas = gyro_body
+            
+            self.preint[r].integrateMeasurement(accel_meas, gyro_meas, dt)
+        
+        self.prev_imu_t[r] = pkt.t
+        
+        # Create IMU factor every ~0.75s
+        delta_t = self.preint[r].deltaTij()
+        if delta_t < 0.75:
+            return
+        
+        k_prev = self.last_key[r]
+        k_new = k_prev + 1
+        
+        pose_key_prev = POSE_KEY(r, k_prev)
+        vel_key_prev = VEL_KEY(r, k_prev)
+        bias_key_prev = BIAS_KEY(r, k_prev)
+        pose_key_new = POSE_KEY(r, k_new)
+        vel_key_new = VEL_KEY(r, k_new)
+        bias_key_new = BIAS_KEY(r, k_new)
+        
+        # Initialize new variables
+        try:
+            pose_prev = self.isam.calculateEstimatePose3(pose_key_prev)
+            vel_prev = self.isam.calculateEstimateVector(vel_key_prev)
+        except Exception:
+            pose_prev = gtsam.Pose3()
+            vel_prev = np.zeros(3)
+        
+        self.values.insert(pose_key_new, pose_prev)
+        self.values.insert(vel_key_new, vel_prev)
+        self.values.insert(bias_key_new, gtsam.imuBias.ConstantBias())
+        
+        # Weak priors for regularization
+        weak_v = gtsam.noiseModel.Isotropic.Sigma(3, 50.0)
+        weak_b = gtsam.noiseModel.Isotropic.Sigma(6, 50.0)
+        self.graph.add(gtsam.PriorFactorVector(vel_key_new, np.zeros(3), weak_v))
+        self.graph.add(gtsam.PriorFactorConstantBias(bias_key_new, gtsam.imuBias.ConstantBias(), weak_b))
+        
+        # IMU factor
+        imu_factor = CombinedImuFactor(
+            pose_key_prev, vel_key_prev,
+            pose_key_new, vel_key_new,
+            bias_key_prev, bias_key_new,
+            self.preint[r]
+        )
+        self.graph.add(imu_factor)
+        
+        # Update tracking
+        self.last_key[r] = k_new
+        self.key_times[r].append(float(pkt.t))
+        self.key_ids[r].append(k_new)
+        
+        # Flush and reset
+        self._flush_graph()
+        
+        try:
+            est_vals = self.isam.calculateEstimate()
+            b_est = est_vals.atConstantBias(bias_key_new)
+        except Exception:
+            b_est = imuBias.ConstantBias()
+        
+        self.preint[r].resetIntegrationAndSetBias(b_est)
+    
+    def _handle_miluv_uwb(self, pkt):
+        """Handle UWB events from MILUV adapter."""
+        # Convert UwbEvent to existing format
+        raw_range = pkt.rng
+        f_id, t_id = pkt.from_id, pkt.to_id
+        t_meas = pkt.t
+        
+        # Anchor ranging
+        if t_id <= 5:
+            anchor_pos = self.static['anchors'].get(t_id)
+            if anchor_pos is None:
+                return
+            
+            r_from = _tag_to_robot(f_id)
+            if r_from is None:
+                return
+            
+            key_from = self._key_for_time(r_from, t_meas)
+            
+            # Use range-only factor (since CIR processing is complex)
+            self.rng_factory.add_range_only_factor(
+                self.graph,
+                key_i=key_from,
+                to_id=t_id,
+                raw_range=raw_range,
+                sigma_m=pkt.std
+            )
+            return
+        
+        # Robot-to-robot ranging
+        r_from = _tag_to_robot(f_id)
+        r_to = _tag_to_robot(t_id)
+        if r_from is None or r_to is None:
+            return
+        
+        key_from = self._key_for_time(r_from, t_meas)
+        key_to = self._key_for_time(r_to, t_meas)
+        
+        if key_to == key_from:
+            return  # Skip self-range
+        
+        # Dedup
+        pair = tuple(sorted([int(key_from), int(key_to)]))
+        last_t = self.rr_last_seen.get(pair)
+        if last_t is not None and abs(t_meas - last_t) < self.rr_dedup_dt:
+            return
+        self.rr_last_seen[pair] = t_meas
+        
+        # Add range factor
+        self.rng_factory.add_range_only_factor(
+            self.graph,
+            key_i=key_from,
+            to_id=key_to,
+            raw_range=raw_range,
+            sigma_m=pkt.std
+        )
+
+# -------------------------------------------------------------------------
 def build_arg_parser():
     import argparse
     p = argparse.ArgumentParser(
         prog = "fg_runner.py",
         description = "Realtime factor‑graph demo based on ISAM2"
     )
-    p.add_argument("exp", help="experiment name / directory")
+    p.add_argument("dataset", help="dataset id (e.g., cir_3_random3_0 or miluv:<exp_name>)")
     p.add_argument("--max-sec", type=float, default=20,
                    help="wall‑clock limit (default: 20 seconds)")
     p.add_argument("--save-dir", type=str, default=None,          ### NEW
@@ -917,6 +1233,13 @@ def build_arg_parser():
                    help="Max plausible UWB range in meters (default: 25.0)")
     p.add_argument("--rr-dedup-dt", type=float, default=0.02,
                    help="Time window (s) to deduplicate mirrored RR ranges")
+    
+    # MILUV-only knobs (all optional):
+    p.add_argument("--miluv-root", default="./data", help="root folder containing MILUV data/<exp>")
+    p.add_argument("--imu-source", choices=["px4","cam","both"], default="px4")
+    p.add_argument("--miluv-remove-imu-bias", action="store_true", default=True)
+    p.add_argument("--no-miluv-remove-imu-bias", dest="miluv_remove_imu_bias", action="store_false")
+    p.add_argument("--use-height", action="store_true", default=False)
     return p
 
 if __name__ == "__main__":
@@ -928,25 +1251,74 @@ if __name__ == "__main__":
     if args.save_dir:
         args.save_dir = ensure_dir(args.save_dir)
     
-    coord = FGCoordinator(args.exp, save_dir=args.save_dir, cir_dt=args.cir_dt, uwb_sigma=args.uwb_sigma,
-                          uwb_min=args.uwb_min, uwb_max=args.uwb_max, rr_dedup_dt=args.rr_dedup_dt)
+    is_miluv = isinstance(args.dataset, str) and args.dataset.startswith("miluv:")
     
-    # Run diagnostics before factor graph processing
-    print("\n=== DIAGNOSTICS: First 10 seconds analysis ===")
-    for ridx in (0,1,2):
-        print(f"\n--- Robot {ridx} IMU Analysis ---")
-        diagnose_first_seconds(coord.mv, seconds=10.0, robot_idx=ridx)
-        print(f"\n--- Robot {ridx} Anchor Range Trend Analysis ---")
-        range_trend_first_seconds(coord.mv, seconds=10.0, robot_idx=ridx)
-        print(f"\n--- Robot {ridx} Robot-to-Robot Range Trend Analysis ---")
-        rr_trend_first_seconds(coord.mv, seconds=10.0, robot_idx=ridx)
-    print("\n=== Starting Factor Graph Processing ===")
-    
-    t0 = time.time()
-    coord.run(max_sec=args.max_sec)
-    dt = time.time() - t0
-    print(f"Finished in {dt:.2f}s")
-    
-    if args.csv_out:                         ### NEW
-        save_estimates(coord.isam, args.csv_out)
-        print(f"ISAM2 poses saved to {args.csv_out}")
+    if is_miluv:
+        # === MILUV path ===
+        assert MiluvAdapter is not None, "sota.miluv.loader import failed"
+        exp_name = args.dataset.split(":",1)[1]
+        adapter = MiluvAdapter(
+            exp_name=exp_name,
+            exp_dir=args.miluv_root,
+            imu_source=args.imu_source,
+            include_height=args.use_height,
+            remove_imu_bias=args.miluv_remove_imu_bias,
+            uwb_sigma_default=args.uwb_sigma,
+            uwb_min=args.uwb_min,
+            uwb_max=args.uwb_max,
+            rr_dedup_dt=args.rr_dedup_dt,
+        )
+        static = adapter.get_static()
+        event_stream = adapter.iter_events(t0=0.0, t1=args.max_sec)
+        
+        print(f"=== MILUV ADAPTER INITIALIZED ===")
+        print(f"Experiment: {exp_name}")
+        print(f"Robot count: {static['robot_count']}")
+        print(f"Anchors: {list(static['anchors'].keys()) if static['anchors'] else 'None'}")
+        print(f"Tag offsets: {list(static['tag_offsets'].keys()) if static['tag_offsets'] else 'None'}")
+        
+        # Create a MILUV-compatible coordinator using the adapter data
+        coord = MiluvFGCoordinator(adapter, save_dir=args.save_dir)
+        
+        # Run the factor graph with MILUV events
+        t0 = time.time()
+        coord.run_miluv_events(event_stream, max_sec=args.max_sec)
+        dt = time.time() - t0
+        print(f"Finished MILUV processing in {dt:.2f}s")
+        
+        if args.csv_out:
+            # new: include timestamps
+            from sota.factor_graph.utils_io import save_estimates_with_timestamps
+            save_estimates_with_timestamps(
+                coord.isam,
+                args.csv_out,
+                key_times=coord.key_times,
+                key_ids=coord.key_ids,
+                robot_syms=[chr(ord('P')+r) for r in range(static['robot_count'])]
+            )
+            print(f"ISAM2 poses saved to {args.csv_out}")
+        
+    else:
+        # === Original path ===
+        coord = FGCoordinator(args.dataset, save_dir=args.save_dir, cir_dt=args.cir_dt, uwb_sigma=args.uwb_sigma,
+                              uwb_min=args.uwb_min, uwb_max=args.uwb_max, rr_dedup_dt=args.rr_dedup_dt)
+        
+        # Run diagnostics before factor graph processing
+        print("\n=== DIAGNOSTICS: First 10 seconds analysis ===")
+        for ridx in (0,1,2):
+            print(f"\n--- Robot {ridx} IMU Analysis ---")
+            diagnose_first_seconds(coord.mv, seconds=10.0, robot_idx=ridx)
+            print(f"\n--- Robot {ridx} Anchor Range Trend Analysis ---")
+            range_trend_first_seconds(coord.mv, seconds=10.0, robot_idx=ridx)
+            print(f"\n--- Robot {ridx} Robot-to-Robot Range Trend Analysis ---")
+            rr_trend_first_seconds(coord.mv, seconds=10.0, robot_idx=ridx)
+        print("\n=== Starting Factor Graph Processing ===")
+        
+        t0 = time.time()
+        coord.run(max_sec=args.max_sec)
+        dt = time.time() - t0
+        print(f"Finished in {dt:.2f}s")
+        
+        if args.csv_out:                         ### NEW
+            save_estimates(coord.isam, args.csv_out)
+            print(f"ISAM2 poses saved to {args.csv_out}")
