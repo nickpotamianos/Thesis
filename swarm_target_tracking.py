@@ -196,9 +196,17 @@ def main(args):
                                     cfg=tf_cfg)
                       for trk in roles.trackers}
 
-    # Measurement adapter (bias & reliability shaping)
+    # Measurement adapter (bias, reliability shaping, innovation scaling)
     base_var = (args.uwb_std**2) if (args.uwb_std is not None) else args.uwb_var
-    meas_ai = MeasureAdapter(AdapterConfig(base_range_var=base_var))
+    mcfg = AdapterConfig(
+        base_range_var=base_var,
+        los_influence=args.los_influence,
+        geom_influence=args.geom_influence,
+        ema_alpha=args.ema_alpha,
+        min_scale=args.r_min_scale,
+        max_scale=args.r_max_scale,
+    )
+    meas_ai = MeasureAdapter(mcfg)
 
     # LOS adapter
     los_adapter = LOSAdapter(LOSConfig(use_cir=args.use_cir, verbose=args.los_verbose))
@@ -217,8 +225,12 @@ def main(args):
         meas_ai.bias_model = biasnet
         print(f"[SWARM] BiasNet loaded from: {args.biasnet_dir}")
 
-    # CI fusion
-    fuser = CIFuser(CIFuserConfig(objective=args.ci_objective, grid_step=args.ci_grid))
+    # CI fusion (auto objective if not set)
+    if args.ci_objective is None:
+        ci_obj = "trace" if args.use_height_tf else "logdet"
+    else:
+        ci_obj = args.ci_objective
+    fuser = CIFuser(CIFuserConfig(objective=ci_obj, grid_step=args.ci_grid))
 
     # Load FusionNet if provided
     if args.fusionnet_dir is not None:
@@ -422,6 +434,15 @@ def main(args):
                 "max_sensitivity": float(np.max(vertical_sensitivities))
             }, f, indent=2)
 
+    # Save trajectory and basic diagnostics
+    out_csv = os.path.join(out_dir, "target_estimate.csv")
+    ts = np.asarray(query_timestamps).reshape(-1, 1)
+    X = np.asarray(mu_star_seq)  # N x 6 [px,py,pz,vx,vy,vz]
+    df = pd.DataFrame(np.hstack([ts, X]),
+                      columns=["timestamp","px","py","pz","vx","vy","vz"]) 
+    df.to_csv(out_csv, index=False)
+    print(f"[SAVE] Trajectory -> {out_csv}")
+
     print(f"[SWARM] Measurements available (trk↔tgt) : {meas_avail}")
     print(f"[SWARM] Measurements used after gating : {meas_used}")
     print(f"[SWARM] LOS scores produced: {los_hits}, missing: {los_misses}")
@@ -446,7 +467,7 @@ if __name__ == "__main__":
     p.add_argument("--uwb_std", type=float, default=None, help="Alternative: give UWB std (m); overrides --uwb_var")
     p.add_argument("--gate_sigma", type=float, default=3.0, help="Gating threshold in sigma")
     p.add_argument("--ci_method", choices=["uniform", "grid", "learned"], default="grid")
-    p.add_argument("--ci_objective", choices=["logdet","trace"], default="logdet")
+    p.add_argument("--ci_objective", choices=["logdet","trace"], default=None)
     p.add_argument("--ci_grid", type=float, default=0.1, help="Grid step for CI weights")
     p.add_argument("--tags_per_robot", type=int, default=2, help="How many tags to assume per robot")
     p.add_argument("--pair_corr", type=float, default=0.7, help="Correlation between tag-pair ranges")
@@ -454,6 +475,11 @@ if __name__ == "__main__":
     p.add_argument("--use_los", action="store_true", help="Use LOS classifier to shape reliability")
     p.add_argument("--use_cir", action="store_true", help="If available, enable CIR for LOS classifier")
     p.add_argument("--los_verbose", action="store_true", help="Print one-time LOS adapter diagnostics")
+    p.add_argument("--los_influence", type=float, default=0.2, help="Strength of LOS->reliability (0..1)")
+    p.add_argument("--geom_influence", type=float, default=0.4, help="Strength of |e_z|->reliability (0..1)")
+    p.add_argument("--ema_alpha", type=float, default=0.05, help="EMA for innovation whiteness")
+    p.add_argument("--r_min_scale", type=float, default=0.5, help="Lower bound on R scaling")
+    p.add_argument("--r_max_scale", type=float, default=6.0, help="Upper bound on R scaling")
     p.add_argument("--init_window", type=int, default=0,
                    help="Use first N timesteps to robustly initialize target position (0=off)")
     p.add_argument("--smooth", action="store_true", help="Enable RTS smoothing after filtering")

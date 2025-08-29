@@ -23,6 +23,9 @@ class AdapterConfig:
     ema_alpha: float = 0.05        # EMA for whiteness
     min_scale: float = 0.25
     max_scale: float = 8.0
+    # New: LOS/geometry influences
+    los_influence: float = 0.5     # controls how strongly LOS adjusts reliability
+    geom_influence: float = 0.5    # controls how strongly |e_z| adjusts reliability
 
 class MeasureAdapter:
     """
@@ -34,6 +37,10 @@ class MeasureAdapter:
         self._residual_memory: Dict[Tuple[str, str], float] = {}
         self._whiten_ema: Dict[Tuple[str, str], float] = {}
         self._rscale: Dict[Tuple[str, str], float] = {}
+        # Online bias estimator per (tracker,target) link
+        self._bias_ema: Dict[Tuple[str, str], float] = {}
+        self._bias_beta: float = 0.01  # slow learn-rate for constant bias
+        self._bias_clip: float = float(self.cfg.bias_clip)
 
     @staticmethod
     def _sigmoid(x: float) -> float:
@@ -49,20 +56,34 @@ class MeasureAdapter:
                 features: Optional[np.ndarray] = None) -> Tuple[float, float, Dict[str, Any]]:
         key = (tracker_id, target_id)
 
-        # Bias
+        # Bias: model-predicted + online EMA estimate (both gently clipped)
+        bias_est = float(self._bias_ema.get(key, 0.0))
+        bias_model = 0.0
         if self.bias_model is not None and features is not None:
             pred = self.bias_model.predict(features)
-            bias = float(np.clip(pred, -self.cfg.bias_clip, self.cfg.bias_clip))
-        else:
-            bias = 0.0
+            bias_model = float(np.clip(pred, -self.cfg.bias_clip, self.cfg.bias_clip))
+        bias = float(np.clip(bias_model + bias_est, -self._bias_clip, self._bias_clip))
         z_corr = float(z - bias)
 
-        # Reliability
+        # Reliability from LOS score (prob in [0,1])
         if los_score is not None:
-            rrel = self._sigmoid(self.cfg.alpha * float(los_score) + self.cfg.beta)
+            ls = float(np.clip(float(los_score), 0.0, 1.0))
+            # Map to a mild multiplier around 1.0
+            los_mult = 1.0 + self.cfg.los_influence * (ls - 0.5)  # 0.75..1.25 if influence=0.5
         else:
-            rrel = 0.5
-        rrel = float(np.clip(rrel, self.cfg.min_reliability, self.cfg.max_reliability))
+            los_mult = 1.0
+
+        # Reliability from geometry (|bearing_z|); small -> downweight, large -> upweight
+        if target_pred_pos is not None and tracker_pos is not None:
+            a = np.asarray(target_pred_pos, float) - np.asarray(tracker_pos, float)
+            nrm = np.linalg.norm(a) + 1e-9
+            ez = abs(a[2]) / nrm
+            geom_mult = 1.0 + self.cfg.geom_influence * (ez - 0.5)  # ~0.75..1.25 typically
+        else:
+            geom_mult = 1.0
+
+        # Compose reliability and clip
+        rrel = float(np.clip(los_mult * geom_mult, self.cfg.min_reliability, self.cfg.max_reliability))
 
         # Base variance + reliability shaping
         R_eff = self.cfg.base_range_var / max(rrel, 1e-6)
@@ -71,7 +92,16 @@ class MeasureAdapter:
         scale = self._rscale.get(key, 1.0)
         R_eff *= float(np.clip(scale, self.cfg.min_scale, self.cfg.max_scale))
 
-        meta = {"bias": bias, "reliability": rrel, "R_eff": R_eff, "z_in": z, "z_corr": z_corr, "scale": scale}
+        meta = {
+            "bias": bias,
+            "bias_online": bias_est,
+            "bias_model": bias_model,
+            "reliability": rrel,
+            "R_eff": R_eff,
+            "z_in": z,
+            "z_corr": z_corr,
+            "scale": scale,
+        }
         return z_corr, R_eff, meta
 
     def update_from_innov(self, tracker_id: str, target_id: str, innov: Optional[float], S: Optional[float]):
@@ -88,3 +118,7 @@ class MeasureAdapter:
         self._whiten_ema[key] = ema
         # Scale future R by current EMA
         self._rscale[key] = float(np.clip(ema, self.cfg.min_scale, self.cfg.max_scale))
+        # Slowly adapt online bias toward mean innovation
+        b = float(self._bias_ema.get(key, 0.0))
+        b = (1.0 - self._bias_beta) * b + self._bias_beta * float(innov)
+        self._bias_ema[key] = float(np.clip(b, -self._bias_clip, self._bias_clip))
