@@ -4,33 +4,36 @@ from typing import Dict, Any, Optional, Tuple
 import numpy as np
 
 try:
-    # Prefer a local copy under swarm_ml if you made one
-    from swarm_ml import los_classification as losmod  # type: ignore
+    from swarm_ml import los_classification as losmod  # optional
 except Exception:
     try:
-        import los_classification as losmod  # repo root
+        import los_classification as losmod
     except Exception:
         losmod = None
 
 @dataclass
 class AdapterConfig:
-    base_range_var: float = 0.10**2  # (m^2) nominal UWB variance
+    base_range_var: float = 0.35**2  # conservative default (m^2)
     min_reliability: float = 1e-3
     max_reliability: float = 1.0
-    bias_clip: float = 1.0  # cap bias correction magnitude
-    # Reliability shaping: r = sigmoid(alpha * s + beta)
+    bias_clip: float = 1.0
     alpha: float = 3.0
     beta: float = -1.0
+    # Innovation adaptation
+    ema_alpha: float = 0.05        # EMA for whiteness
+    min_scale: float = 0.25
+    max_scale: float = 8.0
 
 class MeasureAdapter:
     """
-    Produces (bias-corrected) range and an effective measurement covariance using
-    (optional) LOS/NLOS inference signal and residual heuristics. Plug-in point for BiasNet.
+    Bias-correct + reliability-shape + (optional) innovation-driven R scaling.
     """
     def __init__(self, cfg: AdapterConfig = AdapterConfig(), bias_model=None):
         self.cfg = cfg
         self.bias_model = bias_model
         self._residual_memory: Dict[Tuple[str, str], float] = {}
+        self._whiten_ema: Dict[Tuple[str, str], float] = {}
+        self._rscale: Dict[Tuple[str, str], float] = {}
 
     @staticmethod
     def _sigmoid(x: float) -> float:
@@ -44,32 +47,44 @@ class MeasureAdapter:
                 target_pred_pos: Optional[np.ndarray],
                 los_score: Optional[float],
                 features: Optional[np.ndarray] = None) -> Tuple[float, float, Dict[str, Any]]:
-        """
-        Returns:
-          z_corr: corrected range
-          R_eff:  effective variance
-          meta:   dict with diagnostics
-        """
-        # Bias from learned model if provided
+        key = (tracker_id, target_id)
+
+        # Bias
         if self.bias_model is not None and features is not None:
-            pred = self.bias_model.predict(features)  # must return scalar bias
+            pred = self.bias_model.predict(features)
             bias = float(np.clip(pred, -self.cfg.bias_clip, self.cfg.bias_clip))
         else:
             bias = 0.0
-
         z_corr = float(z - bias)
 
-        # Reliability from LOS classifier (if present) or from geometry
+        # Reliability
         if los_score is not None:
-            r = self._sigmoid(self.cfg.alpha * float(los_score) + self.cfg.beta)
+            rrel = self._sigmoid(self.cfg.alpha * float(los_score) + self.cfg.beta)
         else:
-            # fallback: slightly conservative default
-            r = 0.5
+            rrel = 0.5
+        rrel = float(np.clip(rrel, self.cfg.min_reliability, self.cfg.max_reliability))
 
-        r = float(np.clip(r, self.cfg.min_reliability, self.cfg.max_reliability))
+        # Base variance + reliability shaping
+        R_eff = self.cfg.base_range_var / max(rrel, 1e-6)
 
-        # Effective variance decreases with reliability
-        R_eff = self.cfg.base_range_var / max(r, 1e-6)
+        # Innovation-driven scaling (applied from previous steps)
+        scale = self._rscale.get(key, 1.0)
+        R_eff *= float(np.clip(scale, self.cfg.min_scale, self.cfg.max_scale))
 
-        meta = {"bias": bias, "reliability": r, "R_eff": R_eff, "z_in": z, "z_corr": z_corr}
+        meta = {"bias": bias, "reliability": rrel, "R_eff": R_eff, "z_in": z, "z_corr": z_corr, "scale": scale}
         return z_corr, R_eff, meta
+
+    def update_from_innov(self, tracker_id: str, target_id: str, innov: Optional[float], S: Optional[float]):
+        """
+        After a filter update, call this with the scalar innovation and S.
+        Adjust a per-link variance scaling to drive E[(nu^2)/S] -> 1.
+        """
+        if innov is None or S is None or S <= 0:
+            return
+        key = (tracker_id, target_id)
+        whiten = float((innov * innov) / S)
+        ema = self._whiten_ema.get(key, 1.0)
+        ema = (1.0 - self.cfg.ema_alpha) * ema + self.cfg.ema_alpha * whiten
+        self._whiten_ema[key] = ema
+        # Scale future R by current EMA
+        self._rscale[key] = float(np.clip(ema, self.cfg.min_scale, self.cfg.max_scale))

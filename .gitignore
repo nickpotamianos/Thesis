@@ -13,3 +13,4 @@ _site
 Gemfile.lock
 miluv_env
 data
+outputs_*

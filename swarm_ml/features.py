@@ -5,14 +5,23 @@ import numpy as np
 def se_translation_from_matrix(T: np.ndarray) -> np.ndarray:
     """
     Extract 3D translation from a 4x4 SE(3) or 5x5 SE_2(3) matrix.
-    Falls back to last column's first 3 entries.
+    For SE(2,3): columns [0:3]=R, 3=velocity, 4=position
+    For SE(3): position is in column 3 of 4x4 matrix
     """
     T = np.asarray(T)
-    if T.shape == (4, 4) or T.shape == (5, 5):
-        return T[:3, -1].reshape(3)
-    if T.size >= 3:
-        return np.array(T).reshape(-1)[:3]
-    raise ValueError("Unknown pose format for extracting translation.")
+    if T.shape == (4, 4):          # SE(3)
+        return T[:3, 3].copy()
+    if T.shape == (5, 5):          # SE(2,3): columns [0:3]=R, 3=velocity, 4=position
+        return T[:3, 4].copy()
+    # Fallback: last column as position (handles both cases)
+    return T[:3, -1].copy()
+
+def se_rotation_from_matrix(T: np.ndarray) -> np.ndarray:
+    """
+    Extract 3D rotation matrix from SE(3) or SE(2,3) matrix.
+    """
+    T = np.asarray(T)
+    return T[:3, :3].copy()
 
 def build_measurement_features(tracker_pos: np.ndarray,
                                target_pred_pos: Optional[np.ndarray],

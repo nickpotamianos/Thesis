@@ -6,15 +6,19 @@ from numpy.linalg import inv, slogdet
 
 @dataclass
 class IFConfig:
-    sigma_a: float = 1.0    # process accel noise std (m/s^2)
-    p0: float = 2.0         # initial position std (m)
-    v0: float = 1.0         # initial velocity std (m/s)
-    gate_N_sigma: float = 4.0
+    sigma_a_xy: float = 1.0     # horiz accel noise std (m/s^2)
+    sigma_a_z: float  = 0.5     # vertical accel noise std (m/s^2) -> tighter by default
+    p0_xy: float = 2.0          # initial pos std (x,y)
+    p0_z:  float = 2.0          # initial pos std (z)
+    v0_xy: float = 1.0          # initial vel std (x,y)
+    v0_z:  float = 1.0          # initial vel std (z)
+    gate_N_sigma: float = 3.0
 
 class TargetIF:
     """
     3D constant-velocity target filter in information form:
-      x = [p(3), v(3)], F = [[I, dt*I],[0,I]], Q(dt) standard CV.
+      x = [p(3), v(3)], F = [[I, dt*I],[0,I]]
+      Q(dt) uses per-axis acceleration noise (sigma_a_xy, sigma_a_z).
     Measurement: z = ||p - p_tracker|| + noise.
     """
     def __init__(self, x0: Optional[np.ndarray] = None, cfg: IFConfig = IFConfig()):
@@ -23,24 +27,40 @@ class TargetIF:
             self.mu = np.zeros(6)
         else:
             self.mu = x0.reshape(6)
-        P0 = np.diag([cfg.p0**2]*3 + [cfg.v0**2]*3)
+
+        P0 = np.diag([
+            cfg.p0_xy**2, cfg.p0_xy**2, cfg.p0_z**2,
+            cfg.v0_xy**2, cfg.v0_xy**2, cfg.v0_z**2
+        ])
         self.J = inv(P0)
         self.h = self.J @ self.mu
 
-        self._last_lin_point: Optional[np.ndarray] = None  # for diagnostics
-
     @staticmethod
-    def _F_Q(dt: float, sigma_a: float) -> Tuple[np.ndarray, np.ndarray]:
+    def _F(dt: float) -> np.ndarray:
         I = np.eye(3)
-        F = np.block([[I, dt*I],
-                      [np.zeros((3,3)), I]])
-        q = sigma_a**2
-        Q = np.block([[ (dt**3)/3 * q * I, (dt**2)/2 * q * I],
-                      [ (dt**2)/2 * q * I,    dt * q * I    ]])
-        return F, Q
+        return np.block([[I, dt*I],
+                         [np.zeros((3,3)), I]])
+
+    def _Q(self, dt: float) -> np.ndarray:
+        # axis-wise CV Q
+        qx = self.cfg.sigma_a_xy**2
+        qy = self.cfg.sigma_a_xy**2
+        qz = self.cfg.sigma_a_z**2
+        Q_axis = lambda q: np.block([
+            [ (dt**3)/3 * q, (dt**2)/2 * q ],
+            [ (dt**2)/2 * q,    dt * q     ]
+        ])
+        # build per-axis then assemble
+        Qx = Q_axis(qx); Qy = Q_axis(qy); Qz = Q_axis(qz)
+        Q = np.zeros((6,6))
+        Q[np.ix_([0,3],[0,3])] = Qx
+        Q[np.ix_([1,4],[1,4])] = Qy
+        Q[np.ix_([2,5],[2,5])] = Qz
+        return Q
 
     def predict(self, dt: float):
-        F, Q = self._F_Q(dt, self.cfg.sigma_a)
+        F = self._F(dt)
+        Q = self._Q(dt)
         P = inv(self.J)
         mu = self.mu
 
@@ -62,32 +82,23 @@ class TargetIF:
         return h0, H
 
     def correct(self, z: float, R: float, tracker_pos: np.ndarray) -> Dict[str, Any]:
-        # Gate
         h0, H = self._range_linearize(self.mu, tracker_pos)
         S = H @ inv(self.J) @ H.T + R
         innov = z - h0
         if float(innov**2 / S) > self.cfg.gate_N_sigma**2:
-            return {"used": False, "innov": innov, "S": float(S)}
+            return {"used": False, "innov": float(innov), "S": float(S)}
 
-        # Info update (linearized)
-        J_meas = H.T @ (1.0/R) @ H
-        h_meas = H.T @ (1.0/R) * (z - h0 + H @ self.mu)  # standard IF linearized form
+        J_meas = (1.0/R) * (H.T @ H)
+        h_meas = (1.0/R) * (H.T @ (z - h0 + H @ self.mu))
 
         self.J = self.J + J_meas
         self.h = self.h + h_meas
         self.mu = inv(self.J) @ self.h
-
         return {"used": True, "innov": float(innov), "S": float(S), "h0": float(h0)}
 
     def posterior(self) -> Tuple[np.ndarray, np.ndarray]:
         P = inv(self.J)
         return self.mu.copy(), P
-
-    @staticmethod
-    def info_from_mean_cov(mu: np.ndarray, P: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        J = inv(P)
-        h = J @ mu
-        return J, h
 
     @staticmethod
     def cov_metrics(P: np.ndarray) -> Dict[str, float]:
