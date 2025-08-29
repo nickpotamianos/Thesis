@@ -364,7 +364,8 @@ def main(args):
                     if np.isfinite(h_tgt) and np.isfinite(h_trk):
                         dz_meas = h_tgt - h_trk
                         R_h = 2.0 * (args.height_std ** 2)
-                        z_trk = float(eff_sensor_pos[2])
+                        # Use robot center/world z for the height sensor, not UWB tag geometry
+                        z_trk = float(tracker_pos[trk][2])
                         target_filters[trk].correct_height(dz_meas, z_trk, R_h)
             upd = target_filters[trk].correct(z_corr, R_eff, tracker_pos=eff_sensor_pos)
             if upd.get("used", False):
