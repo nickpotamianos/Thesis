@@ -96,7 +96,7 @@ def main(args):
         exp_dir="./data/three_robots",  # keep your local path
         cir=False,
         barometer=False,
-        height=True if args.use_height else False,
+        height=True if (args.use_height or args.use_height_tf) else False,
         imu="px4",
         cam=None,
         mag=False
@@ -106,7 +106,7 @@ def main(args):
 
     # Inter-robot UWB ranges + (optional) height
     uwb_range = _concat_with_robot(data, "uwb_range")
-    height_df = _concat_with_robot(data, "height") if args.use_height else pd.DataFrame(columns=["timestamp"])
+    height_df = _concat_with_robot(data, "height") if (args.use_height or args.use_height_tf) else pd.DataFrame(columns=["timestamp"])
 
     # Query timestamps (union of UWB and height times)
     query_timestamps = np.sort(np.unique(np.append(
@@ -202,6 +202,14 @@ def main(args):
 
     # LOS adapter
     los_adapter = LOSAdapter(LOSConfig(use_cir=args.use_cir, verbose=args.los_verbose))
+
+    # Height aligned to query timestamps (zero-order hold) for z-only target update
+    height_at_q: dict = {}
+    if args.use_height_tf and not height_df.empty:
+        for r in robots:
+            hdict = miluv.query_by_timestamps(query_timestamps, robots=r, sensors="height")[r]
+            # hdict["height"] has columns [timestamp, range], bias already removed
+            height_at_q[r] = hdict["height"]["range"].to_numpy(dtype=float)
 
     # Load BiasNet if provided
     if args.biasnet_dir is not None:
@@ -347,6 +355,17 @@ def main(args):
 
             # Local filter step
             target_filters[trk].predict(dt)
+            # Optional: z-only height-difference correction
+            if args.use_height_tf and height_at_q:
+                if roles.target in height_at_q and trk in height_at_q:
+                    # Zero-order held values aligned to query_timestamps
+                    h_tgt = float(height_at_q[roles.target][i])
+                    h_trk = float(height_at_q[trk][i])
+                    if np.isfinite(h_tgt) and np.isfinite(h_trk):
+                        dz_meas = h_tgt - h_trk
+                        R_h = 2.0 * (args.height_std ** 2)
+                        z_trk = float(eff_sensor_pos[2])
+                        target_filters[trk].correct_height(dz_meas, z_trk, R_h)
             upd = target_filters[trk].correct(z_corr, R_eff, tracker_pos=eff_sensor_pos)
             if upd.get("used", False):
                 meas_used += 1
@@ -414,6 +433,8 @@ if __name__ == "__main__":
     p.add_argument("--exp", required=True, help="Experiment name, e.g., default_3_random_0")
     p.add_argument("--target", default=None, help="Robot id to treat as target (default: last in sort)")
     p.add_argument("--use_height", action="store_true", help="Include height correction in authors' EKF")
+    p.add_argument("--use_height_tf", action="store_true", help="Use PX4 height to update the target filter (z-only)")
+    p.add_argument("--height_std", type=float, default=0.07, help="Std dev (m) of PX4 height per sensor; used for R_h")
     p.add_argument("--sigma_a", type=float, default=1.0, help="Target process accel noise std (m/s^2) [legacy, use sigma_a_xy/z]")
     p.add_argument("--sigma_a_xy", type=float, default=1.0, help="Horiz accel noise std (m/s^2)")
     p.add_argument("--sigma_a_z", type=float, default=0.5, help="Vertical accel noise std (m/s^2)")

@@ -96,6 +96,34 @@ class TargetIF:
         self.mu = inv(self.J) @ self.h
         return {"used": True, "innov": float(innov), "S": float(S), "h0": float(h0)}
 
+    def correct_height(self, dz_meas: float, z_trk: float, R_h: float) -> Dict[str, Any]:
+        """
+        Z-only linear update using height difference between target and tracker.
+          Measurement model: z = H x - z_trk + noise, H = [0 0 1 0 0 0]
+          where z ≈ (h_tgt - h_trk) and z_trk is the tracker's z in world frame
+          consistent with the geometry used elsewhere.
+        """
+        # Linear measurement setup
+        H = np.zeros((1, 6), dtype=float)
+        H[0, 2] = 1.0
+        # Predicted measurement at current state
+        h0 = float(H @ self.mu - z_trk)
+        # Gate on normalized innovation
+        P = inv(self.J)
+        S = float(H @ P @ H.T + R_h)
+        innov = float(dz_meas - h0)
+        if (innov * innov) / S > self.cfg.gate_N_sigma**2:
+            return {"used": False, "innov": float(innov), "S": float(S)}
+
+        # Information-form update (linear, no re-linearization needed)
+        J_meas = (1.0 / R_h) * (H.T @ H)
+        h_meas = (1.0 / R_h) * (H.T @ (dz_meas - h0 + H @ self.mu))
+
+        self.J = self.J + J_meas
+        self.h = self.h + h_meas
+        self.mu = inv(self.J) @ self.h
+        return {"used": True, "innov": float(innov), "S": float(S), "h0": float(h0)}
+
     def posterior(self) -> Tuple[np.ndarray, np.ndarray]:
         P = inv(self.J)
         return self.mu.copy(), P
