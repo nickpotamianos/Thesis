@@ -11,3 +11,5 @@ results
 _site
 .DS_Store
 Gemfile.lock
+miluv_env
+data

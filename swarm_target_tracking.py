@@ -1,0 +1,240 @@
+# swarm_target_tracking.py
+import argparse, os, json
+import numpy as np
+import pandas as pd
+
+# ---- Authors' devkit imports (do not modify) ----
+from miluv.data import DataLoader
+import miluv.utils as utils
+
+# The EKF models live in the examples package in upstream devkit.
+# Your local copy may also have them at repo root; we try examples first.
+try:
+    import examples.ekfutils.imu_three_robots_models as model
+except Exception:
+    import imu_three_robots_models as model  # fallback to local path if exported
+
+# ---- Our modules (new) ----
+from swarm_ml.roles import get_roles
+from swarm_ml.features import se_translation_from_matrix, build_measurement_features
+from swarm_ml.measure_adapter import MeasureAdapter, AdapterConfig
+from swarm_ml.target_filter import TargetIF, IFConfig
+from swarm_ml.fusion import CIFuser, CIFuserConfig
+from swarm_ml.evaluation_swarm import evaluate_and_save
+
+def _concat_with_robot(data: dict, key: str) -> pd.DataFrame:
+    # Concatenate per-robot DataFrame and annotate the source robot in a new column
+    dfs = []
+    for robot in data.keys():
+        if key in data[robot]:
+            dfs.append(data[robot][key].assign(robot=robot))
+    if not dfs:
+        return pd.DataFrame(columns=["timestamp"])
+    return pd.concat(dfs)
+
+def main(args):
+    exp_name = args.exp
+    os.makedirs(args.out, exist_ok=True)
+
+    # ----------------- Load data (authors' devkit) -----------------
+    miluv = DataLoader(
+        exp_name,
+        cir=False,         # we'll optionally read CIR in advanced versions
+        barometer=False,
+        height=True if args.use_height else False,
+        imu="px4",
+        cam=None,
+        mag=False
+    )
+    data = miluv.data
+    robots = list(data.keys())
+
+    # Inter-robot UWB ranges + (optional) height
+    uwb_range = _concat_with_robot(data, "uwb_range")
+    height_df = _concat_with_robot(data, "height") if args.use_height else pd.DataFrame(columns=["timestamp"])
+
+    # Query timestamps (as in docs): union of UWB and height timestamps
+    query_timestamps = np.sort(np.unique(np.append(
+        uwb_range["timestamp"].to_numpy(),
+        height_df["timestamp"].to_numpy() if not height_df.empty else np.array([], dtype=float)
+    )))
+
+    # IMU at query timestamps (authors' API)
+    imu_at_q = {
+        robot: miluv.query_by_timestamps(query_timestamps, robots=robot, sensors="imu_px4")[robot]
+        for robot in robots
+    }
+    gyro = {
+        robot: imu_at_q[robot]["imu_px4"][["timestamp", "angular_velocity.x", "angular_velocity.y", "angular_velocity.z"]]
+        for robot in robots
+    }
+    accel = {
+        robot: imu_at_q[robot]["imu_px4"][["timestamp", "linear_acceleration.x", "linear_acceleration.y", "linear_acceleration.z"]]
+        for robot in robots
+    }
+
+    # Ground truth (authors' tools)
+    gt_se23 = {
+        robot: utils.get_se23_poses(
+            data[robot]["mocap_quat"](query_timestamps),
+            data[robot]["mocap_pos"].derivative(nu=1)(query_timestamps),
+            data[robot]["mocap_pos"](query_timestamps)
+        )
+        for robot in robots
+    }
+
+    # ----------------- Initialize authors' multi-robot EKF -----------------
+    ekf_history = {
+        robot: {
+            "pose": model.common.MatrixStateHistory(state_dim=5, covariance_dim=9),
+            "bias": model.common.VectorStateHistory(state_dim=6),
+        }
+        for robot in robots
+    }
+
+    ekf = model.EKF(
+        {robot: gt_se23[robot][0] for robot in robots},
+        miluv.anchors,
+        miluv.tag_moment_arms
+    )
+
+    # ----------------- Our swarm setup -----------------
+    roles = get_roles(exp_name, robots, default_target=args.target, uwb_range_df=uwb_range)
+    print(f"[SWARM] Target: {roles.target}; Trackers: {roles.trackers}")
+
+    # Per-tracker target filters
+    tf_cfg = IFConfig(sigma_a=args.sigma_a, p0=args.p0, v0=args.v0, gate_N_sigma=4.0)
+    target_filters = {trk: TargetIF(x0=None, cfg=tf_cfg) for trk in roles.trackers}
+
+    # Measurement adapter (bias & reliability shaping)
+    meas_ai = MeasureAdapter(AdapterConfig(base_range_var=args.uwb_var))
+
+    # CI fusion
+    fuser = CIFuser(CIFuserConfig(objective=args.ci_objective, grid_step=args.ci_grid))
+
+    # Storage for our target estimates
+    mu_star_seq, P_star_seq = [], []
+
+    # ----------------- Main loop -----------------
+    for i in range(len(query_timestamps)):
+        t = query_timestamps[i]
+        # === Authors' EKF predict ===
+        u_dict = {
+            r: np.array([
+                gyro[r].iloc[i]["angular_velocity.x"], gyro[r].iloc[i]["angular_velocity.y"], gyro[r].iloc[i]["angular_velocity.z"],
+                accel[r].iloc[i]["linear_acceleration.x"], accel[r].iloc[i]["linear_acceleration.y"], accel[r].iloc[i]["linear_acceleration.z"]
+            ])
+            for r in robots
+        }
+        dt = (t - query_timestamps[i - 1]) if i > 0 else 0.0
+        ekf.predict(u_dict, dt)
+
+        # === Authors' EKF correct using inter-robot UWB (and optional height) ===
+        idx = np.where(uwb_range["timestamp"] == t)[0]
+        if len(idx) > 0:
+            rdata = uwb_range.iloc[idx]
+            # Forward to authors' correction (format per devkit)
+            ekf.correct({
+                "range": float(rdata["range"].iloc[0]),
+                "to_id": int(rdata["to_id"].iloc[0]),
+                "from_id": int(rdata["from_id"].iloc[0]),
+            })
+        if args.use_height and not height_df.empty:
+            hidx = np.where(height_df["timestamp"] == t)[0]
+            if len(hidx) > 0:
+                hdata = height_df.iloc[hidx]
+                ekf.correct({
+                    "height": float(hdata["range"].iloc[0]),
+                    "robot": str(hdata["robot"].iloc[0]),
+                })
+
+        # Store authors' EKF for post-processing (unchanged)
+        for r in robots:
+            ekf_history[r]["pose"].add(t, ekf.pose[r], ekf.pose_covariance[r])
+            ekf_history[r]["bias"].add(t, ekf.bias[r], ekf.bias_covariance[r])
+
+        # === Our parallel per-tracker target filtering ===
+        # Tracker poses from EKF estimate
+        tracker_pos = {r: se_translation_from_matrix(ekf.pose[r]) for r in roles.trackers}
+
+        # (Optional) last fused target to provide geometry for features
+        last_target_mu = mu_star_seq[-1] if len(mu_star_seq) > 0 else None
+        last_target_pos = last_target_mu[:3] if last_target_mu is not None else None
+
+        # Collect per-tracker local posteriors
+        parts = {}
+        node_feats = {}
+
+        # UWB measurements at t (inter-robot); we will reduce to a single value per trk-target by min across tag pairs seen at t
+        df_t = uwb_range[uwb_range["timestamp"] == t]
+
+        for trk in roles.trackers:
+            # Aggregate candidate ranges at t
+            z_cands = df_t["range"].to_numpy().astype(float) if not df_t.empty else np.array([])
+            if z_cands.size == 0:
+                # still predict-only update on target filter
+                target_filters[trk].predict(dt)
+                mu_i, P_i = target_filters[trk].posterior()
+                parts[trk] = (mu_i, P_i)
+                node_feats[trk] = np.array([0., 0., 0., 0.])  # placeholder
+                continue
+
+            z = float(np.min(z_cands))  # conservative aggregation: shortest inter-tag range
+
+            # Measurement intelligence (bias & reliability)
+            feat = build_measurement_features(
+                tracker_pos=tracker_pos[trk],
+                target_pred_pos=last_target_pos,
+                uwb_range=z,
+                los_score=None
+            )
+            z_corr, R_eff, meta = meas_ai.correct(
+                tracker_id=trk, target_id=roles.target, z=z,
+                tracker_pos=tracker_pos[trk], target_pred_pos=last_target_pos,
+                los_score=None, features=feat
+            )
+
+            # Local filter step
+            target_filters[trk].predict(dt)
+            target_filters[trk].correct(z_corr, R_eff, tracker_pos=tracker_pos[trk])
+            mu_i, P_i = target_filters[trk].posterior()
+            parts[trk] = (mu_i, P_i)
+
+            # Node features for learned fusion (here: variance norm + reliability)
+            var_pos = np.trace(P_i[:3, :3])
+            node_feats[trk] = np.array([var_pos, meta["reliability"], z, R_eff], dtype=float)
+
+        # CI fuse
+        mu_star, P_star, w = fuser.fuse(parts, method=args.ci_method,
+                                        node_features={k: node_feats[k] for k in parts.keys()})
+        mu_star_seq.append(mu_star)
+        P_star_seq.append(P_star)
+
+    # ----------------- Evaluate target tracking -----------------
+    # Ground truth target positions (aligned to query_timestamps)
+    gt_tgt_pos = np.array([se_translation_from_matrix(T) for T in gt_se23[roles.target]])
+
+    # Save evaluation
+    out_dir = os.path.join(args.out, f"{exp_name}_{roles.target}")
+    rm, nees_val = evaluate_and_save(np.array(mu_star_seq), np.array(P_star_seq), gt_tgt_pos, out_dir)
+
+    with open(os.path.join(out_dir, "roles.json"), "w") as f:
+        json.dump({"target": roles.target, "trackers": roles.trackers}, f, indent=2)
+
+    print(f"[DONE] Results written to: {out_dir}")
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--exp", required=True, help="Experiment name, e.g., default_3_random_0")
+    p.add_argument("--target", default=None, help="Robot id to treat as target (default: last in sort)")
+    p.add_argument("--use_height", action="store_true", help="Include height correction in authors' EKF")
+    p.add_argument("--sigma_a", type=float, default=1.0, help="Target process accel noise std (m/s^2)")
+    p.add_argument("--p0", type=float, default=2.0, help="Initial target position std (m)")
+    p.add_argument("--v0", type=float, default=1.0, help="Initial target velocity std (m/s)")
+    p.add_argument("--uwb_var", type=float, default=0.10**2, help="Baseline UWB variance (m^2)")
+    p.add_argument("--ci_method", choices=["uniform", "grid", "learned"], default="grid")
+    p.add_argument("--ci_objective", choices=["logdet","trace"], default="logdet")
+    p.add_argument("--ci_grid", type=float, default=0.1, help="Grid step for CI weights (e.g., 0.05 or 0.1)")
+    p.add_argument("--out", default="outputs_swarm")
+    args = p.parse_args()
+    main(args)

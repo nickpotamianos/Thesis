@@ -11,7 +11,8 @@ class TestDataLoader(unittest.TestCase):
 
     def setUp(self):
         self.loader = DataLoader(
-            "1c",
+            "default_3_random_0",
+            exp_dir="./data/three_robots",
             barometer=False,
             height=False,
             cir=False,
@@ -122,19 +123,19 @@ class TestDataLoader(unittest.TestCase):
                 for id in robot_ids
             ]))
         self.assertTrue(
-            data["ifo001"]["imu_px4"].iloc[0]["timestamp"] == 996361984.0)
+            data["ifo001"]["imu_px4"].iloc[0]["timestamp"] == 81.64540410041809)
         self.assertTrue(data["ifo001"]["imu_px4"].iloc[0]["angular_velocity.x"]
-                        == -0.0027618035674095)
+                        == -0.0027899034321308)
         self.assertTrue(data["ifo001"]["imu_px4"].iloc[0]["angular_velocity.y"]
-                        == 0.001820649835281)
+                        == -0.0009546658257022)
         self.assertTrue(data["ifo001"]["imu_px4"].iloc[0]["angular_velocity.z"]
-                        == 0.0012756492942571)
+                        == 0.0010748533532023)
         self.assertTrue(data["ifo001"]["imu_px4"].iloc[0]
-                        ["linear_acceleration.x"] == -0.4494863748550415)
+                        ["linear_acceleration.x"] == -0.5544447302818298)
         self.assertTrue(data["ifo001"]["imu_px4"].iloc[0]
-                        ["linear_acceleration.y"] == 0.0494523160159599)
+                        ["linear_acceleration.y"] == 0.1075368598103535)
         self.assertTrue(data["ifo001"]["imu_px4"].iloc[0]
-                        ["linear_acceleration.z"] == 9.807592391967772)
+                        ["linear_acceleration.z"] == 9.811885833740234)
 
         pass
 
@@ -177,13 +178,13 @@ class TestDataLoader(unittest.TestCase):
 
         self.assertTrue(imgs is not None)
         self.assertTrue(
-            imgs['ifo001']['bottom'].iloc[0]["timestamp"] == -13562247.0)
+            imgs['ifo001']['bottom'].iloc[0]["timestamp"] == 0)
         self.assertTrue(
-            imgs['ifo001']['color'].iloc[0]["timestamp"] == -28261638.0)
+            imgs['ifo001']['color'].iloc[0]["timestamp"] == 0)
         self.assertTrue(
-            imgs['ifo001']['infra1'].iloc[0]["timestamp"] == 972378516.0)
+            imgs['ifo001']['infra1'].iloc[0]["timestamp"] == 0)
         self.assertTrue(
-            imgs['ifo001']['infra2'].iloc[0]["timestamp"] == 972378516.0)
+            imgs['ifo001']['infra2'].iloc[0]["timestamp"] == 0)
 
         pass
 

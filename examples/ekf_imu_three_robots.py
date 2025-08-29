@@ -11,7 +11,7 @@ import examples.ekfutils.common as common
 
 def run_ekf_imu_three_robots(exp_name: str):
     #################### LOAD SENSOR DATA ####################
-    miluv = DataLoader(exp_name, imu = "px4", cam = None, mag = False)
+    miluv = DataLoader(exp_name, exp_dir="./data/three_robots", imu = "px4", cam = None, mag = False)
     data = miluv.data
 
     # Merge the UWB range and height data from all robots into a single dataframe
