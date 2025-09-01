@@ -9,7 +9,6 @@ def train_biasnet(train_samples, val_samples, in_dim, out_dir, lr=1e-3, epochs=3
     torch.manual_seed(seed)
     model = BiasNet(in_dim=in_dim)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
-    loss_fn = torch.nn.SmoothL1Loss()
 
     train_ds = BiasNetDataset(train_samples)
     val_ds = BiasNetDataset(val_samples)
@@ -27,8 +26,8 @@ def train_biasnet(train_samples, val_samples, in_dim, out_dir, lr=1e-3, epochs=3
                 xb, yb, wb = batch
             else:
                 xb, yb = batch
-                # default unit weights
-                wb = torch.ones_like(yb)
+                wb = torch.ones_like(yb)  # default unit weights
+
             opt.zero_grad()
             yhat = model(xb)
             # Weighted SmoothL1; normalize weights to keep scale stable
@@ -49,7 +48,7 @@ def train_biasnet(train_samples, val_samples, in_dim, out_dir, lr=1e-3, epochs=3
                 else:
                     xb, yb = batch
                 yhat = model(xb)
-                va_loss += loss_fn(yhat, yb).item() * xb.size(0)
+                va_loss += torch.nn.functional.smooth_l1_loss(yhat, yb).item() * xb.size(0)
         va_loss /= len(val_ds)
 
         print(f"[ep {ep+1:03d}] train={tr_loss:.4f} val={va_loss:.4f}")

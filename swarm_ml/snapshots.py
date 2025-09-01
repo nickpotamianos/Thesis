@@ -1,3 +1,4 @@
+# swarm_ml/snapshots.py
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any
@@ -13,7 +14,7 @@ from .los_adapter import LOSAdapter, LOSConfig
 class FusionSnap:
     timestamp: float
     order: List[str]                   # tracker ids order
-    X: np.ndarray                      # (N_nodes, d) node features (var_pos, reliability, z_agg, R_eff)
+    X: np.ndarray                      # (N_nodes, d) node features
     mus: np.ndarray                    # (N_nodes, 6) local posteriors mu_i
     Ps: np.ndarray                     # (N_nodes, 6, 6) local posteriors P_i
     gt_pos: np.ndarray                 # (3,)
@@ -74,7 +75,7 @@ class SnapshotCollector:
                         eff_sensor_pos_used: np.ndarray,
                         los_score: Optional[float]) -> None:
         """
-        Log a sample consistent with your runtime geometry (eff_sensor_pos used).
+        Log a sample consistent with runtime geometry (eff_sensor_pos used).
         Supervision uses GT target position at i.
         """
         t = float(self.ts[i])
@@ -88,7 +89,6 @@ class SnapshotCollector:
             uwb_range=float(z_agg),
             los_score=None if los_score is None else float(los_score),
         )
-        # keep feature layout identical to runtime builder (fills optional slots with zeros)
         feat = np.asarray(feat, dtype=float)
 
         self._bias_jsonl.append({
@@ -119,22 +119,40 @@ class SnapshotCollector:
         snap = FusionSnap(t, order, X, mus, Ps, gt_pos)
         self._fuse_jsonl.append(snap.to_json())
 
-    # ---- Persist ----
+        # ---- Persist ----
     def save(self, out_dir: str) -> None:
         os.makedirs(out_dir, exist_ok=True)
-        if self._bias_jsonl:
-            with open(os.path.join(out_dir, "bias_samples.jsonl"), "w") as f:
-                for row in self._bias_jsonl:
-                    f.write(json.dumps(row) + "\n")
-        if self._fuse_jsonl:
-            with open(os.path.join(out_dir, "fusion_snaps.jsonl"), "w") as f:
+        bias_path = os.path.join(out_dir, "bias_samples.jsonl")
+        fuse_path = os.path.join(out_dir, "fusion_snaps.jsonl")
+        fuse_gz_path = fuse_path + ".gz"
+
+        # Always create files, even if empty, so downstream CLIs never 404.
+        with open(bias_path, "w") as f:
+            for row in self._bias_jsonl:
+                f.write(json.dumps(row) + "\n")
+
+        with open(fuse_path, "w") as f:
+            for row in self._fuse_jsonl:
+                f.write(json.dumps(row) + "\n")
+
+        # Also write a gz copy of fusion snaps; ignore gzip errors but be verbose
+        try:
+            import gzip
+            with gzip.open(fuse_gz_path, "wt") as gf:
                 for row in self._fuse_jsonl:
-                    f.write(json.dumps(row) + "\n")
-            # Also write a gzipped copy for large files
-            try:
-                import gzip
-                with gzip.open(os.path.join(out_dir, "fusion_snaps.jsonl.gz"), "wt") as gf:
-                    for row in self._fuse_jsonl:
-                        gf.write(json.dumps(row) + "\n")
-            except Exception:
-                pass
+                    gf.write(json.dumps(row) + "\n")
+        except Exception as e:
+            print(f"[COLLECT] Note: could not write {fuse_gz_path}: {e}")
+
+        # Quick stats so you can validate immediately
+        stats = {
+            "n_bias_samples": int(len(self._bias_jsonl)),
+            "n_fusion_snaps": int(len(self._fuse_jsonl)),
+            "bias_path": bias_path,
+            "fusion_path": fuse_path,
+            "fusion_path_gz": fuse_gz_path,
+        }
+        with open(os.path.join(out_dir, "collect_stats.json"), "w") as f:
+            json.dump(stats, f, indent=2)
+        print(f"[COLLECT] bias samples: {stats['n_bias_samples']:,} -> {bias_path}")
+        print(f"[COLLECT] fusion snaps: {stats['n_fusion_snaps']:,} -> {fuse_path} (+ .gz)")

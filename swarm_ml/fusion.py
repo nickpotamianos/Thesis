@@ -7,11 +7,12 @@ from numpy.linalg import inv
 @dataclass
 class CIFuserConfig:
     objective: str = "logdet"   # "logdet" or "trace"
-    grid_step: float = 0.1       # weight grid for small N; safe & reproducible
+    grid_step: float = 0.1      # weight grid for small N; safe & reproducible
 
 class CIFuser:
     """
-    CI fusion over N tracker posteriors (mu_i, P_i). Supports:
+    Covariance Intersection (CI) fusion over N tracker posteriors (mu_i, P_i).
+    Supports:
       - uniform weights
       - grid-search weights to minimize trace/logdet(P)
       - learned weights via a model that outputs positive weights -> softmax
@@ -52,7 +53,6 @@ class CIFuser:
         """
         if n == 1:
             return np.array([[1.0]])
-        # recursion by stars-and-bars enumeration
         levels = int(round(1.0 / step))
         grids = []
         def rec(prefix, remain, depth):
@@ -68,8 +68,7 @@ class CIFuser:
     def _objective(self, P: np.ndarray) -> float:
         if self.cfg.objective == "trace":
             return float(np.trace(P))
-        # default: logdet
-        sign, logdet = np.linalg.slogdet(P)
+        sign, logdet = np.linalg.slogdet(P)  # default: logdet
         return float(logdet)
 
     def fuse(self,
@@ -87,7 +86,7 @@ class CIFuser:
             return mu, P, w
 
         if method == "learned" and self.weight_model is not None and node_features is not None:
-            # Stack node features in the same fusion order and get normalized weights
+            # Stack node features in the same order
             X = np.vstack([node_features[k].reshape(1, -1) for k in keys])
             weights_vec = self.weight_model.predict_weights(X)  # (N,)
             # Guard rails: clip and renormalize

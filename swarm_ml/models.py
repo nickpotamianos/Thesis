@@ -5,8 +5,8 @@ import torch.nn.functional as F
 
 class BiasNet(nn.Module):
     """
-    Small MLP that predicts scalar bias for a single range measurement.
-    Input features from features.build_measurement_features(...)
+    Small MLP that predicts scalar bias for a single UWB range measurement.
+    Input features must match features.build_measurement_features(...).
     """
     def __init__(self, in_dim: int, hidden: int = 64):
         super().__init__()
@@ -27,10 +27,11 @@ class BiasNet(nn.Module):
             y = self.forward(x).item()
         return y
 
+
 class FusionNet(nn.Module):
     """
     Predicts per-tracker weights via attention-like scoring.
-    Given per-node features (d-dimensional), produce unnormalized scores s_i.
+    Given per-node features (d-dimensional), produce normalized weights over nodes.
     """
     def __init__(self, in_dim: int, hidden: int = 64):
         super().__init__()
@@ -43,10 +44,10 @@ class FusionNet(nn.Module):
         self.score = nn.Linear(hidden, 1)
 
     def forward(self, X):  # X: (N_nodes, d)
-        H = self.enc(X)           # (N,h)
-        s = self.score(H).squeeze(-1)  # (N,)
-        w = F.softmax(s, dim=0)
-        return w  # (N,)
+        H = self.enc(X)                   # (N,h)
+        s = self.score(H).squeeze(-1)     # (N,)
+        w = F.softmax(s, dim=0)           # (N,)
+        return w
 
     def predict_weights(self, X_np):
         """
@@ -61,6 +62,6 @@ class FusionNet(nn.Module):
             w = self.forward(X)  # (N,)
             return w.cpu().numpy()
 
-    # Backward compatibility
+    # Backward compat alias
     def predict(self, X_np):
         return self.predict_weights(X_np)

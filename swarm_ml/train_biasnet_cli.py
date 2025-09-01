@@ -1,14 +1,14 @@
+# swarm_ml/train_biasnet_cli.py
 import argparse, os, json, random
 from typing import List, Dict
-from .datasets import load_bias_samples_jsonl, BiasNetDataset
+from .datasets import load_bias_samples_jsonl
 from .train_biasnet import train_biasnet
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--samples", required=True, help="Path to bias_samples.jsonl")
+    p.add_argument("--samples", required=True, help="Path to bias_samples.jsonl or .jsonl.gz")
     p.add_argument("--out", required=True, help="Output dir for model")
-    # Support both --val_split and --val_ratio for convenience
-    p.add_argument("--val_split", type=float, default=None)
+    p.add_argument("--val_split", type=float, default=None, help="Alias for --val_ratio")
     p.add_argument("--val_ratio", type=float, default=0.2)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--epochs", type=int, default=30)
@@ -19,7 +19,7 @@ if __name__ == "__main__":
     random.seed(args.seed)
 
     samples: List[Dict] = load_bias_samples_jsonl(args.samples)
-    # Shuffle and split
+    print(f"[CLI] Loaded {len(samples):,} bias samples from {os.path.abspath(args.samples)}")
     random.shuffle(samples)
     n_total = len(samples)
     val_ratio = args.val_ratio if (args.val_split is None) else args.val_split

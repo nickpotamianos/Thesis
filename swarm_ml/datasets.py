@@ -1,3 +1,4 @@
+# swarm_ml/datasets.py
 from __future__ import annotations
 from typing import List, Dict, Tuple, Optional
 import numpy as np
@@ -21,7 +22,8 @@ from .los_adapter import LOSAdapter, LOSConfig
 class BiasNetDataset(Dataset):
     """
     Supervision: bias = measured_range - true_geometric_range.
-    Each item: (features, bias) where features are built by build_measurement_features(...)
+    Each item: (features, bias, weight)
+    Weight defaults to 1.0, optionally derived from pair variance to up‑weight reliable pairs.
     """
     def __init__(self, samples: List[Dict]):
         self.samples = samples
@@ -83,21 +85,10 @@ def build_biasnet_samples(
     Build per-link supervised samples:
       bias = z_agg - true_geometric_range
 
-    Geometry for "true_geometric_range" is computed from **ground truth**:
-      - tracker sensor world position using the tags that actually fired at time t
-      - target tag offset in world using the target tags that fired at t
-      - distance to the target's GT body center (consistent with runtime parameterization)
-
-    Args:
-        roles: Roles(target, trackers, tag_ids_by_robot=tag_map)
-        query_timestamps: 1D array of times used throughout the run
-        uwb_range_df: concatenated inter-robot UWB ranges with columns:
-            ['timestamp','from_id','to_id','range','robot', ...]
-        gt_T_by_robot: {robot -> list of SE(3) or SE_2(3) matrices} at query_timestamps
-        tag_moment_arms: mapping from tag_id to arm (or nested by robot) from MILUV
-        tag_map: {robot -> [tag ids]} inferred earlier
-        height_series: optional per-robot height aligned to query_timestamps
-        los_adapter: optional LOSAdapter to produce a LOS score per pair_df
+    True geometric range uses GT:
+      - robust tracker sensor world position (tags that actually fired at t)
+      - robust target tag offset (tags that fired at t)
+      - distance to target GT body center (consistent with runtime parametrization)
     """
     if los_adapter is None:
         los_adapter = LOSAdapter(LOSConfig(verbose=False))
@@ -108,8 +99,7 @@ def build_biasnet_samples(
     tgt = roles.target
     trks = roles.trackers
 
-    # Ensure fast lookup by timestamp
-    # If your df is large, pre-grouping by timestamp is faster than boolean indexing
+    # Pre-group for faster per‑t timestamp access
     uwb_by_t = dict(tuple(uwb_range_df.groupby("timestamp"))) if "timestamp" in uwb_range_df.columns else {}
 
     for t in query_timestamps:
@@ -122,7 +112,7 @@ def build_biasnet_samples(
         p_tgt = gt_pos[tgt][k]
 
         for trk in trks:
-            # Keep rows that truly connect tracker tags to target tags
+            # rows that truly connect tracker tags to target tags
             df_pair = select_pair_rows(
                 df_t,
                 trk_tags=tag_map.get(trk, []),
@@ -131,12 +121,12 @@ def build_biasnet_samples(
             if df_pair.empty:
                 continue
 
-            # Robustly aggregate multiple tag pairs at this t
+            # robust aggregation across tag-pairs at t
             z_agg, R_pair, _ = robust_range_aggregate(
                 df_pair, base_var=base_var, rho=pair_corr, huber_delta=huber_delta
             )
 
-            # Tracker sensor world position using **GT** pose and the tags that actually fired
+            # tracker sensor world position (GT) and target offset (GT)
             T_trk = gt_T_by_robot[trk][k]
             p_trk_sens = robust_tracker_sensor_position(
                 pair_df=df_pair,
@@ -146,8 +136,6 @@ def build_biasnet_samples(
                 tag_moment_arms=tag_moment_arms,
                 huber_delta=huber_delta
             )
-
-            # Target tag offset in world using **GT** pose and the target tags that fired
             tgt_off_w = robust_target_offset(
                 pair_df=df_pair,
                 tgt_tags=tag_map.get(tgt, []),
@@ -155,45 +143,37 @@ def build_biasnet_samples(
                 tag_moment_arms=tag_moment_arms,
                 huber_delta=huber_delta
             )
-
-            # Effective sensor position consistent with runtime parametrization
             eff_sensor_pos_gt = p_trk_sens - tgt_off_w
 
-            # True geometric range (GT)
+            # True geometric range
             true_range = float(np.linalg.norm(p_tgt - eff_sensor_pos_gt))
 
-            # Optional LOS score (consistent with runtime)
-            los_score = los_adapter.score(df_pair)  # may return None
+            # Optional LOS score
+            los_score = los_adapter.score(df_pair)  # may be None
 
-            # Optional height difference (z_tgt - z_trk); if not provided, 0.0
+            # Optional height difference (z_tgt - z_trk)
             if height_series is not None and trk in height_series and tgt in height_series:
                 dz = float(height_series[tgt][k] - height_series[trk][k])
             else:
                 dz = 0.0
 
-            # Build measurement features; no target_pred_pos for offline labels
+            # Build feature vector (keep layout consistent with runtime builder)
             feat = build_measurement_features(
                 tracker_pos=eff_sensor_pos_gt,
                 target_pred_pos=None,
                 uwb_range=float(z_agg),
                 los_score=los_score,
                 residual_hist=None,
-                height_tracker=None,  # we directly pass height diff below
+                height_tracker=None,
                 height_target=None
             )
-            # Append height difference and simple residual stats to the tail to
-            # keep feature dimensionality aligned with your runtime builder
             feat = np.asarray(feat, dtype=float)
-            # Final feature vector length remains consistent with runtime builder:
-            # [uwb, bx, by, bz, dist, los, dz, mean_resid(0.0), var_resid(0.0)]
-            if feat.shape[0] >= 6:
-                feat[6] = dz  # overwrite height delta spot
-
-            bias = float(z_agg - true_range)
+            if feat.shape[0] >= 7:
+                feat[6] = dz  # overwrite 'dz' slot if present
 
             samples.append({
                 "features": feat.tolist(),
-                "bias": bias,
+                "bias": float(z_agg - true_range),
                 "meta": {
                     "timestamp": float(t),
                     "tracker": trk,
@@ -219,16 +199,31 @@ def save_bias_samples_jsonl(samples: List[Dict], path: str) -> None:
 
 
 def load_bias_samples_jsonl(path: str) -> List[Dict]:
-    import json, gzip
+    """
+    Load BiasNet samples from either .jsonl or .jsonl.gz.
+    Also auto-fallback across extensions if the given file is missing.
+    """
+    import json, gzip, os
+
+    def _resolve(p: str) -> str:
+        if os.path.exists(p):
+            return p
+        if p.endswith(".jsonl") and os.path.exists(p + ".gz"):
+            return p + ".gz"
+        if p.endswith(".jsonl.gz") and os.path.exists(p[:-3]):
+            return p[:-3]
+        raise FileNotFoundError(
+            f"Bias samples file not found. Tried: {p}, "
+            f"{p + '.gz' if p.endswith('.jsonl') else ''}, "
+            f"{p[:-3] if p.endswith('.gz') else ''}"
+        )
+
+    path = _resolve(path)
     out: List[Dict] = []
-    if path.endswith('.gz'):
-        fobj = gzip.open(path, 'rt')
-    else:
-        fobj = open(path, 'r')
-    with fobj as f:
+    open_fn = gzip.open if path.endswith(".gz") else open
+    with open_fn(path, "rt") as f:
         for line in f:
             line = line.strip()
-            if not line:
-                continue
-            out.append(json.loads(line))
+            if line:
+                out.append(json.loads(line))
     return out
