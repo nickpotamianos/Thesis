@@ -25,6 +25,8 @@ from swarm_ml.smoother import rts_smooth, CVNoise
 from swarm_ml.los_adapter import LOSAdapter, LOSConfig
 from swarm_ml.online_tuner import OnlineTuner, OnlineAdaptConfig
 from swarm_ml.snapshots import SnapshotCollector
+from swarm_ml.distrib_ci import GossipFuser, CommsConfig
+from swarm_ml.planning import suggest_vantage_moves
 
 def _concat_with_robot(data: dict, key: str) -> pd.DataFrame:
     dfs = []
@@ -244,6 +246,13 @@ def main(args):
         fuser.weight_model = load_fusionnet(args.fusionnet_dir)
         print(f"[SWARM] FusionNet loaded from: {args.fusionnet_dir} (CI learned weights)")
 
+    # Gossip fuser for decentralized CI
+    gossip = None
+    if args.decentralized:
+        gossip = GossipFuser(CommsConfig(
+            rounds=args.comm_rounds, p_link=args.comm_p, p_drop=args.comm_drop, seed=0))
+        print(f"[SWARM] Decentralized gossip CI enabled: p_link={args.comm_p}, p_drop={args.comm_drop}, rounds={args.comm_rounds}")
+
     # Optional ML data collector (BiasNet samples + FusionNet snaps)
     collector = None
     if args.collect_bias or args.collect_fusion:
@@ -264,6 +273,7 @@ def main(args):
     meas_avail, meas_used = 0, 0
     los_hits, los_misses = 0, 0
     vertical_sensitivities = []
+    action_rows = []  # For action suggestions CSV
 
     out_dir = os.path.join(args.out, f"{exp_name}_{roles.target}")
 
@@ -486,11 +496,38 @@ def main(args):
         if collector and args.collect_fusion:
             collector.add_fusion_snap(i=i, parts=parts, node_feats=node_feats)
 
-        # CI fuse per-tracker posteriors
-        mu_star, P_star, w = fuser.fuse(parts, method=args.ci_method,
-                                        node_features={k: node_feats[k] for k in parts.keys()})
+        # Decide which trackers to keep under budget
+        keep_keys = list(parts.keys())
+        if args.budget_k is not None and len(keep_keys) > args.budget_k:
+            if fuser.weight_model is not None:
+                # Use learned weights on node features
+                X_stack = np.vstack([node_feats[k].reshape(1, -1) for k in keep_keys])
+                w_pred = fuser.weight_model.predict_weights(X_stack)  # (N,)
+                order = np.argsort(-w_pred)[:args.budget_k]
+                keep_keys = [keep_keys[i] for i in order]
+            else:
+                # Fallback: use reliability from adapter/meta (index 1 in node_feats as we stored)
+                scored = [(k, float(node_feats[k][1])) for k in keep_keys]
+                keep_keys = [k for k,_ in sorted(scored, key=lambda x: -x[1])[:args.budget_k]]
+
+        # Reduce to budgeted set
+        parts = {k: parts[k] for k in keep_keys}
+        node_feats = {k: node_feats[k] for k in keep_keys}
+
+        # CI fuse per-tracker posteriors (centralized or decentralized)
+        if args.decentralized:
+            mu_star, P_star, w = gossip.fuse(parts)
+        else:
+            mu_star, P_star, w = fuser.fuse(parts, method=args.ci_method,
+                                            node_features={k: node_feats[k] for k in parts.keys()})
         mu_star_seq.append(mu_star)
         P_star_seq.append(P_star)
+
+        # Generate action suggestions for active sensing
+        if len(parts) > 0:
+            moves = suggest_vantage_moves(mu_star[:3], tracker_pos)
+            for trk, mv in moves.items():
+                action_rows.append([float(t), trk, float(mv[0]), float(mv[1]), float(mv[2])])
 
         # Log CI weights to CSV
         try:
@@ -553,6 +590,14 @@ def main(args):
             w.writerow(["timestamp","tracker","nis","S"])
             w.writerows(nis_rows)
 
+    # Save action suggestions CSV
+    if action_rows:
+        import csv
+        with open(os.path.join(out_dir, "action_suggestions.csv"), "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["timestamp","tracker","dx","dy","dz"])
+            w.writerows(action_rows)
+
     if 'w_file' in locals() and w_file is not None:
         try:
             w_file.close()
@@ -612,5 +657,12 @@ if __name__ == "__main__":
     p.add_argument("--collect_bias", action="store_true", help="Collect BiasNet samples during run")
     p.add_argument("--collect_fusion", action="store_true", help="Collect FusionNet snaps during run")
     p.add_argument("--collect_dir", default=None, help="Override output dir for collected data (default: experiment out dir)")
+    p.add_argument("--decentralized", action="store_true",
+                   help="Use decentralized gossip CI instead of centralized CI")
+    p.add_argument("--comm_p", type=float, default=1.0, help="Link probability in comms graph")
+    p.add_argument("--comm_drop", type=float, default=0.0, help="Packet drop probability per edge per round")
+    p.add_argument("--comm_rounds", type=int, default=1, help="Consensus rounds per timestep")
+    p.add_argument("--budget_k", type=int, default=None,
+                   help="If set, only the top-k trackers (by FusionNet weight or reliability) update and fuse")
     args = p.parse_args()
     main(args)
