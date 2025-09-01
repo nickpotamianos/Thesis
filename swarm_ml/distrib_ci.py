@@ -1,6 +1,6 @@
 # swarm_ml/distrib_ci.py
 from dataclasses import dataclass
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Optional
 import numpy as np
 
 @dataclass
@@ -41,7 +41,7 @@ class GossipFuser:
             A = np.maximum(A, A.T)  # undirected
         return A
 
-    def fuse(self, parts: Dict[str, Tuple[np.ndarray, np.ndarray]]):
+    def fuse(self, parts: Dict[str, Tuple[np.ndarray, np.ndarray]], weights: Optional[Dict[str, float]] = None):
         keys: List[str] = list(parts.keys())
         N = len(keys)
         if N == 1:
@@ -55,7 +55,8 @@ class GossipFuser:
             mu, P = parts[rid]
             Ji = np.linalg.inv(P + 1e-9 * np.eye(P.shape[0]))
             hi = Ji @ mu
-            J.append(Ji); h.append(hi)
+            wi = 1.0 if (weights is None) else float(weights.get(rid, 1.0))
+            J.append(wi * Ji); h.append(wi * hi)
         J = np.stack(J, axis=0)  # (N, d, d)
         h = np.stack(h, axis=0)  # (N, d)
 
@@ -88,6 +89,14 @@ class GossipFuser:
         P = np.linalg.inv(J_bar_reg)
         mu = P @ h_bar
 
-        # Provide implicit weights (uniform over nodes at convergence)
-        w = {keys[i]: 1.0 / N for i in range(N)}
+        # Provide implicit weights (uniform if none were provided)
+        if weights is None:
+            w = {keys[i]: 1.0 / N for i in range(N)}
+        else:
+            # Normalize provided weights to sum to 1 for logging
+            s = sum(max(0.0, float(weights.get(k, 0.0))) for k in keys)
+            if s <= 0:
+                w = {k: 1.0 / N for k in keys}
+            else:
+                w = {k: float(weights.get(k, 0.0)) / s for k in keys}
         return mu, P, w

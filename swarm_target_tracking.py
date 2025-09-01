@@ -334,6 +334,7 @@ def main(args):
         node_feats = {}
         df_t = uwb_range[uwb_range["timestamp"] == t]
 
+        info_gain_map = {}
         for trk in roles.trackers:
             # Select only tracker↔target tag pairs (either direction)
             pair_df = select_pair_rows(df_t,
@@ -353,6 +354,7 @@ def main(args):
                 nis_ema  = tuner._ema_nis.get((trk, roles.target), 1.0) if (tuner is not None) else 1.0
                 los_f    = 0.5
                 node_feats[trk] = np.array([var_pos, 0.0, 0.0, args.uwb_var, 0.0, los_f, gate_sig, nis_ema], dtype=float)
+                info_gain_map[trk] = 0.0
                 continue
 
             # robust aggregation across all tag pairs at t
@@ -424,6 +426,19 @@ def main(args):
                 target_filters[trk].cfg.sigma_a_z  = args.sigma_a_z  * float(qz_scale)
             target_filters[trk].predict(dt)
 
+            # Compute approximate one-step information gain (trace reduction) for budgeting
+            try:
+                h0_tmp, H_tmp = target_filters[trk]._range_linearize(target_filters[trk].mu, eff_sensor_pos)
+                from numpy.linalg import inv
+                P_pred_local_for_gain = inv(target_filters[trk].J)
+                Hc = H_tmp.reshape(-1, 1)
+                J_add = (1.0 / float(R_eff)) * (Hc @ Hc.T)
+                # A-optimal trace reduction
+                gain_trace = float(np.trace(P_pred_local_for_gain) - np.trace(inv(target_filters[trk].J + J_add)))
+            except Exception:
+                gain_trace = 0.0
+            info_gain_map[trk] = max(0.0, gain_trace)
+
             # Pre-gate (causal) using tuner's threshold if enabled
             if tuner is not None:
                 h0, H = target_filters[trk]._range_linearize(target_filters[trk].mu, eff_sensor_pos)
@@ -435,6 +450,7 @@ def main(args):
                 accepted = (float((nu_pred * nu_pred) / S_pred) <= gate_sigma * gate_sigma)
                 tuner.after_gating(link, accepted=accepted)
                 if not accepted:
+                    info_gain_map[trk] = 0.0
                     mu_i, P_i = target_filters[trk].posterior()
                     parts[trk] = (mu_i, P_i)
                     var_pos = np.trace(P_i[:3, :3])
@@ -478,7 +494,7 @@ def main(args):
                         geom_ez=geom_ez_val
                     )
                 if upd.get("S", None) is not None and upd.get("innov", None) is not None:
-                    nis_rows.append([float(t), trk, float((upd['innov']**2)/upd['S']), float(upd['S'])])
+                    nis_rows.append([float(t), trk, float((upd['innov']**2)/upd['S']), float(upd['S']), float(R_eff)])
 
             mu_i, P_i = target_filters[trk].posterior()
             parts[trk] = (mu_i, P_i)
@@ -499,16 +515,19 @@ def main(args):
         # Decide which trackers to keep under budget
         keep_keys = list(parts.keys())
         if args.budget_k is not None and len(keep_keys) > args.budget_k:
-            if fuser.weight_model is not None:
-                # Use learned weights on node features
-                X_stack = np.vstack([node_feats[k].reshape(1, -1) for k in keep_keys])
-                w_pred = fuser.weight_model.predict_weights(X_stack)  # (N,)
-                order = np.argsort(-w_pred)[:args.budget_k]
-                keep_keys = [keep_keys[i] for i in order]
-            else:
-                # Fallback: use reliability from adapter/meta (index 1 in node_feats as we stored)
-                scored = [(k, float(node_feats[k][1])) for k in keep_keys]
+            # Prefer information-gain (A-opt trace reduction); fallback to weights or reliability
+            try:
+                scored = [(k, float(info_gain_map.get(k, 0.0))) for k in keep_keys]
                 keep_keys = [k for k,_ in sorted(scored, key=lambda x: -x[1])[:args.budget_k]]
+            except Exception:
+                if fuser.weight_model is not None:
+                    X_stack = np.vstack([node_feats[k].reshape(1, -1) for k in keep_keys])
+                    w_pred = fuser.weight_model.predict_weights(X_stack)  # (N,)
+                    order = np.argsort(-w_pred)[:args.budget_k]
+                    keep_keys = [keep_keys[i] for i in order]
+                else:
+                    scored = [(k, float(node_feats[k][1])) for k in keep_keys]
+                    keep_keys = [k for k,_ in sorted(scored, key=lambda x: -x[1])[:args.budget_k]]
 
         # Reduce to budgeted set
         parts = {k: parts[k] for k in keep_keys}
@@ -516,7 +535,13 @@ def main(args):
 
         # CI fuse per-tracker posteriors (centralized or decentralized)
         if args.decentralized:
-            mu_star, P_star, w = gossip.fuse(parts)
+            if fuser.weight_model is not None and len(parts) > 0:
+                X_stack = np.vstack([node_feats[k].reshape(1, -1) for k in parts.keys()])
+                w_vec = fuser.weight_model.predict_weights(X_stack)
+                w_map = {k: float(w_vec[i]) for i, k in enumerate(parts.keys())}
+                mu_star, P_star, w = gossip.fuse(parts, weights=w_map)
+            else:
+                mu_star, P_star, w = gossip.fuse(parts)
         else:
             mu_star, P_star, w = fuser.fuse(parts, method=args.ci_method,
                                             node_features={k: node_feats[k] for k in parts.keys()})
@@ -587,7 +612,7 @@ def main(args):
         import csv
         with open(os.path.join(out_dir, "nis_log.csv"), "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["timestamp","tracker","nis","S"])
+            w.writerow(["timestamp","tracker","nis","S","R_eff"])
             w.writerows(nis_rows)
 
     # Save action suggestions CSV
