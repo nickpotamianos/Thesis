@@ -17,6 +17,7 @@ class AdapterConfig:
     min_reliability: float = 1e-3
     max_reliability: float = 1.0
     bias_clip: float = 1.0
+    bias_beta: float = 0.01
     alpha: float = 3.0
     beta: float = -1.0
     # Innovation adaptation
@@ -39,7 +40,7 @@ class MeasureAdapter:
         self._rscale: Dict[Tuple[str, str], float] = {}
         # Online bias estimator per (tracker,target) link
         self._bias_ema: Dict[Tuple[str, str], float] = {}
-        self._bias_beta: float = 0.01  # slow learn-rate for constant bias
+        self._bias_beta: float = float(self.cfg.bias_beta)  # slow learn-rate for constant bias
         self._bias_clip: float = float(self.cfg.bias_clip)
 
     @staticmethod

@@ -156,3 +156,20 @@ class SnapshotCollector:
             json.dump(stats, f, indent=2)
         print(f"[COLLECT] bias samples: {stats['n_bias_samples']:,} -> {bias_path}")
         print(f"[COLLECT] fusion snaps: {stats['n_fusion_snaps']:,} -> {fuse_path} (+ .gz)")
+
+        # Persist a simple schema for node feature layout to aid training
+        schema = {
+            "node_features_layout": {
+                "0": "var_pos_trace",
+                "1": "reliability",
+                "2": "z_agg_center",
+                "3": "R_eff",
+                "4": "geom_ez_abs",
+                "5": "los_score",
+                "6": "gate_sigma",
+                "7": "nis_ema"
+            },
+            "description": "Per-node feature indices used for FusionNet training",
+        }
+        with open(os.path.join(out_dir, "fusion_schema.json"), "w") as f:
+            json.dump(schema, f, indent=2)

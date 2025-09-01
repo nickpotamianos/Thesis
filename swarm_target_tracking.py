@@ -26,7 +26,8 @@ from swarm_ml.los_adapter import LOSAdapter, LOSConfig
 from swarm_ml.online_tuner import OnlineTuner, OnlineAdaptConfig
 from swarm_ml.snapshots import SnapshotCollector
 from swarm_ml.distrib_ci import GossipFuser, CommsConfig
-from swarm_ml.planning import suggest_vantage_moves
+from swarm_ml.planning import suggest_vantage_moves, suggest_vantage_moves_eig
+from swarm_control.bridge import ControlBridge
 
 def _concat_with_robot(data: dict, key: str) -> pd.DataFrame:
     dfs = []
@@ -250,8 +251,11 @@ def main(args):
     gossip = None
     if args.decentralized:
         gossip = GossipFuser(CommsConfig(
-            rounds=args.comm_rounds, p_link=args.comm_p, p_drop=args.comm_drop, seed=0))
-        print(f"[SWARM] Decentralized gossip CI enabled: p_link={args.comm_p}, p_drop={args.comm_drop}, rounds={args.comm_rounds}")
+            rounds=args.comm_rounds, p_link=args.comm_p, p_drop=args.comm_drop, seed=args.comm_seed))
+        print(f"[SWARM] Decentralized gossip CI enabled: p_link={args.comm_p}, p_drop={args.comm_drop}, rounds={args.comm_rounds}, seed={args.comm_seed}")
+
+    # Control bridge (optional live publish)
+    ctrl = ControlBridge(mode=args.control_mode, rate_hz=args.control_rate)
 
     # Optional ML data collector (BiasNet samples + FusionNet snaps)
     collector = None
@@ -335,6 +339,7 @@ def main(args):
         df_t = uwb_range[uwb_range["timestamp"] == t]
 
         info_gain_map = {}
+        r_eff_map = {}
         for trk in roles.trackers:
             # Select only tracker↔target tag pairs (either direction)
             pair_df = select_pair_rows(df_t,
@@ -417,7 +422,14 @@ def main(args):
                 tracker_pos=eff_sensor_pos, target_pred_pos=last_target_pos,
                 los_score=los_score, features=feat
             )
-            R_eff = max(R_eff, R_pair)
+            # Soft R-floor blending to avoid hard lower-bounding
+            if True:
+                # blend factor from CLI
+                k = float(getattr(args, 'r_floor_blend', 0.5))
+                R_eff = k * float(R_eff) + (1.0 - k) * float(max(R_eff, R_pair))
+            else:
+                R_eff = max(R_eff, R_pair)
+            r_eff_map[trk] = float(R_eff)
 
             # Local filter predict step (before gating)
             if tuner is not None and args.q_adapt:
@@ -550,9 +562,17 @@ def main(args):
 
         # Generate action suggestions for active sensing
         if len(parts) > 0:
-            moves = suggest_vantage_moves(mu_star[:3], tracker_pos)
+            if args.planner == 'eig':
+                moves = suggest_vantage_moves_eig(mu_star, P_star, tracker_pos, r_eff_map)
+            else:
+                moves = suggest_vantage_moves(mu_star[:3], tracker_pos)
             for trk, mv in moves.items():
                 action_rows.append([float(t), trk, float(mv[0]), float(mv[1]), float(mv[2])])
+            # Optional live publish (sim/mavsdk)
+            try:
+                ctrl.send_vantage_moves(float(t), moves)
+            except Exception:
+                pass
 
         # Log CI weights to CSV
         try:
@@ -581,7 +601,12 @@ def main(args):
     rm, nees_val = evaluate_and_save(np.array(mu_star_seq), np.array(P_star_seq), gt_tgt_pos, out_dir)
 
     with open(os.path.join(out_dir, "roles.json"), "w") as f:
-        json.dump({"target": roles.target, "trackers": roles.trackers, "tag_map": tag_map}, f, indent=2)
+        json.dump({
+            "target": roles.target,
+            "trackers": roles.trackers,
+            "tag_map": tag_map,
+            "comm": {"p_link": args.comm_p, "p_drop": args.comm_drop, "rounds": args.comm_rounds, "seed": args.comm_seed}
+        }, f, indent=2)
 
     # Save vertical sensitivity data
     if vertical_sensitivities:
@@ -614,6 +639,20 @@ def main(args):
             w = csv.writer(f)
             w.writerow(["timestamp","tracker","nis","S","R_eff"])
             w.writerows(nis_rows)
+        # Rolling timeseries for quick visibility
+        try:
+            df_nis = pd.DataFrame(nis_rows, columns=["timestamp","tracker","nis","S","R_eff"])
+            df_nis = df_nis.sort_values("timestamp").reset_index(drop=True)
+            df_nis["roll_mean_global"] = df_nis["nis"].rolling(window=200, min_periods=1).mean()
+            df_nis["roll_mean_tracker"] = df_nis.groupby("tracker")["nis"].rolling(window=200, min_periods=1).mean().reset_index(level=0, drop=True)
+            # Add chi-square(1) reference bands
+            df_nis["q50"] = 0.455
+            df_nis["q90"] = 2.706
+            df_nis["q95"] = 3.841
+            df_nis["q99"] = 6.635
+            df_nis.to_csv(os.path.join(out_dir, "nis_timeseries.csv"), index=False)
+        except Exception:
+            pass
 
     # Save action suggestions CSV
     if action_rows:
@@ -687,7 +726,12 @@ if __name__ == "__main__":
     p.add_argument("--comm_p", type=float, default=1.0, help="Link probability in comms graph")
     p.add_argument("--comm_drop", type=float, default=0.0, help="Packet drop probability per edge per round")
     p.add_argument("--comm_rounds", type=int, default=1, help="Consensus rounds per timestep")
+    p.add_argument("--comm_seed", type=int, default=0, help="Seed for comms graph randomness")
     p.add_argument("--budget_k", type=int, default=None,
                    help="If set, only the top-k trackers (by FusionNet weight or reliability) update and fuse")
+    p.add_argument("--planner", choices=["heuristic","eig"], default="heuristic")
+    p.add_argument("--control_mode", choices=["none","sim","mavsdk"], default="none")
+    p.add_argument("--control_rate", type=int, default=5)
+    p.add_argument("--r_floor_blend", type=float, default=0.5, help="Blend factor for soft R floor (0..1)")
     args = p.parse_args()
     main(args)
