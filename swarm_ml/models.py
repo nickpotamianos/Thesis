@@ -48,9 +48,19 @@ class FusionNet(nn.Module):
         w = F.softmax(s, dim=0)
         return w  # (N,)
 
-    def predict(self, x_np):
+    def predict_weights(self, X_np):
+        """
+        X_np: array-like of shape (N_nodes, d)
+        Returns: numpy array of shape (N_nodes,) that sums to 1.
+        """
+        self.eval()
         with torch.no_grad():
-            X = torch.tensor(x_np, dtype=torch.float32)
-            w = self.forward(X).cpu().numpy()
-        # Return scalar if single feature, else average
-        return float(w.mean()) if w.ndim == 1 else float(w.squeeze())
+            X = torch.tensor(X_np, dtype=torch.float32)
+            if X.ndim == 1:  # allow single-node input as (d,)
+                X = X.unsqueeze(0)
+            w = self.forward(X)  # (N,)
+            return w.cpu().numpy()
+
+    # Backward compatibility
+    def predict(self, X_np):
+        return self.predict_weights(X_np)

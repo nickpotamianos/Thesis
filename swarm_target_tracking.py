@@ -24,6 +24,7 @@ from swarm_ml.tagmap import infer_tag_ids_by_robot, select_pair_rows, robust_ran
 from swarm_ml.smoother import rts_smooth, CVNoise
 from swarm_ml.los_adapter import LOSAdapter, LOSConfig
 from swarm_ml.online_tuner import OnlineTuner, OnlineAdaptConfig
+from swarm_ml.snapshots import SnapshotCollector
 
 def _concat_with_robot(data: dict, key: str) -> pd.DataFrame:
     dfs = []
@@ -252,6 +253,21 @@ def main(args):
         fuser.weight_model = load_fusionnet(args.fusionnet_dir)
         print(f"[SWARM] FusionNet loaded from: {args.fusionnet_dir} (CI learned weights)")
 
+    # Optional ML data collector (BiasNet samples + FusionNet snaps)
+    collector = None
+    if args.collect_bias or args.collect_fusion:
+        collector = SnapshotCollector(
+            query_timestamps=query_timestamps,
+            roles=roles,
+            tag_map=tag_map,
+            gt_T_by_robot=gt_se23,
+            tag_moment_arms=miluv.tag_moment_arms,
+            base_var=base_var,
+            pair_corr=args.pair_corr,
+            huber_delta=args.huber_delta,
+            los_verbose=args.los_verbose
+        )
+
     # Storage for our target estimates
     mu_star_seq, P_star_seq = [], []
 
@@ -262,6 +278,17 @@ def main(args):
 
     # Vertical sensitivity logging
     vertical_sensitivities = []
+
+    # Precompute output dir for any streaming logs we may write
+    out_dir = os.path.join(args.out, f"{exp_name}_{roles.target}")
+
+    # CI weights logging
+    w_csv = None
+    w_file = None
+    w_header_written = False
+
+    # NIS logging
+    nis_rows = []
 
     # ----------------- Main loop -----------------
     for i in range(total_steps):
@@ -330,7 +357,13 @@ def main(args):
                 target_filters[trk].predict(dt)
                 mu_i, P_i = target_filters[trk].posterior()
                 parts[trk] = (mu_i, P_i)
-                node_feats[trk] = np.array([np.trace(P_i[:3, :3]), 0.0, 0.0, args.uwb_var], dtype=float)
+                # Richer node features (predict-only defaults)
+                var_pos = np.trace(P_i[:3, :3])
+                geom_ez = 0.0
+                gate_sig = target_filters[trk].cfg.gate_N_sigma
+                nis_ema  = tuner._ema_nis.get((trk, roles.target), 1.0) if (tuner is not None) else 1.0
+                los_f    = 0.5
+                node_feats[trk] = np.array([var_pos, 0.0, 0.0, args.uwb_var, geom_ez, los_f, gate_sig, nis_ema], dtype=float)
                 continue
 
             # NEW: robust aggregation across all tag pairs at t
@@ -385,6 +418,17 @@ def main(args):
                 meas_ai._rscale[link] = float(r_scale)
                 target_filters[trk].cfg.gate_N_sigma = float(tuner.get_gate_sigma(link))
 
+            # Collect BiasNet supervised sample using current geometry
+            if collector and args.collect_bias:
+                collector.add_bias_sample(
+                    i=i,
+                    trk=trk,
+                    pair_df=pair_df,
+                    z_agg=z_agg,
+                    eff_sensor_pos_used=eff_sensor_pos,
+                    los_score=los_score
+                )
+
             z_corr, R_eff, meta = meas_ai.correct(
                 tracker_id=trk, target_id=roles.target, z=z_agg_center,  # <<<<<<<<<<
                 tracker_pos=eff_sensor_pos, target_pred_pos=last_target_pos,
@@ -419,7 +463,15 @@ def main(args):
                     mu_i, P_i = target_filters[trk].posterior()
                     parts[trk] = (mu_i, P_i)
                     var_pos = np.trace(P_i[:3, :3])
-                    node_feats[trk] = np.array([var_pos, meta["reliability"], z_agg_center, R_eff], dtype=float)
+                    # Richer node features
+                    geom_ez = 0.0
+                    if last_target_pos is not None:
+                        b = (last_target_pos - eff_sensor_pos) / (np.linalg.norm(last_target_pos - eff_sensor_pos) + 1e-9)
+                        geom_ez = float(abs(b[2]))
+                    gate_sig = tuner.get_gate_sigma(link) if tuner is not None else target_filters[trk].cfg.gate_N_sigma
+                    nis_ema  = tuner._ema_nis.get(link, 1.0) if (tuner is not None) else 1.0
+                    los_f    = 0.5 if (los_score is None) else float(los_score)
+                    node_feats[trk] = np.array([var_pos, meta["reliability"], z_agg_center, R_eff, geom_ez, los_f, gate_sig, nis_ema], dtype=float)
                     continue
             # Optional: z-only height-difference correction
             if args.use_height_tf and height_at_q:
@@ -456,18 +508,44 @@ def main(args):
                         r_is_maxed=bool(float(r_scale) >= 0.6 * float(tuner.cfg.r_max_scale)),
                         geom_ez=geom_ez_val
                     )
+                # Log NIS
+                if upd.get("S", None) is not None and upd.get("innov", None) is not None:
+                    nis_rows.append([float(t), trk, float((upd['innov']**2)/upd['S']), float(upd['S'])])
 
             mu_i, P_i = target_filters[trk].posterior()
             parts[trk] = (mu_i, P_i)
             var_pos = np.trace(P_i[:3, :3])
             # keep features consistent with the actual measurement and geometry
-            node_feats[trk] = np.array([var_pos, meta["reliability"], z_agg_center, R_eff], dtype=float)
+            geom_ez = 0.0
+            if last_target_pos is not None:
+                b = (last_target_pos - eff_sensor_pos) / (np.linalg.norm(last_target_pos - eff_sensor_pos) + 1e-9)
+                geom_ez = float(abs(b[2]))
+            gate_sig = tuner.get_gate_sigma(link) if tuner is not None else target_filters[trk].cfg.gate_N_sigma
+            nis_ema  = tuner._ema_nis.get(link, 1.0) if (tuner is not None) else 1.0
+            los_f    = 0.5 if (los_score is None) else float(los_score)
+            node_feats[trk] = np.array([var_pos, meta["reliability"], z_agg_center, R_eff, geom_ez, los_f, gate_sig, nis_ema], dtype=float)
+
+        # Collect FusionNet snapshot before fusion (node features + local posteriors)
+        if collector and args.collect_fusion:
+            collector.add_fusion_snap(i=i, parts=parts, node_feats=node_feats)
 
         # CI fuse per-tracker posteriors
         mu_star, P_star, w = fuser.fuse(parts, method=args.ci_method,
                                         node_features={k: node_feats[k] for k in parts.keys()})
         mu_star_seq.append(mu_star)
         P_star_seq.append(P_star)
+        # Log CI weights
+        try:
+            if w_file is None:
+                import csv
+                os.makedirs(out_dir, exist_ok=True)
+                w_file = open(os.path.join(out_dir, "fusion_weights.csv"), "w", newline="")
+                w_csv = csv.writer(w_file)
+                # Use current order of keys
+                w_csv.writerow(["timestamp"] + [f"w_{rid}" for rid in w.keys()])
+            w_csv.writerow([float(t)] + [float(w[rid]) for rid in w.keys()])
+        except Exception:
+            pass
 
     # ----------------- Optional RTS smoothing -----------------
     if args.smooth:
@@ -482,8 +560,6 @@ def main(args):
 
     # ----------------- Evaluate target tracking -----------------
     gt_tgt_pos = np.array([se_translation_from_matrix(T) for T in gt_se23[roles.target]])
-
-    out_dir = os.path.join(args.out, f"{exp_name}_{roles.target}")
     rm, nees_val = evaluate_and_save(np.array(mu_star_seq), np.array(P_star_seq), gt_tgt_pos, out_dir)
 
     with open(os.path.join(out_dir, "roles.json"), "w") as f:
@@ -500,14 +576,34 @@ def main(args):
                 "max_sensitivity": float(np.max(vertical_sensitivities))
             }, f, indent=2)
 
-    # Save trajectory and basic diagnostics
-    out_csv = os.path.join(out_dir, "target_estimate.csv")
+    # Save trajectory and basic diagnostics (separate file to avoid overwriting evaluate_and_save output)
+    out_csv = os.path.join(out_dir, "target_state.csv")
     ts = np.asarray(query_timestamps).reshape(-1, 1)
     X = np.asarray(mu_star_seq)  # N x 6 [px,py,pz,vx,vy,vz]
     df = pd.DataFrame(np.hstack([ts, X]),
                       columns=["timestamp","px","py","pz","vx","vy","vz"]) 
     df.to_csv(out_csv, index=False)
     print(f"[SAVE] Trajectory -> {out_csv}")
+
+    # Persist NIS log if available
+    if nis_rows:
+        import csv
+        with open(os.path.join(out_dir, "nis_log.csv"), "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["timestamp","tracker","nis","S"])
+            w.writerows(nis_rows)
+
+    # Close weights CSV if open
+    if w_file is not None:
+        try:
+            w_file.close()
+        except Exception:
+            pass
+
+    # Persist collected ML data if enabled
+    if collector:
+        coll_dir = args.collect_dir if args.collect_dir else out_dir
+        collector.save(coll_dir)
 
     print(f"[SWARM] Measurements available (trk↔tgt) : {meas_avail}")
     print(f"[SWARM] Measurements used after gating : {meas_used}")
@@ -562,5 +658,8 @@ if __name__ == "__main__":
     p.add_argument("--biasnet_dir", default=None, help="Directory containing biasnet.pt and biasnet_meta.json")
     p.add_argument("--fusionnet_dir", default=None, help="Directory containing fusionnet.pt and fusionnet_meta.json")
     p.add_argument("--out", default="outputs_swarm")
+    p.add_argument("--collect_bias", action="store_true", help="Collect BiasNet samples during run")
+    p.add_argument("--collect_fusion", action="store_true", help="Collect FusionNet snaps during run")
+    p.add_argument("--collect_dir", default=None, help="Override output dir for collected data (default: experiment out dir)")
     args = p.parse_args()
     main(args)

@@ -27,7 +27,8 @@ class CIFuser:
         h_sum = None
         for rid, (mu, P) in parts.items():
             w = weights[rid]
-            J_i = inv(P)
+            # numerical stability jitter
+            J_i = inv(P + 1e-9 * np.eye(P.shape[0], dtype=P.dtype))
             h_i = J_i @ mu
             if J_sum is None:
                 J_sum = w * J_i
@@ -86,10 +87,13 @@ class CIFuser:
             return mu, P, w
 
         if method == "learned" and self.weight_model is not None and node_features is not None:
-            # model returns unconstrained scores; we softmax to simplex
-            scores = np.array([self.weight_model.predict(node_features[k]) for k in keys]).reshape(-1)
-            exps = np.exp(scores - scores.max())
-            w = {k: float(exps[i] / np.sum(exps)) for i, k in enumerate(keys)}
+            # Stack node features in the same fusion order and get normalized weights
+            X = np.vstack([node_features[k].reshape(1, -1) for k in keys])
+            weights_vec = self.weight_model.predict_weights(X)  # (N,)
+            # Guard rails: clip and renormalize
+            weights_vec = np.maximum(weights_vec, 1e-9)
+            weights_vec = weights_vec / np.sum(weights_vec)
+            w = {k: float(weights_vec[i]) for i, k in enumerate(keys)}
             mu, P = self._fuse_given_weights(parts, w)
             return mu, P, w
 

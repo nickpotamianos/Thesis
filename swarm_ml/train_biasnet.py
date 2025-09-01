@@ -21,10 +21,20 @@ def train_biasnet(train_samples, val_samples, in_dim, out_dir, lr=1e-3, epochs=3
     for ep in range(epochs):
         model.train()
         tr_loss = 0.0
-        for xb, yb in train_loader:
+        for batch in train_loader:
+            # Support (x,y,w) tuples from dataset
+            if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                xb, yb, wb = batch
+            else:
+                xb, yb = batch
+                # default unit weights
+                wb = torch.ones_like(yb)
             opt.zero_grad()
             yhat = model(xb)
-            loss = loss_fn(yhat, yb)
+            # Weighted SmoothL1; normalize weights to keep scale stable
+            per = torch.nn.functional.smooth_l1_loss(yhat, yb, reduction='none')
+            wnorm = wb / (wb.mean() + 1e-8)
+            loss = (wnorm * per).mean()
             loss.backward()
             opt.step()
             tr_loss += loss.item() * xb.size(0)
@@ -33,7 +43,11 @@ def train_biasnet(train_samples, val_samples, in_dim, out_dir, lr=1e-3, epochs=3
         model.eval()
         va_loss = 0.0
         with torch.no_grad():
-            for xb, yb in val_loader:
+            for batch in val_loader:
+                if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                    xb, yb, _ = batch
+                else:
+                    xb, yb = batch
                 yhat = model(xb)
                 va_loss += loss_fn(yhat, yb).item() * xb.size(0)
         va_loss /= len(val_ds)
