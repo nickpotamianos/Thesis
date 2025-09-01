@@ -23,6 +23,7 @@ from swarm_ml.evaluation_swarm import evaluate_and_save
 from swarm_ml.tagmap import infer_tag_ids_by_robot, select_pair_rows, robust_range_aggregate, robust_tracker_sensor_position, robust_target_offset
 from swarm_ml.smoother import rts_smooth, CVNoise
 from swarm_ml.los_adapter import LOSAdapter, LOSConfig
+from swarm_ml.online_tuner import OnlineTuner, OnlineAdaptConfig
 
 def _concat_with_robot(data: dict, key: str) -> pd.DataFrame:
     dfs = []
@@ -211,6 +212,20 @@ def main(args):
     # LOS adapter
     los_adapter = LOSAdapter(LOSConfig(use_cir=args.use_cir, verbose=args.los_verbose))
 
+    # Online self-calibration (causal, a-priori) using innovation statistics
+    tuner = None
+    if args.online_tune:
+        tuner = OnlineTuner(OnlineAdaptConfig(
+            ema_alpha=0.05,
+            r_min_scale=args.online_r_min_scale,
+            r_max_scale=args.online_r_max_scale,
+            gate_target_accept=args.gate_target,
+            gate_sigma_init=args.gate_sigma_init,
+            q_adapt=args.q_adapt,
+            q_alpha=0.05,
+            q_gain=0.25
+        ))
+
     # Height aligned to query timestamps (zero-order hold) for z-only target update
     height_at_q: dict = {}
     if args.use_height_tf and not height_df.empty:
@@ -307,6 +322,11 @@ def main(args):
                                        tgt_tags=tag_map.get(roles.target, []))
             if pair_df.empty:
                 # predict-only
+                # Optional process-noise adaptation (global scales)
+                if tuner is not None and args.q_adapt:
+                    qxy_scale, qz_scale = tuner.get_q_scales()
+                    target_filters[trk].cfg.sigma_a_xy = args.sigma_a_xy * float(qxy_scale)
+                    target_filters[trk].cfg.sigma_a_z  = args.sigma_a_z  * float(qz_scale)
                 target_filters[trk].predict(dt)
                 mu_i, P_i = target_filters[trk].posterior()
                 parts[trk] = (mu_i, P_i)
@@ -357,6 +377,14 @@ def main(args):
                 else:
                     los_hits += 1
 
+            # Fetch per-link R scale and gate sigma from tuner (if enabled)
+            link = (trk, roles.target)
+            r_scale = 1.0
+            if tuner is not None:
+                r_scale = tuner.get_r_scale(link)
+                meas_ai._rscale[link] = float(r_scale)
+                target_filters[trk].cfg.gate_N_sigma = float(tuner.get_gate_sigma(link))
+
             z_corr, R_eff, meta = meas_ai.correct(
                 tracker_id=trk, target_id=roles.target, z=z_agg_center,  # <<<<<<<<<<
                 tracker_pos=eff_sensor_pos, target_pred_pos=last_target_pos,
@@ -365,8 +393,34 @@ def main(args):
             # Combine adapter's reliability shaping with pair variance
             R_eff = max(R_eff, R_pair)
 
-            # Local filter step
+            # Local filter predict step (before gating)
+            # Optional process-noise adaptation (global scales)
+            if tuner is not None and args.q_adapt:
+                qxy_scale, qz_scale = tuner.get_q_scales()
+                target_filters[trk].cfg.sigma_a_xy = args.sigma_a_xy * float(qxy_scale)
+                target_filters[trk].cfg.sigma_a_z  = args.sigma_a_z  * float(qz_scale)
             target_filters[trk].predict(dt)
+
+            # Pre-gate using tuner's sigma if enabled (causal check before update)
+            if tuner is not None:
+                # Predict measurement at current state for gating
+                h0, H = target_filters[trk]._range_linearize(target_filters[trk].mu, eff_sensor_pos)
+                # Innovation and S using current covariance
+                from numpy.linalg import inv
+                P_pred_local = inv(target_filters[trk].J)
+                # scalar-safe H P H^T + R using einsum
+                S_pred = float(np.einsum('i,ij,j->', H.ravel(), P_pred_local, H.ravel()) + R_eff)
+                nu_pred = float(z_corr - h0)
+                gate_sigma = float(tuner.get_gate_sigma(link))
+                accepted = (float((nu_pred * nu_pred) / S_pred) <= gate_sigma * gate_sigma)
+                tuner.after_gating(link, accepted=accepted)
+                if not accepted:
+                    # Skip update if gate fails; move to posterior
+                    mu_i, P_i = target_filters[trk].posterior()
+                    parts[trk] = (mu_i, P_i)
+                    var_pos = np.trace(P_i[:3, :3])
+                    node_feats[trk] = np.array([var_pos, meta["reliability"], z_agg_center, R_eff], dtype=float)
+                    continue
             # Optional: z-only height-difference correction
             if args.use_height_tf and height_at_q:
                 if roles.target in height_at_q and trk in height_at_q:
@@ -380,16 +434,28 @@ def main(args):
                         z_trk = float(tracker_pos[trk][2])
                         target_filters[trk].correct_height(dz_meas, z_trk, R_h)
             upd = target_filters[trk].correct(z_corr, R_eff, tracker_pos=eff_sensor_pos)
+            # No extra tuner.after_gating() here to avoid double-counting
             if upd.get("used", False):
                 meas_used += 1
                 # NEW: feed innovation and S back to the adapter for future steps
                 meas_ai.update_from_innov(tracker_id=trk, target_id=roles.target,
                                           innov=upd.get("innov", None), S=upd.get("S", None))
 
-                # Log vertical sensitivity for observability analysis
+                # Log vertical sensitivity for observability analysis and feed tuner
+                geom_ez_val = None
                 if last_target_pos is not None:
                     bearing = (last_target_pos - eff_sensor_pos) / np.linalg.norm(last_target_pos - eff_sensor_pos)
-                    vertical_sensitivities.append(abs(bearing[2]))  # |e_z|
+                    geom_ez_val = float(abs(bearing[2]))
+                    vertical_sensitivities.append(geom_ez_val)  # |e_z|
+                # Feed per-link innovation stats back to tuner (causal)
+                if tuner is not None:
+                    tuner.after_update(
+                        link=link,
+                        innovation=float(upd.get("innov", 0.0)),
+                        S_scalar=float(upd.get("S", 1.0)),
+                        r_is_maxed=bool(float(r_scale) >= 0.6 * float(tuner.cfg.r_max_scale)),
+                        geom_ez=geom_ez_val
+                    )
 
             mu_i, P_i = target_filters[trk].posterior()
             parts[trk] = (mu_i, P_i)
@@ -477,9 +543,17 @@ if __name__ == "__main__":
     p.add_argument("--los_verbose", action="store_true", help="Print one-time LOS adapter diagnostics")
     p.add_argument("--los_influence", type=float, default=0.2, help="Strength of LOS->reliability (0..1)")
     p.add_argument("--geom_influence", type=float, default=0.4, help="Strength of |e_z|->reliability (0..1)")
-    p.add_argument("--ema_alpha", type=float, default=0.05, help="EMA for innovation whiteness")
+    # IMPORTANT: when --online_tune is ON, set --ema_alpha 0.0 to avoid double R-scaling
+    p.add_argument("--ema_alpha", type=float, default=0.0, help="EMA for innovation whiteness (MeasureAdapter)")
     p.add_argument("--r_min_scale", type=float, default=0.5, help="Lower bound on R scaling")
     p.add_argument("--r_max_scale", type=float, default=6.0, help="Upper bound on R scaling")
+    # Online tuner flags
+    p.add_argument("--online_tune", action="store_true", help="Enable OnlineTuner (causal self-calibration)")
+    p.add_argument("--online_r_min_scale", type=float, default=0.75)
+    p.add_argument("--online_r_max_scale", type=float, default=10.0)
+    p.add_argument("--gate_target", type=float, default=0.97)
+    p.add_argument("--gate_sigma_init", type=float, default=3.0)
+    p.add_argument("--q_adapt", action="store_true", help="Let tuner gently scale process noise (Q)")
     p.add_argument("--init_window", type=int, default=0,
                    help="Use first N timesteps to robustly initialize target position (0=off)")
     p.add_argument("--smooth", action="store_true", help="Enable RTS smoothing after filtering")

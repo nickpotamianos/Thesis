@@ -1,0 +1,139 @@
+[RUN-B2] default_3_random3_1 ifo001
+         env PYTHONPATH=/home/nick/Thesis miluv_env/bin/python swarm_target_tracking.py --exp default_3_random3_1 --target ifo001 --use_height --use_height_tf --uwb_std 0.33 --pair_corr 0.75 --sigma_a_xy 1.0 --sigma_a_z 0.45 --ci_method grid --ci_objective trace --use_los --los_influence 0.2 --geom_influence 0.4 --ema_alpha 0.0 --online_tune --online_r_min_scale 0.75 --online_r_max_scale 10.0 --gate_target 0.97 --gate_sigma_init 3.0 --q_adapt --out outputs_online_tuned_v2
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+[SWARM] Target RMSE (m): {'rmse_x': 0.391399545757219, 'rmse_y': 0.33627845701536757, 'rmse_z': 0.142003048144612, 'rmse_3d': 0.5352024577241371}  NEES: 2.324
+[SAVE] Trajectory -> outputs_online_tuned_v2/default_3_random3_1_ifo001/target_estimate.csv
+[SWARM] Measurements available (trk↔tgt) : 4572
+[SWARM] Measurements used after gating : 4544
+[SWARM] LOS scores produced: 4572, missing: 0
+[SWARM] Vertical sensitivity: mean=0.169, median=0.144
+[DONE] Results written to: outputs_online_tuned_v2/default_3_random3_1_ifo001
+[RUN-B2] default_3_random3_1 ifo002
+         env PYTHONPATH=/home/nick/Thesis miluv_env/bin/python swarm_target_tracking.py --exp default_3_random3_1 --target ifo002 --use_height --use_height_tf --uwb_std 0.33 --pair_corr 0.75 --sigma_a_xy 1.0 --sigma_a_z 0.45 --ci_method grid --ci_objective trace --use_los --los_influence 0.2 --geom_influence 0.4 --ema_alpha 0.0 --online_tune --online_r_min_scale 0.75 --online_r_max_scale 10.0 --gate_target 0.97 --gate_sigma_init 3.0 --q_adapt --out outputs_online_tuned_v2
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+[SWARM] Target: ifo002; Trackers: ['ifo001', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+[SWARM] Target RMSE (m): {'rmse_x': 1.2930027500758825, 'rmse_y': 0.9180666449495629, 'rmse_z': 0.20178138075418514, 'rmse_3d': 1.598567546865568}  NEES: 10.589
+[SAVE] Trajectory -> outputs_online_tuned_v2/default_3_random3_1_ifo002/target_estimate.csv
+[SWARM] Measurements available (trk↔tgt) : 4554
+[SWARM] Measurements used after gating : 4543
+[SWARM] LOS scores produced: 4554, missing: 0
+[SWARM] Vertical sensitivity: mean=0.163, median=0.124
+[DONE] Results written to: outputs_online_tuned_v2/default_3_random3_1_ifo002
+[RUN-B2] default_3_random3_1 ifo003
+         env PYTHONPATH=/home/nick/Thesis miluv_env/bin/python swarm_target_tracking.py --exp default_3_random3_1 --target ifo003 --use_height --use_height_tf --uwb_std 0.33 --pair_corr 0.75 --sigma_a_xy 1.0 --sigma_a_z 0.45 --ci_method grid --ci_objective trace --use_los --los_influence 0.2 --geom_influence 0.4 --ema_alpha 0.0 --online_tune --online_r_min_scale 0.75 --online_r_max_scale 10.0 --gate_target 0.97 --gate_sigma_init 3.0 --q_adapt --out outputs_online_tuned_v2
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+[SWARM] Target: ifo003; Trackers: ['ifo001', 'ifo002']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+[SWARM] Target RMSE (m): {'rmse_x': 0.4212578986593408, 'rmse_y': 0.4278016914956055, 'rmse_z': 0.1777531953603495, 'rmse_3d': 0.6261538971292908}  NEES: 2.886
+[SAVE] Trajectory -> outputs_online_tuned_v2/default_3_random3_1_ifo003/target_estimate.csv
+[SWARM] Measurements available (trk↔tgt) : 4564
+[SWARM] Measurements used after gating : 4528
+[SWARM] LOS scores produced: 4564, missing: 0
+[SWARM] Vertical sensitivity: mean=0.156, median=0.125
+[DONE] Results written to: outputs_online_tuned_v2/default_3_random3_1_ifo003
+[RUN-B2] default_3_random3_2 ifo001
+         env PYTHONPATH=/home/nick/Thesis miluv_env/bin/python swarm_target_tracking.py --exp default_3_random3_2 --target ifo001 --use_height --use_height_tf --uwb_std 0.33 --pair_corr 0.75 --sigma_a_xy 1.0 --sigma_a_z 0.45 --ci_method grid --ci_objective trace --use_los --los_influence 0.2 --geom_influence 0.4 --ema_alpha 0.0 --online_tune --online_r_min_scale 0.75 --online_r_max_scale 10.0 --gate_target 0.97 --gate_sigma_init 3.0 --q_adapt --out outputs_online_tuned_v2
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [11, 10], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+[SWARM] Target RMSE (m): {'rmse_x': 1.7323704120911434, 'rmse_y': 1.2765225710392079, 'rmse_z': 0.2897676371584784, 'rmse_3d': 2.1713089145964024}  NEES: 14.194
+[SAVE] Trajectory -> outputs_online_tuned_v2/default_3_random3_2_ifo001/target_estimate.csv
+[SWARM] Measurements available (trk↔tgt) : 4126
+[SWARM] Measurements used after gating : 4014
+[SWARM] LOS scores produced: 4126, missing: 0
+[SWARM] Vertical sensitivity: mean=0.168, median=0.125
+[DONE] Results written to: outputs_online_tuned_v2/default_3_random3_2_ifo001
+[RUN-B2] default_3_random3_2 ifo002
+         env PYTHONPATH=/home/nick/Thesis miluv_env/bin/python swarm_target_tracking.py --exp default_3_random3_2 --target ifo002 --use_height --use_height_tf --uwb_std 0.33 --pair_corr 0.75 --sigma_a_xy 1.0 --sigma_a_z 0.45 --ci_method grid --ci_objective trace --use_los --los_influence 0.2 --geom_influence 0.4 --ema_alpha 0.0 --online_tune --online_r_min_scale 0.75 --online_r_max_scale 10.0 --gate_target 0.97 --gate_sigma_init 3.0 --q_adapt --out outputs_online_tuned_v2
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+[SWARM] Target: ifo002; Trackers: ['ifo001', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [11, 10], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+[SWARM] Target RMSE (m): {'rmse_x': 1.718613405398531, 'rmse_y': 1.545385248034717, 'rmse_z': 0.5720072426124309, 'rmse_3d': 2.3809745667814175}  NEES: 17.424
+[SAVE] Trajectory -> outputs_online_tuned_v2/default_3_random3_2_ifo002/target_estimate.csv
+[SWARM] Measurements available (trk↔tgt) : 4110
+[SWARM] Measurements used after gating : 4054
+[SWARM] LOS scores produced: 4110, missing: 0
+[SWARM] Vertical sensitivity: mean=0.179, median=0.129
+[DONE] Results written to: outputs_online_tuned_v2/default_3_random3_2_ifo002
+[RUN-B2] default_3_random3_2 ifo003
+         env PYTHONPATH=/home/nick/Thesis miluv_env/bin/python swarm_target_tracking.py --exp default_3_random3_2 --target ifo003 --use_height --use_height_tf --uwb_std 0.33 --pair_corr 0.75 --sigma_a_xy 1.0 --sigma_a_z 0.45 --ci_method grid --ci_objective trace --use_los --los_influence 0.2 --geom_influence 0.4 --ema_alpha 0.0 --online_tune --online_r_min_scale 0.75 --online_r_max_scale 10.0 --gate_target 0.97 --gate_sigma_init 3.0 --q_adapt --out outputs_online_tuned_v2
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/csaps/_sspumv.py:301: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+  u = la.spsolve(a, b)
+[SWARM] Target: ifo003; Trackers: ['ifo001', 'ifo002']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [11, 10], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+[SWARM] Target RMSE (m): {'rmse_x': 1.437627686780238, 'rmse_y': 1.7920681092731712, 'rmse_z': 0.5523115181212305, 'rmse_3d': 2.3629069992533425}  NEES: 17.193
+[SAVE] Trajectory -> outputs_online_tuned_v2/default_3_random3_2_ifo003/target_estimate.csv
+[SWARM] Measurements available (trk↔tgt) : 4106
+[SWARM] Measurements used after gating : 4072
+[SWARM] LOS scores produced: 4106, missing: 0
+[SWARM] Vertical sensitivity: mean=0.149, median=0.124
+[DONE] Results written to: outputs_online_tuned_v2/default_3_random3_2_ifo003
+[DONE] Scheduled 6 tuned v2 runs to match last baseline stress combos.
