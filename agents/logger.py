@@ -25,6 +25,11 @@ def _load_fusionnet(path_dir: str):
     state = torch.load(os.path.join(path_dir, "fusionnet.pt"), map_location="cpu")
     m.load_state_dict(state)
     m.eval()
+    # expose expected input feature dim for assertion later
+    try:
+        m.input_dim = int(in_dim)
+    except Exception:
+        pass
     return m
 
 def main():
@@ -89,6 +94,10 @@ def main():
     fused_mu, fused_P, fused_t = [], [], []
     fusion_weights_file = None
     fusion_weights_writer = None
+    fusion_cols = None
+    # Basic per-tracker counters
+    recv_count = collections.Counter()
+    missing_at_fuse = collections.Counter()
 
     # Output directory per (exp,target)
     out_dir = os.path.join(args.out, f"{args.exp}_{args.target}")
@@ -122,6 +131,14 @@ def main():
             parts[rid] = (mu, P)
             node_feats[rid] = X
 
+        # Assert FusionNet feature dimensionality matches model expectation
+        if (args.method == "learned") and (fuser.weight_model is not None):
+            any_feats = next(iter(node_feats.values()), None)
+            if any_feats is not None:
+                expected = int(getattr(fuser.weight_model, "input_dim", len(any_feats)))
+                assert len(any_feats) == expected, \
+                    f"FusionNet expects {expected} features, got {len(any_feats)}"
+
         # Fuse (centralized or gossip) and record
         if args.method == "gossip":
             mu_star, P_star, w = gossip.fuse(parts)
@@ -143,16 +160,25 @@ def main():
                 "P":  P_star.tolist()
             })
 
-        # Log weights
+        # Log weights: stable header order matches declared trackers
         try:
             import csv
             if fusion_weights_file is None:
                 fusion_weights_file = open(os.path.join(out_dir, "fusion_weights.csv"), "w", newline="")
                 fusion_weights_writer = csv.writer(fusion_weights_file)
-                fusion_weights_writer.writerow(["timestamp"] + [f"w_{rid}" for rid in w.keys()])
-            else:
-                fusion_weights_writer = fusion_weights_writer  # noqa
-            fusion_weights_writer.writerow([float(tb)] + [float(w[r]) for r in w.keys()])
+                fusion_cols = [f"w_{rid}" for rid in trackers]
+                fusion_weights_writer.writerow(["timestamp"] + fusion_cols)
+            # write NaN when a tracker's weight is missing at this tb
+            row = [float(tb)] + [float(w.get(rid, float('nan'))) for rid in trackers]
+            fusion_weights_writer.writerow(row)
+        except Exception:
+            pass
+
+        # Count missing trackers at fuse time (for diagnostics)
+        try:
+            for rid in trackers:
+                if rid not in present:
+                    missing_at_fuse[rid] += 1
         except Exception:
             pass
 
@@ -166,6 +192,9 @@ def main():
     try:
         while True:
             m = rx()
+            # Schema/version filter
+            if int(m.get("v", 0)) != 1:
+                continue
             # Ignore our own fused-state broadcasts
             if m.get("type") == "fused":
                 continue
@@ -176,6 +205,7 @@ def main():
             r_eff = float(m.get("r_eff", 0.35**2))
             window[tb][rid] = {"mu": mu, "P": P, "X": X, "r_eff": r_eff}
             last_seen_t[rid] = time.time()
+            recv_count[rid] += 1
 
             # attempt fusion at this timestamp
             maybe_fuse(tb)
@@ -225,6 +255,15 @@ def main():
     # Minimal roles manifest
     with open(os.path.join(out_dir, "roles.json"), "w") as f:
         json.dump({"target": args.target, "trackers": trackers}, f, indent=2)
+
+    # Diagnostics summary
+    try:
+        total_fused = len(fused_t)
+        print(f"[STATS] fused_timestamps={total_fused} / query={len(query_timestamps)}")
+        print(f"[STATS] recv_count={dict(recv_count)}")
+        print(f"[STATS] missing_at_fuse={dict(missing_at_fuse)}")
+    except Exception:
+        pass
 
     print(f"[DONE] Results written to: {out_dir}")
 

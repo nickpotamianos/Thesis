@@ -1,5 +1,5 @@
 # agent/robot_node.py
-import argparse, time, json
+import argparse, time, json, os
 import numpy as np
 import pandas as pd
 
@@ -66,6 +66,11 @@ def main():
     ap.add_argument("--biasnet_dir", default=None)
     ap.add_argument("--use_height_tf", action="store_true")
     ap.add_argument("--height_std", type=float, default=0.07)
+    ap.add_argument("--r_floor_blend", type=float, default=0.5,
+                    help="Blend factor for soft R floor with pair variance (0..1)")
+    # expose influences for quick A/B
+    ap.add_argument("--los_influence", type=float, default=0.5)
+    ap.add_argument("--geom_influence", type=float, default=0.5)
     # online tuner (innovation-driven R scale, adaptive gating, optional Q adapt)
     ap.add_argument("--online_tune", action="store_true")
     ap.add_argument("--online_r_min_scale", type=float, default=0.75)
@@ -74,6 +79,7 @@ def main():
     ap.add_argument("--gate_sigma_init", type=float, default=3.0)
     ap.add_argument("--q_adapt", action="store_true")
     ap.add_argument("--realtime", action="store_true", help="Sleep to approximate wall-time replay")
+    ap.add_argument("--allow_same_t_fanout", action="store_true", help="If set, allow using fused state at same timestamp (not recommended)")
     args = ap.parse_args()
 
     ip, port = args.udp.split(":")
@@ -145,7 +151,9 @@ def main():
 
     # Measurement adaptation (BiasNet/LOS/reliability shaping)
     base_var = (args.uwb_std**2) if (args.uwb_std is not None) else args.uwb_var
-    mcfg = AdapterConfig(base_range_var=base_var)
+    mcfg = AdapterConfig(base_range_var=base_var,
+                         los_influence=args.los_influence,
+                         geom_influence=args.geom_influence)
     meas_ai = MeasureAdapter(mcfg, bias_model=_load_biasnet(args.biasnet_dir))
     los_adapter = LOSAdapter(LOSConfig(use_cir=args.use_cir, verbose=args.los_verbose)) if args.use_los else None
 
@@ -176,6 +184,17 @@ def main():
     # last fused state (for geometry & gating only)
     last_fused_mu = None
     last_fused_t  = None
+    did_warmstart = False
+    EPS = 1e-6
+
+    # Prepare NIS log (per-node)
+    nis_log_path = os.path.join("logs", f"nis_node_{args.id}.csv")
+    try:
+        if not os.path.exists(nis_log_path):
+            with open(nis_log_path, "w") as f:
+                f.write("t,nis\n")
+    except Exception:
+        pass
 
     # ----------------- Main loop -----------------
     for i, t in enumerate(query_timestamps):
@@ -184,9 +203,15 @@ def main():
             m = rx_nb()
             if m is None:
                 break
+            # schema check
+            if int(m.get("v", 0)) != 1:
+                continue
             if m.get("type") == "fused":
-                last_fused_mu = np.asarray(m["mu"], float)
-                last_fused_t  = float(m["t"])
+                t_f = float(m.get("t", -1.0))
+                # accept only if strictly newer than what we have (drop reorders/dups)
+                if (last_fused_t is None) or (t_f > last_fused_t + EPS):
+                    last_fused_mu = np.asarray(m["mu"], float)
+                    last_fused_t  = t_f
         dt = (t - query_timestamps[i-1]) if i > 0 else 0.0
 
         # Authors' EKF (all robots) to keep tracker/target poses realistic
@@ -234,7 +259,15 @@ def main():
         # 2) if we have a measurement, aggregate + adapt + correct
         z_agg_center, R_eff, rel, los_score = 0.0, args.uwb_var, 0.0, 0.5
         tracker_pos = se_translation_from_matrix(ekf.pose[args.id])
-        target_pred_pos = (last_fused_mu[:3] if isinstance(last_fused_mu, np.ndarray) else None)
+        target_pred_pos = None
+        if isinstance(last_fused_mu, np.ndarray) and (last_fused_t is not None):
+            # causal fanout (default): use only strictly older fused state
+            if args.allow_same_t_fanout or (last_fused_t + EPS < float(t)):
+                target_pred_pos = last_fused_mu[:3]
+                # optional warm-start once (only from strictly older fused)
+                if (last_fused_t + EPS < float(t)) and (not did_warmstart):
+                    tf.mu[:3] = last_fused_mu[:3]
+                    did_warmstart = True
         if pair_df is not None and not pair_df.empty:
             z_agg, R_pair, _ = robust_range_aggregate(
                 pair_df, base_var=base_var, rho=args.pair_corr, huber_delta=args.huber_delta
@@ -281,8 +314,9 @@ def main():
                 tracker_pos=eff_sensor_pos, target_pred_pos=target_pred_pos,
                 los_score=los_score, features=feat
             )
-            # Soft floor with pair variance
-            R_eff = 0.5 * float(R_eff) + 0.5 * float(max(R_eff, R_pair))
+            # Soft floor with pair variance (configurable blend)
+            k = float(args.r_floor_blend)
+            R_eff = k * float(R_eff) + (1.0 - k) * float(max(R_eff, R_pair))
             z_agg_center = float(z_corr)
             rel = float(meta["reliability"])
 
@@ -309,6 +343,14 @@ def main():
                         r_is_maxed=bool(float(r_scale) >= 0.6 * float(tuner.cfg.r_max_scale)),
                         geom_ez=None
                     )
+                # Log NIS to CSV
+                try:
+                    if upd.get("S", None) is not None and upd.get("innov", None) is not None:
+                        nis = float((upd["innov"] * upd["innov"]) / upd["S"]) if upd["S"] > 0 else float('nan')
+                        with open(nis_log_path, "a") as f:
+                            f.write(f"{float(t)},{nis}\n")
+                except Exception:
+                    pass
 
             # Optional: z-only height difference
             if args.use_height_tf and height_at_q:
@@ -322,6 +364,11 @@ def main():
                         tf.correct_height(dz_meas, z_trk, R_h)
 
         mu_i, P_i = tf.posterior()
+        # Numerical hygiene: symmetrize and floor tiny negative eigs
+        P_i = 0.5 * (P_i + P_i.T)
+        me = float(np.linalg.eigvalsh(P_i).min())
+        if me < 1e-10:
+            P_i = P_i + np.eye(P_i.shape[0]) * (1e-10 - me + 1e-12)
 
         # Node features for FusionNet (8‑vector)
         var_pos = float(np.trace(P_i[:3, :3]))
@@ -338,6 +385,7 @@ def main():
         # Broadcast compact message
         tx({
             "v": 1,
+            "type": "local",
             "t": float(t),
             "id": str(args.id),
             "target": str(args.target),
