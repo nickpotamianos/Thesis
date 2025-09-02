@@ -27,6 +27,7 @@ from swarm_ml.online_tuner import OnlineTuner, OnlineAdaptConfig
 from swarm_ml.snapshots import SnapshotCollector
 from swarm_ml.distrib_ci import GossipFuser, CommsConfig
 from swarm_ml.planning import suggest_vantage_moves, suggest_vantage_moves_eig
+from swarm_ml.active_sensing import expected_trace_reduction
 from swarm_control.bridge import ControlBridge
 
 def _concat_with_robot(data: dict, key: str) -> pd.DataFrame:
@@ -288,6 +289,7 @@ def main(args):
 
     w_csv = None; w_file = None
     nis_rows = []
+    eig_scores_rows = []
 
     # ----------------- Main loop -----------------
     for i in range(total_steps):
@@ -568,6 +570,16 @@ def main(args):
                 moves = suggest_vantage_moves(mu_star[:3], tracker_pos)
             for trk, mv in moves.items():
                 action_rows.append([float(t), trk, float(mv[0]), float(mv[1]), float(mv[2])])
+            # EIG diagnostics for chosen move
+            if args.planner == 'eig':
+                for trk, mv in moves.items():
+                    try:
+                        p = tracker_pos[trk].reshape(3)
+                        cand_p = p + np.asarray(mv, float).reshape(3)
+                        eig_val = expected_trace_reduction(mu_star, P_star, cand_p, r_eff_map.get(trk, args.uwb_var))
+                        eig_scores_rows.append([float(t), trk, float(eig_val), float(r_eff_map.get(trk, args.uwb_var))])
+                    except Exception:
+                        pass
             # Optional live publish (sim/mavsdk)
             try:
                 ctrl.send_vantage_moves(float(t), moves)
@@ -665,6 +677,17 @@ def main(args):
     if 'w_file' in locals() and w_file is not None:
         try:
             w_file.close()
+        except Exception:
+            pass
+
+    # Save planner EIG diagnostics if available
+    if eig_scores_rows:
+        try:
+            import csv
+            with open(os.path.join(out_dir, "planner_eig_scores.csv"), "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["timestamp","tracker","eig_score","R_eff"])
+                w.writerows(eig_scores_rows)
         except Exception:
             pass
 

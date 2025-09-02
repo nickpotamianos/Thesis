@@ -15,3 +15,4 @@ miluv_env
 data
 outputs_*
 *.pdf
+*.log
