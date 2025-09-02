@@ -22,6 +22,8 @@ from swarm_ml.measure_adapter import MeasureAdapter, AdapterConfig
 from swarm_ml.target_filter import TargetIF, IFConfig
 from swarm_ml.los_adapter import LOSAdapter, LOSConfig
 from swarm_ml.online_tuner import OnlineTuner, OnlineAdaptConfig
+from swarm_ml.safety import project_to_safe, SafetyLimits
+from swarm_control.bridge import ControlBridge
 
 def _concat_with_robot(data: dict, key: str) -> pd.DataFrame:
     dfs = []
@@ -80,11 +82,16 @@ def main():
     ap.add_argument("--q_adapt", action="store_true")
     ap.add_argument("--realtime", action="store_true", help="Sleep to approximate wall-time replay")
     ap.add_argument("--allow_same_t_fanout", action="store_true", help="If set, allow using fused state at same timestamp (not recommended)")
+    ap.add_argument("--warmstart_once", action="store_true", help="Copy first older fused position into local filter state (one-shot)")
+    ap.add_argument("--control_mode", choices=["none","sim","mavsdk"], default="none",
+                    help="Where to send cmd_move displacements")
+    ap.add_argument("--control_rate", type=int, default=5, help="Setpoint rate (Hz) for ControlBridge")
     args = ap.parse_args()
 
     ip, port = args.udp.split(":")
     tx = make_tx(UdpGroup(mcast_ip=ip, port=int(port)))
     rx_nb = make_rx_nb(UdpGroup(mcast_ip=ip, port=int(port)))  # non-blocking poll
+    ctrl = ControlBridge(mode=args.control_mode, rate_hz=args.control_rate)
 
     # ----------------- Load data -----------------
     miluv = DataLoader(
@@ -186,6 +193,8 @@ def main():
     last_fused_t  = None
     did_warmstart = False
     EPS = 1e-6
+    # neighbors' last known positions for safety projection
+    neighbor_pos = {}
 
     # Prepare NIS log (per-node)
     nis_log_path = os.path.join("logs", f"nis_node_{args.id}.csv")
@@ -206,12 +215,42 @@ def main():
             # schema check
             if int(m.get("v", 0)) != 1:
                 continue
-            if m.get("type") == "fused":
+            m_type = m.get("type")
+            if m_type == "fused":
+                # drop foreign experiments/targets
+                if m.get("exp") != args.exp or m.get("target") != args.target:
+                    continue
                 t_f = float(m.get("t", -1.0))
                 # accept only if strictly newer than what we have (drop reorders/dups)
                 if (last_fused_t is None) or (t_f > last_fused_t + EPS):
                     last_fused_mu = np.asarray(m["mu"], float)
                     last_fused_t  = t_f
+            elif m_type == "local":
+                # keep neighbor positions for safety projection
+                rid_nb = str(m.get("id", ""))
+                if rid_nb and rid_nb != args.id:
+                    p_nb = m.get("p", None)
+                    if p_nb is not None:
+                        try:
+                            neighbor_pos[rid_nb] = np.asarray(p_nb, float).reshape(3)
+                        except Exception:
+                            pass
+            elif m_type == "cmd_move":
+                # apply only if this cmd belongs to our exp/target and includes our id
+                if m.get("exp") != args.exp or m.get("target") != args.target:
+                    continue
+                moves = m.get("moves", {})
+                if args.id in moves:
+                    mv = np.asarray(moves[args.id], float).reshape(3)
+                    # project to safe displacement using our current tracker/body position
+                    p_self = se_translation_from_matrix(ekf.pose[args.id]).reshape(3)
+                    mv_safe = project_to_safe(p_self, mv, neighbors=neighbor_pos, limits=SafetyLimits())
+                    # execute
+                    try:
+                        ctrl.send_vantage_moves(float(m.get("t", 0.0)), {args.id: mv_safe})
+                        print(f"[AGENT {args.id}] exec cmd_move t={m.get('t'):.2f} mv={mv.tolist()} -> safe={mv_safe.tolist()}")
+                    except Exception as e:
+                        print(f"[AGENT {args.id}] control error: {e}")
         dt = (t - query_timestamps[i-1]) if i > 0 else 0.0
 
         # Authors' EKF (all robots) to keep tracker/target poses realistic
@@ -259,13 +298,14 @@ def main():
         # 2) if we have a measurement, aggregate + adapt + correct
         z_agg_center, R_eff, rel, los_score = 0.0, args.uwb_var, 0.0, 0.5
         tracker_pos = se_translation_from_matrix(ekf.pose[args.id])
+        sensor_pos = tracker_pos  # default; overwritten when pair measurement available
         target_pred_pos = None
         if isinstance(last_fused_mu, np.ndarray) and (last_fused_t is not None):
             # causal fanout (default): use only strictly older fused state
             if args.allow_same_t_fanout or (last_fused_t + EPS < float(t)):
                 target_pred_pos = last_fused_mu[:3]
                 # optional warm-start once (only from strictly older fused)
-                if (last_fused_t + EPS < float(t)) and (not did_warmstart):
+                if args.warmstart_once and (last_fused_t + EPS < float(t)) and (not did_warmstart):
                     tf.mu[:3] = last_fused_mu[:3]
                     did_warmstart = True
         if pair_df is not None and not pair_df.empty:
@@ -285,6 +325,7 @@ def main():
                 huber_delta=args.huber_delta
             )
             eff_sensor_pos = sensor_pos - tgt_offset_w
+            sensor_pos = eff_sensor_pos
 
             # features (use fused target prediction if available)
             feat = build_measurement_features(
@@ -374,7 +415,7 @@ def main():
         var_pos = float(np.trace(P_i[:3, :3]))
         geom_ez = 0.0
         if target_pred_pos is not None:
-            diff = (target_pred_pos - (sensor_pos if 'sensor_pos' in locals() else tracker_pos))
+            diff = (target_pred_pos - sensor_pos)
             nrm = float(np.linalg.norm(diff) + 1e-9)
             geom_ez = float(abs(diff[2]) / nrm)
         gate_sig = float(tf.cfg.gate_N_sigma)
@@ -382,7 +423,7 @@ def main():
         X = np.array([var_pos, rel, z_agg_center, float(R_eff), geom_ez, float(los_score),
                       gate_sig, nis_ema], dtype=float)
 
-        # Broadcast compact message
+        # Broadcast compact message (+ our current effective sensor position 'p')
         tx({
             "v": 1,
             "type": "local",
@@ -393,7 +434,8 @@ def main():
             "mu": mu_i.tolist(),
             "P": P_i.tolist(),
             "X": X.tolist(),
-            "r_eff": float(R_eff)
+            "r_eff": float(R_eff),
+            "p": sensor_pos.tolist()
         })
 
         # pace if requested

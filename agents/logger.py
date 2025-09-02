@@ -12,6 +12,7 @@ from swarm_ml.fusion import CIFuser, CIFuserConfig
 from swarm_ml.distrib_ci import GossipFuser, CommsConfig
 from swarm_ml.evaluation_swarm import evaluate_and_save
 from swarm_ml.features import se_translation_from_matrix
+from swarm_ml.planning import suggest_vantage_moves, suggest_vantage_moves_eig
 
 def _load_fusionnet(path_dir: str):
     if path_dir is None:
@@ -46,6 +47,8 @@ def main():
     ap.add_argument("--out", default="outputs_decentralized")
     ap.add_argument("--timeout_ms", type=int, default=300, help="Fuse if not all trackers arrive within this gap")
     ap.add_argument("--fanout", action="store_true", help="Broadcast fused state to nodes")
+    ap.add_argument("--planner", choices=["none","heuristic","eig"], default="none",
+                    help="If not 'none', compute vantage moves at each fused timestamp and broadcast them")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -103,9 +106,13 @@ def main():
     out_dir = os.path.join(args.out, f"{args.exp}_{args.target}")
     os.makedirs(out_dir, exist_ok=True)
 
-    print(f"[LOGGER] listening on {args.udp}; exp={args.exp}; target={args.target}; trackers={trackers}; method={args.method}")
+    print(f"[LOGGER] listening on {args.udp}; exp={args.exp}; target={args.target}; "
+          f"trackers={trackers}; method={args.method}; timeout_ms={args.timeout_ms}; "
+          f"planner={args.planner}")
 
     def maybe_fuse(tb: float):
+        # add this line right after the def
+        nonlocal fusion_weights_file, fusion_weights_writer, fusion_cols
         # fuse when either (a) all trackers present or (b) timeout since the earliest arrival
         parts = {}
         node_feats = {}
@@ -130,14 +137,21 @@ def main():
             X  = np.asarray(payload.get("X", np.zeros(8)), float)
             parts[rid] = (mu, P)
             node_feats[rid] = X
+        # Optional: tracker positions and per-node effective R at this tb
+        tracker_pos = {rid: np.asarray(payload.get("p", []), float).reshape(-1)
+                       for rid, payload in window[tb].items() if "p" in payload}
+        r_eff_map   = {rid: float(payload.get("r_eff", 0.35**2))
+                       for rid, payload in window[tb].items()}
 
         # Assert FusionNet feature dimensionality matches model expectation
         if (args.method == "learned") and (fuser.weight_model is not None):
             any_feats = next(iter(node_feats.values()), None)
             if any_feats is not None:
                 expected = int(getattr(fuser.weight_model, "input_dim", len(any_feats)))
-                assert len(any_feats) == expected, \
-                    f"FusionNet expects {expected} features, got {len(any_feats)}"
+                assert len(any_feats) == expected, (
+                    f"FusionNet expects {expected} features, got {len(any_feats)}. "
+                    f"Feature vector (ordered): [var_pos, rel, z_center, R_eff, geom_ez, los_score, gate_sigma, nis_ema] = {any_feats.tolist()}"
+                )
 
         # Fuse (centralized or gossip) and record
         if args.method == "gossip":
@@ -155,6 +169,8 @@ def main():
             tx_fused({
                 "v": 1,
                 "type": "fused",
+                "exp": args.exp,
+                "target": args.target,
                 "t": float(tb),
                 "mu": mu_star.tolist(),
                 "P":  P_star.tolist()
@@ -171,8 +187,8 @@ def main():
             # write NaN when a tracker's weight is missing at this tb
             row = [float(tb)] + [float(w.get(rid, float('nan'))) for rid in trackers]
             fusion_weights_writer.writerow(row)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[LOGGER] fusion weights log error at t={tb:.3f}: {e}")
 
         # Count missing trackers at fuse time (for diagnostics)
         try:
@@ -184,6 +200,25 @@ def main():
 
         # Done with this t
         window.pop(tb, None)
+
+        # --- Optional active sensing plan (requires --planner and at least one tracker position) ---
+        try:
+            if tx_fused and args.planner != "none" and len(tracker_pos) > 0:
+                if args.planner == "eig":
+                    moves = suggest_vantage_moves_eig(mu_star, P_star, tracker_pos, r_eff_map)
+                else:
+                    moves = suggest_vantage_moves(mu_star[:3], tracker_pos)
+                # Fanout the command to all nodes
+                tx_fused({
+                    "v": 1,
+                    "type": "cmd_move",
+                    "exp": args.exp,
+                    "target": args.target,
+                    "t": float(tb),
+                    "moves": {rid: [float(d) for d in mv] for rid, mv in moves.items()}
+                })
+        except Exception as e:
+            print(f"[LOGGER] planning error at t={tb:.3f}: {e}")
         return True
 
     # ---- Main receive loop ----
@@ -195,15 +230,26 @@ def main():
             # Schema/version filter
             if int(m.get("v", 0)) != 1:
                 continue
-            # Ignore our own fused-state broadcasts
-            if m.get("type") == "fused":
+            m_type = m.get("type", "local")
+            # Ignore our own fanouts and planner commands
+            if m_type in ("fused", "cmd_move"):
+                continue
+            # Only tracker updates are eligible for fusion
+            if m_type != "local":
+                continue
+            # Drop foreign experiment/target traffic on the same multicast group
+            if (m.get("exp") != args.exp) or (m.get("target") != args.target):
+                continue
+            # Required fields present?
+            if not all(k in m for k in ("t", "id", "mu", "P")):
                 continue
             tb = float(m["t"])
             rid = str(m["id"])
             mu = m["mu"]; P = m["P"]
             X  = m.get("X", [0.0]*8)
             r_eff = float(m.get("r_eff", 0.35**2))
-            window[tb][rid] = {"mu": mu, "P": P, "X": X, "r_eff": r_eff}
+            p     = m.get("p", None)
+            window[tb][rid] = {"mu": mu, "P": P, "X": X, "r_eff": r_eff, "p": p}
             last_seen_t[rid] = time.time()
             recv_count[rid] += 1
 
