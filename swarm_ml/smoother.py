@@ -40,11 +40,20 @@ def rts_smooth(mu_f, P_f, dts, noise: CVNoise):
     mu_s = [m.copy() for m in mu_f]
     P_s  = [S.copy() for S in P_f]
 
+    # Normalize dts: accept either length N-1 (preferred) or length N with dts[0]=0
+    dts = np.asarray(dts).reshape(-1)
+    if dts.size == N - 1:
+        def _dt_at(k): return float(dts[k])
+    elif dts.size == N:
+        def _dt_at(k): return float(dts[k+1])
+    else:
+        raise ValueError(f"dts length must be N-1 or N; got {dts.size} for N={N}")
+
     # Forward pass: store predictions
     mu_p = [None]*N
     P_p  = [None]*N
     for k in range(N-1):
-        dt = float(dts[k+1])
+        dt = _dt_at(k)
         F = F_mat(dt)
         Q = Q_mat(dt, noise)
         mu_p[k+1] = F @ mu_f[k]
@@ -52,7 +61,7 @@ def rts_smooth(mu_f, P_f, dts, noise: CVNoise):
 
     # Backward pass
     for k in range(N-2, -1, -1):
-        dt = float(dts[k+1])
+        dt = _dt_at(k)
         F  = F_mat(dt)
         # stable: solve instead of inverse
         # Ck = P_k F^T (P_k+1|k)^-1  ->  solve(P_p, (F @ P_f[k]).T).T

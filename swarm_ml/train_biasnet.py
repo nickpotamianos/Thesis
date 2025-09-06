@@ -1,12 +1,12 @@
 # swarm_ml/train_biasnet.py
-import argparse, os, json
+import argparse, os, json, random
 import numpy as np, torch
 from torch.utils.data import DataLoader
 from .models import BiasNet
 from .datasets import BiasNetDataset
 
 def train_biasnet(train_samples, val_samples, in_dim, out_dir, lr=1e-3, epochs=30, batch_size=256, seed=0):
-    torch.manual_seed(seed)
+    torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
     model = BiasNet(in_dim=in_dim)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
 

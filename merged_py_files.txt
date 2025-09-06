@@ -1,0 +1,4152 @@
+### datasets.py
+# swarm_ml/datasets.py
+from __future__ import annotations
+from typing import List, Dict, Tuple, Optional
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+
+from .features import (
+    build_measurement_features,
+    se_translation_from_matrix,
+)
+from .tagmap import (
+    select_pair_rows,
+    robust_range_aggregate,
+    robust_tracker_sensor_position,
+    robust_target_offset,
+)
+from .los_adapter import LOSAdapter, LOSConfig
+
+
+class BiasNetDataset(Dataset):
+    """
+    Supervision: bias = measured_range - true_geometric_range.
+    Each item: (features, bias, weight)
+    Weight defaults to 1.0, optionally derived from pair variance to up‑weight reliable pairs.
+    """
+    def __init__(self, samples: List[Dict]):
+        self.samples = samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, i):
+        s = self.samples[i]
+        x = torch.tensor(s["features"], dtype=torch.float32)
+        y = torch.tensor(s["bias"], dtype=torch.float32)
+        # Optional: importance weight from pair variance (prefer lower R)
+        w_val = 1.0
+        try:
+            R_pair = float(s.get("meta", {}).get("R_pair", 0.0))
+            if np.isfinite(R_pair) and R_pair > 0:
+                w_val = float(1.0 / np.sqrt(R_pair))
+        except Exception:
+            w_val = 1.0
+        w = torch.tensor(w_val, dtype=torch.float32)
+        return x, y, w
+
+
+def _index_for_time(ts: np.ndarray, t: float) -> int:
+    """
+    Return index of t in ts. Assumes ts are exactly the query_timestamps used to build inputs.
+    Falls back to nearest if exact match is missing.
+    """
+    idx = np.where(ts == t)[0]
+    if idx.size > 0:
+        return int(idx[0])
+    # Safe nearest-neighbor fallback
+    return int(np.argmin(np.abs(ts - t)))
+
+
+def _gt_positions_from_T(gt_T_by_robot: Dict[str, List[np.ndarray]]) -> Dict[str, np.ndarray]:
+    """Extract 3D position sequences for every robot from SE(3)/SE_2(3) transforms."""
+    out = {}
+    for r, mats in gt_T_by_robot.items():
+        out[r] = np.asarray([se_translation_from_matrix(M) for M in mats], dtype=float)
+    return out
+
+
+def build_biasnet_samples(
+    exp_name: str,
+    roles,  # swarm_ml.roles.Roles
+    query_timestamps: np.ndarray,
+    uwb_range_df: pd.DataFrame,
+    gt_T_by_robot: Dict[str, List[np.ndarray]],
+    tag_moment_arms,
+    tag_map: Dict[str, List[int]],
+    height_series: Optional[Dict[str, np.ndarray]] = None,
+    los_adapter: Optional[LOSAdapter] = None,
+    base_var: float = 0.35**2,
+    pair_corr: float = 0.7,
+    huber_delta: float = 0.8,
+) -> List[Dict]:
+    """
+    Build per-link supervised samples:
+      bias = z_agg - true_geometric_range
+
+    True geometric range uses GT:
+      - robust tracker sensor world position (tags that actually fired at t)
+      - robust target tag offset (tags that fired at t)
+      - distance to target GT body center (consistent with runtime parametrization)
+    """
+    if los_adapter is None:
+        los_adapter = LOSAdapter(LOSConfig(verbose=False))
+
+    gt_pos = _gt_positions_from_T(gt_T_by_robot)
+
+    samples: List[Dict] = []
+    tgt = roles.target
+    trks = roles.trackers
+
+    # Pre-group for faster per‑t timestamp access
+    uwb_by_t = dict(tuple(uwb_range_df.groupby("timestamp"))) if "timestamp" in uwb_range_df.columns else {}
+
+    for t in query_timestamps:
+        df_t = uwb_by_t.get(t, None)
+        if df_t is None or df_t.empty:
+            continue
+
+        k = _index_for_time(query_timestamps, float(t))
+        T_tgt = gt_T_by_robot[tgt][k]
+        p_tgt = gt_pos[tgt][k]
+
+        for trk in trks:
+            # rows that truly connect tracker tags to target tags
+            df_pair = select_pair_rows(
+                df_t,
+                trk_tags=tag_map.get(trk, []),
+                tgt_tags=tag_map.get(tgt, []),
+            )
+            if df_pair.empty:
+                continue
+
+            # robust aggregation across tag-pairs at t
+            z_agg, R_pair, _ = robust_range_aggregate(
+                df_pair, base_var=base_var, rho=pair_corr, huber_delta=huber_delta
+            )
+
+            # tracker sensor world position (GT) and target offset (GT)
+            T_trk = gt_T_by_robot[trk][k]
+            p_trk_sens = robust_tracker_sensor_position(
+                pair_df=df_pair,
+                trk=trk,
+                trk_tags=tag_map.get(trk, []),
+                T_trk=T_trk,
+                tag_moment_arms=tag_moment_arms,
+                huber_delta=huber_delta
+            )
+            tgt_off_w = robust_target_offset(
+                pair_df=df_pair,
+                tgt_tags=tag_map.get(tgt, []),
+                T_tgt=T_tgt,
+                tag_moment_arms=tag_moment_arms,
+                huber_delta=huber_delta
+            )
+            eff_sensor_pos_gt = p_trk_sens - tgt_off_w
+
+            # True geometric range
+            true_range = float(np.linalg.norm(p_tgt - eff_sensor_pos_gt))
+
+            # Optional LOS score
+            los_score = los_adapter.score(df_pair)  # may be None
+
+            # Optional height difference (z_tgt - z_trk)
+            if height_series is not None and trk in height_series and tgt in height_series:
+                dz = float(height_series[tgt][k] - height_series[trk][k])
+            else:
+                dz = 0.0
+
+            # Build feature vector (keep layout consistent with runtime builder)
+            feat = build_measurement_features(
+                tracker_pos=eff_sensor_pos_gt,
+                target_pred_pos=None,
+                uwb_range=float(z_agg),
+                los_score=los_score,
+                residual_hist=None,
+                height_tracker=None,
+                height_target=None
+            )
+            feat = np.asarray(feat, dtype=float)
+            if feat.shape[0] >= 7:
+                feat[6] = dz  # overwrite 'dz' slot if present
+
+            samples.append({
+                "features": feat.tolist(),
+                "bias": float(z_agg - true_range),
+                "meta": {
+                    "timestamp": float(t),
+                    "tracker": trk,
+                    "target": tgt,
+                    "z_agg": float(z_agg),
+                    "true_range": true_range,
+                    "R_pair": float(R_pair),
+                    "los": None if los_score is None else float(los_score),
+                }
+            })
+
+    return samples
+
+
+# ---------- simple utilities for JSONL IO (used by CLI trainers) ----------
+
+def save_bias_samples_jsonl(samples: List[Dict], path: str) -> None:
+    import json, os
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        for s in samples:
+            f.write(json.dumps(s) + "\n")
+
+
+def load_bias_samples_jsonl(path: str) -> List[Dict]:
+    """
+    Load BiasNet samples from either .jsonl or .jsonl.gz.
+    Also auto-fallback across extensions if the given file is missing.
+    """
+    import json, gzip, os
+
+    def _resolve(p: str) -> str:
+        if os.path.exists(p):
+            return p
+        if p.endswith(".jsonl") and os.path.exists(p + ".gz"):
+            return p + ".gz"
+        if p.endswith(".jsonl.gz") and os.path.exists(p[:-3]):
+            return p[:-3]
+        raise FileNotFoundError(
+            f"Bias samples file not found. Tried: {p}, "
+            f"{p + '.gz' if p.endswith('.jsonl') else ''}, "
+            f"{p[:-3] if p.endswith('.gz') else ''}"
+        )
+
+    path = _resolve(path)
+    out: List[Dict] = []
+    open_fn = gzip.open if path.endswith(".gz") else open
+    with open_fn(path, "rt") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    return out
+
+
+### planning.py
+# swarm_ml/planning.py
+import numpy as np
+from typing import Dict, Tuple, List
+from .safety import project_to_safe
+from .active_sensing import expected_trace_reduction
+
+def suggest_vantage_moves(target_pos: np.ndarray,
+                          tracker_pos: Dict[str, np.ndarray],
+                          desired_range: Tuple[float, float] = (6.0, 12.0),
+                          up_bias: float = 0.3) -> Dict[str, np.ndarray]:
+    """
+    Suggest a small move vector per tracker to increase information about z and maintain spacing.
+    up_bias in [0,1]: how much to prefer vertical separation |b_z|.
+    Returns: {tracker -> delta_xyz} (not scaled to dynamics; just a hint).
+    """
+    p_t = target_pos[:3].reshape(3)
+    moves = {}
+    # crude angular diversity: spread by azimuth
+    ids = list(tracker_pos.keys())
+    az = []
+    for k in ids:
+        v = p_t - tracker_pos[k].reshape(3)
+        az.append(np.arctan2(v[1], v[0]))
+    order = np.argsort(az)
+    # neighbors in azimuth should separate
+    for rank, idx in enumerate(order):
+        k = ids[idx]
+        p = tracker_pos[k].reshape(3)
+        v = p_t - p
+        d = np.linalg.norm(v) + 1e-9
+        b = v / d
+        # range term
+        dmin, dmax = desired_range
+        r_push = 0.0
+        if d < dmin: r_push = -(dmin - d) / dmin
+        elif d > dmax: r_push = (d - dmax) / dmax
+        # vertical observability push: move to increase |b_z|
+        # move opposite to target along z to increase |b_z|
+        vz = np.array([0.0, 0.0, -np.sign(b[2]) if b[2] != 0 else -1.0])
+        # azimuthal separation (repel from neighbors)
+        left = ids[order[(rank - 1) % len(ids)]]
+        right = ids[order[(rank + 1) % len(ids)]]
+        repel = 0.0
+        for nbr in [left, right]:
+            vn = p_t - tracker_pos[nbr].reshape(3)
+            repel += np.cross(vn, np.array([0,0,1.0]))[:2] @ np.cross(v, np.array([0,0,1.0]))[:2]
+        repel_dir = np.array([-b[1], b[0], 0.0]) * np.sign(repel)
+        # combine
+        move = (1.0 - up_bias) * (r_push * b + 0.1 * repel_dir) + up_bias * vz * 0.5
+        # project to maintain separation (simple barrier)
+        nbrs = {n: tracker_pos[n] for n in ids if n != k}
+        move = project_to_safe(p, move, nbrs, d_min=1.5)
+        moves[k] = move
+    return moves
+
+
+def suggest_vantage_moves_eig(mu_star: np.ndarray,
+                              P_star: np.ndarray,
+                              tracker_pos: Dict[str, np.ndarray],
+                              r_eff_map: Dict[str, float],
+                              desired_range: Tuple[float, float] = (6.0, 12.0),
+                              step: float = 0.5) -> Dict[str, np.ndarray]:
+    """
+    EIG-based myopic planner: pick among candidate directions the one maximizing
+    expected trace reduction, with simple range constraint shaping and separation.
+    """
+    moves: Dict[str, np.ndarray] = {}
+    p_t = mu_star[:3].reshape(3)
+    # candidate unit directions
+    dirs = [
+        np.array([1,0,0], float), np.array([-1,0,0], float),
+        np.array([0,1,0], float), np.array([0,-1,0], float),
+        np.array([0,0,1], float), np.array([0,0,-1], float),
+    ]
+    for k, p in tracker_pos.items():
+        p = p.reshape(3)
+        b = (p_t - p); d = float(np.linalg.norm(b) + 1e-9)
+        b = b / d
+        dirs_ext = dirs + [b, -b]
+        best_dir = np.zeros(3)
+        best_score = -1e18
+        R_eff = float(r_eff_map.get(k, 0.35**2))
+        for dvec in dirs_ext:
+            cand_p = p + step * dvec
+            eig = expected_trace_reduction(mu_star, P_star, cand_p, R_eff)
+            # range shaping
+            dmin, dmax = desired_range
+            dn = float(np.linalg.norm(p_t - cand_p))
+            range_pen = 0.0
+            if dn < dmin: range_pen = (dmin - dn)
+            elif dn > dmax: range_pen = (dn - dmax)
+            score = eig - 0.5 * range_pen
+            if score > best_score:
+                best_score = score
+                best_dir = dvec
+        move = best_dir * step
+        # safety projection
+        nbrs = {n: tracker_pos[n] for n in tracker_pos.keys() if n != k}
+        move = project_to_safe(p, move, nbrs, d_min=1.5)
+        moves[k] = move
+    return moves
+
+
+### tagmap.py
+# swarm_ml/tagmap.py
+from typing import Dict, List
+import pandas as pd
+import numpy as np
+
+def infer_tag_ids_by_robot(uwb_range_df: pd.DataFrame,
+                           robots: List[str],
+                           top_n: int = 2) -> Dict[str, List[int]]:
+    """
+    Infer which numeric tag IDs belong to which robot by frequency analysis.
+    We look at all rows where a given robot produced the measurement and count
+    how often each tag id appears in from_id/to_id. Return top_n ids per robot.
+    """
+    tag_map: Dict[str, List[int]] = {}
+    if "robot" not in uwb_range_df.columns:
+        # caller must annotate before calling
+        for r in robots:
+            tag_map[r] = []
+        return tag_map
+
+    for r in robots:
+        df_r = uwb_range_df[uwb_range_df["robot"] == r]
+        if df_r.empty:
+            tag_map[r] = []
+            continue
+        counts = pd.concat([df_r["from_id"].value_counts(),
+                            df_r["to_id"].value_counts()], axis=1).fillna(0).sum(axis=1)
+        counts = counts.sort_values(ascending=False)
+        tag_map[r] = [int(i) for i in list(counts.index[:top_n])]
+    return tag_map
+
+def select_pair_rows(df_t: pd.DataFrame,
+                     trk_tags: List[int],
+                     tgt_tags: List[int]) -> pd.DataFrame:
+    """
+    Keep only rows that connect any tracker tag to any target tag (either direction).
+    """
+    if df_t.empty or not trk_tags or not tgt_tags:
+        return df_t.iloc[0:0]  # empty df
+    m = df_t[
+        ((df_t["from_id"].isin(trk_tags)) & (df_t["to_id"].isin(tgt_tags))) |
+        ((df_t["from_id"].isin(tgt_tags)) & (df_t["to_id"].isin(trk_tags)))
+    ]
+    return m
+
+def robust_range_aggregate(pair_df: pd.DataFrame,
+                           base_var: float,
+                           rho: float = 0.7,
+                           huber_delta: float = 0.8) -> tuple[float, float, dict]:
+    """
+    Robustly aggregate multiple tag-pair ranges for one tracker↔target at time t.
+    - Location: Huber M-estimator (delta in meters).
+    - Variance: base_var / m_eff, with m_eff = m / (1 + (m-1)*rho), rho in [0,1].
+    Returns: (z_agg, R_eff, meta)
+    """
+    zs = pair_df["range"].to_numpy(dtype=float)
+    m = zs.size
+    med = float(np.median(zs))
+    # Huber step
+    r = zs - med
+    w = np.ones_like(r)
+    mask = np.abs(r) > huber_delta
+    w[mask] = huber_delta / np.abs(r[mask])
+    z_agg = float(np.sum(w * zs) / np.sum(w))
+
+    # Effective sample size with correlation rho
+    m_eff = m / (1.0 + (m - 1.0) * rho)
+    m_eff = max(1.0, m_eff)  # never below 1
+
+    R_eff = base_var / m_eff
+    return z_agg, R_eff, {"m": int(m), "m_eff": float(m_eff)}
+
+def robust_tracker_sensor_position(pair_df: pd.DataFrame,
+                                   trk: str,
+                                   trk_tags: List[int],
+                                   T_trk: np.ndarray,
+                                   tag_moment_arms,
+                                   huber_delta: float = 0.8) -> np.ndarray:
+    """
+    Compute a Huber-weighted average of the world positions of the tracker tags
+    that actually fired at this timestamp. If anything fails, return the robot center.
+    """
+    from swarm_ml.features import se_rotation_from_matrix, se_translation_from_matrix
+
+    if pair_df is None or pair_df.empty:
+        return se_translation_from_matrix(T_trk)
+
+    zs = pair_df["range"].to_numpy(dtype=float)
+    med = float(np.median(zs))
+    r = zs - med
+    w = np.ones_like(r)
+    mask = np.abs(r) > huber_delta
+    w[mask] = huber_delta / np.abs(r[mask])
+
+    R = se_rotation_from_matrix(T_trk)
+    p = se_translation_from_matrix(T_trk)
+
+    positions = []
+    w_list = []
+    for (_, row), wi in zip(pair_df.iterrows(), w):
+        # Determine which tracker tag contributed in this row
+        tid = None
+        f = int(row["from_id"]); t = int(row["to_id"])
+        if f in trk_tags: tid = f
+        elif t in trk_tags: tid = t
+
+        if tid is None:
+            continue
+        # Lookup moment arm for this tag; fall back to robot center
+        arm = None
+        if isinstance(tag_moment_arms, dict):
+            if tid in tag_moment_arms:
+                arm = np.asarray(tag_moment_arms[tid], dtype=float).reshape(3)
+            else:
+                for v in tag_moment_arms.values():
+                    if isinstance(v, dict) and tid in v:
+                        arm = np.asarray(v[tid], dtype=float).reshape(3)
+                        break
+        if arm is None:
+            pos = p
+        else:
+            pos = p + R @ arm
+        positions.append(pos)
+        w_list.append(wi)
+
+    if not positions:
+        return p
+    P = np.vstack(positions)
+    wv = np.asarray(w_list, dtype=float).reshape(-1, 1)
+    wv /= (wv.sum() + 1e-12)
+    return (wv * P).sum(axis=0)
+
+def robust_target_offset(pair_df: pd.DataFrame,
+                         tgt_tags: List[int],
+                         T_tgt: np.ndarray,
+                         tag_moment_arms,
+                         huber_delta: float = 0.8) -> np.ndarray:
+    """
+    Return world-frame offset vector R_tgt @ arm(tag) for the TARGET tag(s) that fired
+    at this timestamp. Uses Huber weights over all tag-pair rows at t.
+    If unknown, returns zeros(3).
+    """
+    from swarm_ml.features import se_rotation_from_matrix
+
+    if pair_df is None or pair_df.empty or not tgt_tags:
+        return np.zeros(3)
+
+    zs = pair_df["range"].to_numpy(dtype=float)
+    med = float(np.median(zs))
+    r = zs - med
+    w = np.ones_like(r)
+    mask = np.abs(r) > huber_delta
+    w[mask] = huber_delta / np.abs(r[mask])
+
+    R_t = se_rotation_from_matrix(T_tgt)
+
+    # Collect offset candidates (R@arm) for any target tag that fired
+    offsets, w_list = [], []
+    for (_, row), wi in zip(pair_df.iterrows(), w):
+        tid = None
+        f = int(row["from_id"]); t = int(row["to_id"])
+        if f in tgt_tags: tid = f
+        elif t in tgt_tags: tid = t
+        if tid is None:
+            continue
+
+        # Lookup arm for target tag id (allow nested dicts)
+        arm = None
+        if isinstance(tag_moment_arms, dict):
+            if tid in tag_moment_arms:
+                arm = np.asarray(tag_moment_arms[tid], dtype=float).reshape(3)
+            else:
+                for v in tag_moment_arms.values():
+                    if isinstance(v, dict) and tid in v:
+                        arm = np.asarray(v[tid], dtype=float).reshape(3)
+                        break
+        if arm is None:
+            continue
+
+        offsets.append(R_t @ arm)
+        w_list.append(wi)
+
+    if not offsets:
+        return np.zeros(3)
+
+    O = np.vstack(offsets)
+    wv = np.asarray(w_list, dtype=float).reshape(-1, 1)
+    wv /= (wv.sum() + 1e-12)
+    return (wv * O).sum(axis=0)
+
+### active_sensing.py
+#swarm_ml/active_sensing.py
+import numpy as np
+from .target_filter import TargetIF
+
+def expected_trace_reduction(mu: np.ndarray, P: np.ndarray,
+                             tracker_p: np.ndarray, R: float) -> float:
+    """
+    One-step A-optimal (trace) reduction for a scalar range measurement
+    linearized at (mu, tracker_p).
+    """
+    _, H = TargetIF._range_linearize(mu, tracker_p)
+    S = float(H @ P @ H.T + R)  # scalar
+    KPH = (P @ H.T) * (1.0 / S)  # (6,1)
+    P_new = P - KPH @ (H @ P)    # Joseph not needed for scalar, deterministic linearization
+    return float(np.trace(P) - np.trace(P_new))
+
+def batch_expected_trace_reduction(mu: np.ndarray, P: np.ndarray,
+                                   trackers: np.ndarray, R: float) -> np.ndarray:
+    return np.asarray([expected_trace_reduction(mu, P, p, R) for p in trackers], dtype=float)
+
+
+### snapshots.py
+# swarm_ml/snapshots.py
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Any
+import os, json
+import numpy as np
+import pandas as pd
+
+from .features import se_translation_from_matrix, build_measurement_features
+from .tagmap import robust_tracker_sensor_position, robust_target_offset
+from .los_adapter import LOSAdapter, LOSConfig
+
+@dataclass
+class FusionSnap:
+    timestamp: float
+    order: List[str]                   # tracker ids order
+    X: np.ndarray                      # (N_nodes, d) node features
+    mus: np.ndarray                    # (N_nodes, 6) local posteriors mu_i
+    Ps: np.ndarray                     # (N_nodes, 6, 6) local posteriors P_i
+    gt_pos: np.ndarray                 # (3,)
+    los: Optional[Dict[str, float]] = None
+
+    def to_json(self) -> Dict[str, Any]:
+        return {
+            "timestamp": float(self.timestamp),
+            "order": list(self.order),
+            "X": self.X.tolist(),
+            "mus": self.mus.tolist(),
+            "Ps": self.Ps.tolist(),
+            "gt_pos": self.gt_pos.tolist(),
+            "los": None if self.los is None else {k: float(v) for k, v in self.los.items()}
+        }
+
+
+class SnapshotCollector:
+    """
+    Collects:
+      - BiasNet samples (features + bias labels)
+      - FusionNet snaps (per-timestep node features + local posteriors + GT target position)
+    Saves JSONL files under the experiment out directory.
+    """
+    def __init__(self,
+                 query_timestamps: np.ndarray,
+                 roles,
+                 tag_map: Dict[str, List[int]],
+                 gt_T_by_robot: Dict[str, List[np.ndarray]],
+                 tag_moment_arms,
+                 base_var: float,
+                 pair_corr: float,
+                 huber_delta: float = 0.8,
+                 los_verbose: bool = False):
+        self.ts = np.asarray(query_timestamps, dtype=float)
+        self.roles = roles
+        self.tag_map = tag_map
+        self.gt_T = gt_T_by_robot
+        self.tag_moment_arms = tag_moment_arms
+        self.base_var = float(base_var)
+        self.pair_corr = float(pair_corr)
+        self.huber_delta = float(huber_delta)
+        self.los_adapter = LOSAdapter(LOSConfig(verbose=los_verbose))
+
+        # precompute GT positions per robot
+        self.gt_pos = {r: np.asarray([se_translation_from_matrix(T) for T in mats], dtype=float)
+                       for r, mats in gt_T_by_robot.items()}
+
+        self._bias_jsonl: List[Dict[str, Any]] = []
+        self._fuse_jsonl: List[Dict[str, Any]] = []
+
+    # ---- BiasNet collection (called from measurement path) ----
+    def add_bias_sample(self,
+                        i: int,
+                        trk: str,
+                        pair_df: pd.DataFrame,
+                        z_agg: float,
+                        eff_sensor_pos_used: np.ndarray,
+                        los_score: Optional[float]) -> None:
+        """
+        Log a sample consistent with runtime geometry (eff_sensor_pos used).
+        Supervision uses GT target position at i.
+        """
+        t = float(self.ts[i])
+        tgt = self.roles.target
+        p_tgt = self.gt_pos[tgt][i]
+        true_range = float(np.linalg.norm(p_tgt - eff_sensor_pos_used))
+
+        feat = build_measurement_features(
+            tracker_pos=np.asarray(eff_sensor_pos_used, dtype=float),
+            target_pred_pos=None,
+            uwb_range=float(z_agg),
+            los_score=None if los_score is None else float(los_score),
+        )
+        feat = np.asarray(feat, dtype=float)
+
+        self._bias_jsonl.append({
+            "features": feat.tolist(),
+            "bias": float(z_agg - true_range),
+            "meta": {
+                "timestamp": t,
+                "tracker": trk,
+                "target": tgt,
+                "z_agg": float(z_agg),
+                "true_range": true_range,
+                "los": None if los_score is None else float(los_score)
+            }
+        })
+
+    # ---- FusionNet collection (called after building parts/node_feats, before fusion) ----
+    def add_fusion_snap(self,
+                        i: int,
+                        parts: Dict[str, Tuple[np.ndarray, np.ndarray]],
+                        node_feats: Dict[str, np.ndarray]) -> None:
+        t = float(self.ts[i])
+        order = list(parts.keys())  # keep the runtime order
+        X = np.vstack([node_feats[k].reshape(-1) for k in order])
+        mus = np.vstack([parts[k][0].reshape(1, -1) for k in order])
+        Ps = np.stack([parts[k][1] for k in order], axis=0)
+        gt_pos = self.gt_pos[self.roles.target][i][:3]
+
+        snap = FusionSnap(t, order, X, mus, Ps, gt_pos)
+        self._fuse_jsonl.append(snap.to_json())
+
+        # ---- Persist ----
+    def save(self, out_dir: str) -> None:
+        os.makedirs(out_dir, exist_ok=True)
+        bias_path = os.path.join(out_dir, "bias_samples.jsonl")
+        fuse_path = os.path.join(out_dir, "fusion_snaps.jsonl")
+        fuse_gz_path = fuse_path + ".gz"
+
+        # Always create files, even if empty, so downstream CLIs never 404.
+        with open(bias_path, "w") as f:
+            for row in self._bias_jsonl:
+                f.write(json.dumps(row) + "\n")
+
+        with open(fuse_path, "w") as f:
+            for row in self._fuse_jsonl:
+                f.write(json.dumps(row) + "\n")
+
+        # Also write a gz copy of fusion snaps; ignore gzip errors but be verbose
+        try:
+            import gzip
+            with gzip.open(fuse_gz_path, "wt") as gf:
+                for row in self._fuse_jsonl:
+                    gf.write(json.dumps(row) + "\n")
+        except Exception as e:
+            print(f"[COLLECT] Note: could not write {fuse_gz_path}: {e}")
+
+        # Quick stats so you can validate immediately
+        stats = {
+            "n_bias_samples": int(len(self._bias_jsonl)),
+            "n_fusion_snaps": int(len(self._fuse_jsonl)),
+            "bias_path": bias_path,
+            "fusion_path": fuse_path,
+            "fusion_path_gz": fuse_gz_path,
+        }
+        with open(os.path.join(out_dir, "collect_stats.json"), "w") as f:
+            json.dump(stats, f, indent=2)
+        print(f"[COLLECT] bias samples: {stats['n_bias_samples']:,} -> {bias_path}")
+        print(f"[COLLECT] fusion snaps: {stats['n_fusion_snaps']:,} -> {fuse_path} (+ .gz)")
+
+        # Persist a simple schema for node feature layout to aid training
+        schema = {
+            "node_features_layout": {
+                "0": "var_pos_trace",
+                "1": "reliability",
+                "2": "z_agg_center",
+                "3": "R_eff",
+                "4": "geom_ez_abs",
+                "5": "los_score",
+                "6": "gate_sigma",
+                "7": "nis_ema"
+            },
+            "description": "Per-node feature indices used for FusionNet training",
+        }
+        with open(os.path.join(out_dir, "fusion_schema.json"), "w") as f:
+            json.dump(schema, f, indent=2)
+
+
+### features.py
+# swarm_ml/features.py
+from typing import Dict, Any, Optional
+import numpy as np
+
+def se_translation_from_matrix(T: np.ndarray) -> np.ndarray:
+    """
+    Extract 3D translation from a 4x4 SE(3) or 5x5 SE_2(3) matrix.
+    For SE(2,3): columns [0:3]=R, 3=velocity, 4=position
+    For SE(3): position is in column 3 of 4x4 matrix
+    """
+    T = np.asarray(T)
+    if T.shape == (4, 4):          # SE(3)
+        return T[:3, 3].copy()
+    if T.shape == (5, 5):          # SE(2,3): columns [0:3]=R, 3=velocity, 4=position
+        return T[:3, 4].copy()
+    # Fallback: last column as position (handles both cases)
+    return T[:3, -1].copy()
+
+def se_rotation_from_matrix(T: np.ndarray) -> np.ndarray:
+    """
+    Extract 3D rotation matrix from SE(3) or SE(2,3) matrix.
+    """
+    T = np.asarray(T)
+    return T[:3, :3].copy()
+
+def build_measurement_features(tracker_pos: np.ndarray,
+                               target_pred_pos: Optional[np.ndarray],
+                               uwb_range: float,
+                               los_score: Optional[float],
+                               residual_hist: Optional[np.ndarray] = None,
+                               height_tracker: Optional[float] = None,
+                               height_target: Optional[float] = None) -> np.ndarray:
+    """
+    Create a feature vector for ML-based measurement quality/bias modeling.
+    """
+    if target_pred_pos is None:
+        geom = np.zeros(4)
+    else:
+        diff = target_pred_pos - tracker_pos
+        dist = np.linalg.norm(diff) + 1e-9
+        bearing = diff / dist
+        geom = np.hstack([bearing, dist])
+
+    f = [uwb_range]
+    f.extend(geom.tolist())
+    f.append(los_score if los_score is not None else 0.5)
+
+    if height_tracker is not None and height_target is not None:
+        f.append(height_target - height_tracker)
+    else:
+        f.append(0.0)
+
+    if residual_hist is not None and residual_hist.size > 0:
+        f.extend([np.mean(residual_hist), np.var(residual_hist)])
+    else:
+        f.extend([0.0, 0.0])
+    return np.asarray(f, dtype=float)
+
+
+### distrib_ci.py
+# swarm_ml/distrib_ci.py
+from dataclasses import dataclass
+from typing import Dict, Tuple, List, Optional
+import numpy as np
+
+@dataclass
+class CommsConfig:
+    rounds: int = 1        # consensus rounds per timestep
+    p_link: float = 1.0    # probability an undirected link exists
+    p_drop: float = 0.0    # independent packet drop per edge per round
+    seed: int = 0
+
+def _metropolis_weights(A: np.ndarray) -> np.ndarray:
+    """Build row-stochastic Metropolis-Hastings weights for undirected graph A."""
+    N = A.shape[0]
+    deg = A.sum(axis=1)
+    W = np.zeros_like(A, dtype=float)
+    for i in range(N):
+        for j in range(N):
+            if i != j and A[i, j] > 0:
+                W[i, j] = 1.0 / (1.0 + max(deg[i], deg[j]))
+        W[i, i] = 1.0 - W[i].sum()
+    return W
+
+class GossipFuser:
+    """
+    Decentralized CI via gossip on information form.
+    Each node holds J_i, h_i; at each round it averages with neighbors using W (row-stochastic).
+    Returns the network-averaged fused estimate (what a central logger would see).
+    """
+    def __init__(self, cfg: CommsConfig = CommsConfig()):
+        self.cfg = cfg
+        self.rng = np.random.default_rng(cfg.seed)
+
+    def _rand_graph(self, N: int) -> np.ndarray:
+        if self.cfg.p_link >= 1.0:
+            A = np.ones((N, N)) - np.eye(N)
+        else:
+            U = self.rng.random((N, N))
+            A = ((U < self.cfg.p_link).astype(float) * (1.0 - np.eye(N)))
+            A = np.maximum(A, A.T)  # undirected
+        return A
+
+    def fuse(self, parts: Dict[str, Tuple[np.ndarray, np.ndarray]], weights: Optional[Dict[str, float]] = None):
+        keys: List[str] = list(parts.keys())
+        N = len(keys)
+        if N == 1:
+            mu, P = parts[keys[0]]
+            return mu, P, {keys[0]: 1.0}
+
+        # Build per-node information (CI-friendly jitter)
+        J = []
+        h = []
+        for rid in keys:
+            mu, P = parts[rid]
+            Ji = np.linalg.inv(P + 1e-9 * np.eye(P.shape[0]))
+            hi = Ji @ mu
+            wi = 1.0 if (weights is None) else float(weights.get(rid, 1.0))
+            J.append(wi * Ji); h.append(wi * hi)
+        J = np.stack(J, axis=0)  # (N, d, d)
+        h = np.stack(h, axis=0)  # (N, d)
+
+        # Random communication graph and weights
+        A = self._rand_graph(N)
+        W = _metropolis_weights(A)
+
+        # Perform consensus rounds with independent packet drops
+        Jv = J.copy()
+        hv = h.copy()
+        for _ in range(self.cfg.rounds):
+            # Drop edges independently (row-wise renormalization keeps convexity)
+            if self.cfg.p_drop > 0.0:
+                mask = (self.rng.random(W.shape) >= self.cfg.p_drop).astype(float)
+                W_eff = W * mask
+                row_sums = W_eff.sum(axis=1, keepdims=True)
+                row_sums[row_sums == 0.0] = 1.0
+                W_eff = W_eff / row_sums
+            else:
+                W_eff = W
+            # Apply averaging: (N,N) @ (N,d,d) -> (N,d,d) via einsum; same for h
+            Jv = np.einsum("ij,jkl->ikl", W_eff, Jv)
+            hv = np.einsum("ij,jk->ik",   W_eff, hv)
+
+        # What a central observer would see (nodes have converged if rounds are enough)
+        J_bar = Jv.mean(axis=0)
+        h_bar = hv.mean(axis=0)
+        # IMPORTANT: the centralized solution uses the SUM of information, not the MEAN.
+        # μ is invariant to a common scale on (J, h), but P = (Σ J_i)^-1 will be too large
+        # if we invert the mean. Multiply back by N to recover the sum.
+        N = len(keys)
+        J_sum = N * J_bar
+        h_sum = N * h_bar
+        # Add regularization for numerical stability before inversion
+        J_sum_reg = J_sum + 1e-6 * np.eye(J_sum.shape[0])
+        P = np.linalg.inv(J_sum_reg)
+        mu = P @ h_sum
+
+        # Provide implicit weights (uniform if none were provided)
+        if weights is None:
+            w = {keys[i]: 1.0 / N for i in range(N)}
+        else:
+            # Normalize provided weights to sum to 1 for logging
+            s = sum(max(0.0, float(weights.get(k, 0.0))) for k in keys)
+            if s <= 0:
+                w = {k: 1.0 / N for k in keys}
+            else:
+                w = {k: float(weights.get(k, 0.0)) / s for k in keys}
+        return mu, P, w
+
+
+### roles.py
+# swarm_ml/roles.py
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+import pandas as pd
+
+@dataclass
+class Roles:
+    target: str
+    trackers: List[str]
+    # Optional pre-resolved mapping from robot -> list of its UWB tag IDs
+    tag_ids_by_robot: Optional[Dict[str, List[int]]] = None
+
+def infer_tag_ids_by_robot(uwb_range_df: pd.DataFrame,
+                           robots: List[str],
+                           min_count: int = 50) -> Dict[str, List[int]]:
+    """
+    Heuristic: infer which numeric tag IDs belong to which robot by co-occurrence
+    in the source robot's UWB dataframe. This uses frequency statistics and works
+    even when each robot has 2 tags.
+    """
+    tag_ids_by_robot = {}
+    if "robot" not in uwb_range_df.columns:
+        # if caller didn't add it, infer from grouping if possible, else leave empty
+        for r in robots:
+            tag_ids_by_robot[r] = []
+        return tag_ids_by_robot
+
+    for r in robots:
+        df_r = uwb_range_df[uwb_range_df["robot"] == r]
+        # Tags seen on this robot either in from_id or to_id (depending on logger)
+        counts = pd.concat([
+            df_r["from_id"].value_counts(),
+            df_r["to_id"].value_counts()
+        ], axis=1).fillna(0).sum(axis=1).sort_values(ascending=False)
+        tag_ids_by_robot[r] = [int(t) for t, c in counts.items() if c >= min_count]
+    return tag_ids_by_robot
+
+def get_roles(exp_name: str,
+              robots: List[str],
+              default_target: Optional[str] = None,
+              uwb_range_df: Optional[pd.DataFrame] = None,
+              user_override: Optional[Tuple[str, List[str]]] = None
+              ) -> Roles:
+    """
+    Decide which robot is 'target' vs 'trackers'. If user_override is provided, use that.
+    Else, pick the robot with the densest UWB connections as the target (often ifo003 in examples).
+    """
+    if user_override is not None:
+        tgt, trk = user_override
+        return Roles(target=tgt, trackers=trk)
+
+    if default_target is None and robots:
+        # Basic heuristic: choose lexicographically last (often ifo003 in docs)
+        default_target = sorted(robots)[-1]
+    trackers = [r for r in robots if r != default_target]
+
+    tag_map = None
+    if uwb_range_df is not None:
+        tag_map = infer_tag_ids_by_robot(uwb_range_df.assign(robot=uwb_range_df.get("robot", None)),
+                                         robots=robots)
+
+    return Roles(target=default_target, trackers=trackers, tag_ids_by_robot=tag_map)
+
+
+### train_fusionnet_cli.py
+# swarm_ml/train_fusionnet_cli.py
+import argparse, json, os, gzip
+import numpy as np
+from typing import List, Dict, Any
+from .train_fusionnet import train_fusionnet
+
+def _open_any(path: str):
+    """
+    Open either plain JSONL or GZ; auto-fallback across .jsonl <-> .jsonl.gz
+    """
+    if os.path.exists(path):
+        return gzip.open(path, "rt") if path.endswith(".gz") else open(path, "r")
+    if path.endswith(".gz") and os.path.exists(path[:-3]):
+        return open(path[:-3], "r")
+    if path.endswith(".jsonl") and os.path.exists(path + ".gz"):
+        return gzip.open(path + ".gz", "rt")
+    raise FileNotFoundError(f"Fusion snaps file not found. Tried: {path}, {path[:-3] if path.endswith('.gz') else ''}, {path + '.gz' if path.endswith('.jsonl') else ''}")
+
+def load_fusion_snaps_jsonl(path: str):
+    snaps = []
+    with _open_any(path) as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            X = np.asarray(obj["X"], dtype=float)
+            mus = np.asarray(obj["mus"], dtype=float)
+            Ps = np.asarray(obj["Ps"], dtype=float)
+            gt = np.asarray(obj["gt_pos"], dtype=float)
+            parts = {rid: (mus[i].copy(), Ps[i].copy()) for i, rid in enumerate(obj["order"]) }
+            snaps.append({"X": X, "parts": parts, "gt_pos": gt})
+    return snaps
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--snaps", required=True, help="Path to fusion_snaps.jsonl or .jsonl.gz")
+    p.add_argument("--out", required=True, help="Output dir for model")
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--seed", type=int, default=0)
+    args = p.parse_args()
+
+    snaps = load_fusion_snaps_jsonl(args.snaps)
+    print(f"[CLI] Loaded {len(snaps):,} fusion snaps from {os.path.abspath(args.snaps)}")
+    assert len(snaps) > 0, "No fusion snaps found (file exists but contained zero lines)."
+
+    in_dim = int(snaps[0]["X"].shape[1])
+    model = train_fusionnet(
+        snaps=snaps,
+        in_dim=in_dim,
+        out_dir=args.out,
+        lr=args.lr,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        seed=args.seed
+    )
+    print(f"[OK] FusionNet trained. Artifacts in: {args.out}")
+
+
+### target_init.py
+# swarm_ml/target_init.py
+from typing import Dict, Tuple, Optional
+import numpy as np
+import pandas as pd
+
+def multilaterate_linear(p_list, z_list):
+    # Linear LS via difference of sphere equations
+    # choose first as reference
+    p0 = p_list[0]; z0 = z_list[0]
+    A=[]; b=[]
+    for i in range(1, len(p_list)):
+        pi = p_list[i]; zi = z_list[i]
+        A.append(2*(pi - p0))
+        b.append((np.dot(pi,pi) - np.dot(p0,p0)) - (zi*zi - z0*z0))
+    A = np.vstack(A); b = np.array(b).reshape(-1,1)
+    try:
+        x, *_ = np.linalg.lstsq(A, b, rcond=None)
+        return x.flatten()
+    except Exception:
+        return p0.copy()
+
+def robust_multilateration(p_list, z_list, huber_delta=0.6, iters=15):
+    # Initialize with linear solution, then Gauss-Newton with Huber
+    p = multilaterate_linear(p_list, z_list)
+    for _ in range(iters):
+        r=[]; J=[]
+        for pi, zi in zip(p_list, z_list):
+            d = np.linalg.norm(p - pi) + 1e-12
+            r.append(d - zi)
+            J.append((p - pi)/d)
+        r = np.array(r); J = np.vstack(J)
+        w = np.ones_like(r)
+        mask = np.abs(r) > huber_delta
+        w[mask] = huber_delta/np.abs(r[mask])
+        # weighted GN step
+        W = np.diag(w)
+        try:
+            H = J.T @ W @ J
+            g = J.T @ (W @ r)
+            step = np.linalg.solve(H, -g)
+        except np.linalg.LinAlgError:
+            break
+        p = p + step
+        if np.linalg.norm(step) < 1e-4:
+            break
+    return p
+
+def init_target_from_window(query_ts, uwb_range_df, tag_map, tracker_ids, target_id,
+                            tracker_pose_fn, agg_fn, window_len=15):
+    """
+    Build a p0 from the earliest window where we have data.
+    - tracker_pose_fn(trk, t) -> np.ndarray(3,) tracker sensor position in world
+    - agg_fn(df_rows_for_trk_at_t) -> scalar range (e.g., robust_range_aggregate)
+    Returns p0 or None if insufficient geometry.
+    """
+    # choose a start index that yields at least one measurement per tracker
+    for start in range(0, min(window_len, len(query_ts))):
+        end = min(start + window_len, len(query_ts))
+        p_list=[]; z_list=[]
+        for trk in tracker_ids:
+            zs=[]
+            ps=[]
+            for t in query_ts[start:end]:
+                df_t = uwb_range_df[uwb_range_df["timestamp"] == t]
+                trk_tags = tag_map.get(trk, [])
+                tgt_tags = tag_map.get(target_id, [])
+                df_pair = df_t[
+                    ((df_t["from_id"].isin(trk_tags)) & (df_t["to_id"].isin(tgt_tags))) |
+                    ((df_t["from_id"].isin(tgt_tags)) & (df_t["to_id"].isin(trk_tags)))
+                ]
+                if df_pair.empty: continue
+                z_t, _, _ = agg_fn(df_pair)
+                ps.append(tracker_pose_fn(trk, t))
+                zs.append(z_t)
+            if zs:
+                # use median across the window
+                p_list.append(np.median(np.vstack(ps), axis=0))
+                z_list.append(float(np.median(zs)))
+        if len(p_list) >= 3:
+            p0 = robust_multilateration(p_list, z_list)
+            return p0
+    return None
+
+
+### fusion.py
+# swarm_ml/fusion.py
+from dataclasses import dataclass
+from typing import Dict, Tuple, Optional, List
+import numpy as np
+from numpy.linalg import inv
+
+@dataclass
+class CIFuserConfig:
+    objective: str = "logdet"   # "logdet" or "trace"
+    grid_step: float = 0.1      # weight grid for small N; safe & reproducible
+
+class CIFuser:
+    """
+    Covariance Intersection (CI) fusion over N tracker posteriors (mu_i, P_i).
+    Supports:
+      - uniform weights
+      - grid-search weights to minimize trace/logdet(P)
+      - learned weights via a model that outputs positive weights -> softmax
+    """
+    def __init__(self, cfg: CIFuserConfig = CIFuserConfig(), weight_model=None):
+        self.cfg = cfg
+        self.weight_model = weight_model
+
+    @staticmethod
+    def _fuse_given_weights(parts: Dict[str, Tuple[np.ndarray, np.ndarray]],
+                            weights: Dict[str, float]) -> Tuple[np.ndarray, np.ndarray]:
+        J_sum = None
+        h_sum = None
+        for rid, (mu, P) in parts.items():
+            w = weights[rid]
+            # numerical stability jitter
+            J_i = inv(P + 1e-9 * np.eye(P.shape[0], dtype=P.dtype))
+            h_i = J_i @ mu
+            if J_sum is None:
+                J_sum = w * J_i
+                h_sum = w * h_i
+            else:
+                J_sum += w * J_i
+                h_sum += w * h_i
+        P = inv(J_sum)
+        mu = P @ h_sum
+        return mu, P
+
+    @staticmethod
+    def _uniform_weights(keys: List[str]) -> Dict[str, float]:
+        w = 1.0 / max(1, len(keys))
+        return {k: w for k in keys}
+
+    @staticmethod
+    def _simplex_grid(n: int, step: float) -> np.ndarray:
+        """
+        Generate simplex points of dimension n that sum to 1 with given step.
+        """
+        if n == 1:
+            return np.array([[1.0]])
+        levels = int(round(1.0 / step))
+        grids = []
+        def rec(prefix, remain, depth):
+            if depth == n-1:
+                grids.append(prefix + [remain])
+                return
+            for i in range(remain+1):
+                rec(prefix + [i], remain - i, depth + 1)
+        rec([], levels, 0)
+        arr = np.array(grids, dtype=float) / levels
+        return arr
+
+    def _objective(self, P: np.ndarray) -> float:
+        if self.cfg.objective == "trace":
+            return float(np.trace(P))
+        sign, logdet = np.linalg.slogdet(P)  # default: logdet
+        return float(logdet)
+
+    def fuse(self,
+             parts: Dict[str, Tuple[np.ndarray, np.ndarray]],
+             method: str = "uniform",
+             node_features: Optional[Dict[str, np.ndarray]] = None) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
+        keys = list(parts.keys())
+        if len(keys) == 1:
+            mu, P = parts[keys[0]]
+            return mu, P, {keys[0]: 1.0}
+
+        if method == "uniform":
+            w = self._uniform_weights(keys)
+            mu, P = self._fuse_given_weights(parts, w)
+            return mu, P, w
+
+        if method == "learned" and self.weight_model is not None and node_features is not None:
+            # Stack node features in the same order
+            X = np.vstack([node_features[k].reshape(1, -1) for k in keys])
+            weights_vec = self.weight_model.predict_weights(X)  # (N,)
+            # Guard rails: clip and renormalize
+            weights_vec = np.maximum(weights_vec, 1e-9)
+            weights_vec = weights_vec / np.sum(weights_vec)
+            w = {k: float(weights_vec[i]) for i, k in enumerate(keys)}
+            mu, P = self._fuse_given_weights(parts, w)
+            return mu, P, w
+
+        # Grid-search CI weights (robust and dependency-free)
+        grid = self._simplex_grid(len(keys), self.cfg.grid_step)
+        best_val = np.inf
+        best_w = None
+        best_mu, best_P = None, None
+        for g in grid:
+            w = {k: float(g[i]) for i, k in enumerate(keys)}
+            if abs(sum(w.values()) - 1.0) > 1e-9:
+                continue
+            mu, P = self._fuse_given_weights(parts, w)
+            val = self._objective(P)
+            if val < best_val:
+                best_val = val
+                best_w = w
+                best_mu, best_P = mu, P
+        return best_mu, best_P, best_w
+
+
+### models.py
+# swarm_ml/models.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class BiasNet(nn.Module):
+    """
+    Small MLP that predicts scalar bias for a single UWB range measurement.
+    Input features must match features.build_measurement_features(...).
+    """
+    def __init__(self, in_dim: int, hidden: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)  # (B,)
+
+    def predict(self, x_np):
+        with torch.no_grad():
+            x = torch.tensor(x_np, dtype=torch.float32).unsqueeze(0)
+            y = self.forward(x).item()
+        return y
+
+
+class FusionNet(nn.Module):
+    """
+    Predicts per-tracker weights via attention-like scoring.
+    Given per-node features (d-dimensional), produce normalized weights over nodes.
+    """
+    def __init__(self, in_dim: int, hidden: int = 64):
+        super().__init__()
+        self.enc = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU()
+        )
+        self.score = nn.Linear(hidden, 1)
+
+    def forward(self, X):  # X: (N_nodes, d)
+        H = self.enc(X)                   # (N,h)
+        s = self.score(H).squeeze(-1)     # (N,)
+        w = F.softmax(s, dim=0)           # (N,)
+        return w
+
+    def predict_weights(self, X_np):
+        """
+        X_np: array-like of shape (N_nodes, d)
+        Returns: numpy array of shape (N_nodes,) that sums to 1.
+        """
+        self.eval()
+        with torch.no_grad():
+            X = torch.tensor(X_np, dtype=torch.float32)
+            if X.ndim == 1:  # allow single-node input as (d,)
+                X = X.unsqueeze(0)
+            w = self.forward(X)  # (N,)
+            return w.cpu().numpy()
+
+    # Backward compat alias
+    def predict(self, X_np):
+        return self.predict_weights(X_np)
+
+
+### train_fusionnet.py
+# swarm_ml/train_fusionnet.py
+import argparse, os, json
+import numpy as np, torch
+from torch.utils.data import Dataset, DataLoader
+from .models import FusionNet
+
+def _ci_fuse_torch(parts, w):
+    """
+    Torch implementation of CI fusion for differentiable training.
+
+    parts: dict[id] -> (mu_i (6,), P_i (6,6)) numpy arrays
+    w: torch.Tensor shape (N,) softmax weights
+    Returns: (mu_fused (6,), P_fused (6,6)) torch tensors
+    """
+    keys = list(parts.keys())
+    J_sum = None
+    h_sum = None
+    for i, rid in enumerate(keys):
+        mu_i_np, P_i_np = parts[rid]
+        mu_i = torch.tensor(mu_i_np, dtype=torch.float32)
+        P_i = torch.tensor(P_i_np, dtype=torch.float32)
+        # Numerical jitter for stability
+        P_i = P_i + torch.eye(P_i.shape[0], dtype=torch.float32) * 1e-6
+        J_i = torch.inverse(P_i)
+        h_i = J_i @ mu_i
+        wi = w[i]
+        if J_sum is None:
+            J_sum = wi * J_i
+            h_sum = wi * h_i
+        else:
+            J_sum = J_sum + wi * J_i
+            h_sum = h_sum + wi * h_i
+    P = torch.inverse(J_sum)
+    mu = P @ h_sum
+    return mu, P
+
+class FusionSnapDataset(Dataset):
+    """
+    Each sample contains:
+      - X: (N_nodes, d) per-tracker node features
+      - gt_pos: (3,) target 3D position (ground truth) at that time
+      - parts: dict of (mu_i, P_i) local posteriors
+    """
+    def __init__(self, snaps):
+        self.snaps = snaps
+
+    def __len__(self): return len(self.snaps)
+    def __getitem__(self, i): return self.snaps[i]
+
+def train_fusionnet(snaps, in_dim, out_dir, lr=1e-3, epochs=20, batch_size=64, seed=0, fuser=None):
+    torch.manual_seed(seed)
+    model = FusionNet(in_dim=in_dim)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    ds = FusionSnapDataset(snaps)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, collate_fn=lambda b: b)
+
+    best = 1e9
+    os.makedirs(out_dir, exist_ok=True)
+    for ep in range(epochs):
+        model.train()
+        tot = 0.0; cnt = 0
+        for batch in dl:
+            loss = 0.0
+            for snap in batch:
+                X = torch.tensor(snap["X"], dtype=torch.float32)      # (N,d)
+                y = torch.tensor(snap["gt_pos"], dtype=torch.float32) # (3,)
+                w = model(X)                                          # (N,)
+                mu_fused, P_fused = _ci_fuse_torch(snap["parts"], w)
+                e = mu_fused[:3] - y
+                P3 = P_fused[:3, :3] + torch.eye(3, dtype=torch.float32) * 1e-6
+                # Gaussian NLL: (e^T P^{-1} e) + logdet(P)
+                maha = (e.unsqueeze(0) @ torch.linalg.solve(P3, e.unsqueeze(1))).squeeze()
+                _, logdet = torch.slogdet(P3)
+                nll = maha + logdet
+                # Encourage non-degenerate weights
+                entropy = -(w * torch.log(w + 1e-8)).sum()
+                loss = loss + (nll - 0.01 * entropy)
+            loss = loss / len(batch)
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            tot += loss.item(); cnt += 1
+
+        avg = tot / max(cnt, 1)
+        print(f"[ep {ep+1:03d}] train_nll={avg:.4f}")
+        if avg < best:
+            best = avg
+            torch.save(model.state_dict(), os.path.join(out_dir, "fusionnet.pt"))
+
+    with open(os.path.join(out_dir, "fusionnet_meta.json"), "w") as f:
+        json.dump({"in_dim": in_dim}, f, indent=2)
+    return model
+
+
+### online_tuner.py
+#/swarm_ml/online_tuner.py
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Dict, Tuple, Optional
+import math
+import numpy as np
+
+Link = Tuple[str, str]  # (tracker_id, target_id)
+
+
+@dataclass
+class OnlineAdaptConfig:
+    # NIS EMA for measurement calibration
+    ema_alpha: float = 0.05
+    r_min_scale: float = 0.5
+    r_max_scale: float = 10.0
+
+    # Q (process) inflation control (optional)
+    q_adapt: bool = True
+    q_alpha: float = 0.02
+    q_min_scale_xy: float = 0.6
+    q_max_scale_xy: float = 3.0
+    q_min_scale_z: float = 0.6
+    q_max_scale_z: float = 3.0
+    q_gain: float = 0.15      # how strongly NIS>1 pushes Q up when R already high
+    nis_tol: float = 0.10     # deadband around 1.0
+
+    # Gating acceptance control
+    gate_adapt: bool = True
+    gate_target_accept: float = 0.97
+    gate_sigma_init: float = 3.0
+    gate_sigma_min: float = 2.0
+    gate_sigma_max: float = 4.0
+    gate_gain: float = 0.05   # 0.02..0.10 is safe
+
+    # CI weights (if FusionNet not used)
+    ci_lambda: float = 0.7    # NIS weight slope
+    ci_use_los: bool = True
+    ci_los_alpha: float = 0.4 # exponent on LOS score
+
+
+class OnlineTuner:
+    """
+    Causal, per-link self-calibration using innovation statistics (no GT).
+    Maintains:
+      - EMA of NIS per link -> R scaling
+      - gate_sigma adaptation to maintain target acceptance
+      - optional global Q scaling (xy, z) based on persistent miscalibration
+    """
+
+    def __init__(self, cfg: OnlineAdaptConfig = OnlineAdaptConfig()):
+        self.cfg = cfg
+        # Per-link stats
+        self._ema_nis: Dict[Link, float] = {}
+        self._r_scale: Dict[Link, float] = {}
+        self._gate_sigma: Dict[Link, float] = {}
+        self._acc_pass: Dict[Link, int] = {}
+        self._acc_tot: Dict[Link, int] = {}
+
+        # Global process noise scales (apply to all trackers/target model)
+        self._q_scale_xy: float = 1.0
+        self._q_scale_z: float = 1.0
+
+    # ---------- public API ----------
+    def get_r_scale(self, link: Link) -> float:
+        return float(self._r_scale.get(link, 1.0))
+
+    def get_gate_sigma(self, link: Link) -> float:
+        return float(self._gate_sigma.get(link, self.cfg.gate_sigma_init))
+
+    def get_q_scales(self) -> Tuple[float, float]:
+        return float(self._q_scale_xy), float(self._q_scale_z)
+
+    def suggest_ci_weights(self,
+                           keys: list[str],
+                           nis_recent: Dict[str, float],
+                           los_recent: Optional[Dict[str, float]] = None) -> Dict[str, float]:
+        """
+        Optional: CI weights from recent per-tracker NIS and LOS (causal).
+        w_i ∝ exp(-λ NIS_i) * LOS_i^α
+        """
+        lam = self.cfg.ci_lambda
+        alpha = self.cfg.ci_los_alpha
+        s = []
+        for k in keys:
+            nis_i = max(1e-6, float(nis_recent.get(k, 1.0)))
+            w = math.exp(-lam * nis_i)
+            if self.cfg.ci_use_los and los_recent is not None:
+                los = float(np.clip(los_recent.get(k, 0.5), 0.05, 0.95))
+                w *= (los ** alpha)
+            s.append(w)
+        s = np.asarray(s, dtype=float)
+        if s.sum() <= 0:
+            return {k: 1.0/len(keys) for k in keys}
+        s /= s.sum()
+        return {k: float(s[i]) for i, k in enumerate(keys)}
+
+    # ---------- online updates ----------
+    def after_gating(self, link: Link, accepted: bool):
+        """Call once per attempted measurement, before EKF update."""
+        self._acc_tot[link] = self._acc_tot.get(link, 0) + 1
+        if accepted:
+            self._acc_pass[link] = self._acc_pass.get(link, 0) + 1
+        # adapt gate sigma occasionally
+        if self.cfg.gate_adapt and self._acc_tot[link] % 100 == 0:
+            self._adapt_gate_sigma(link)
+
+    def after_update(self,
+                     link: Link,
+                     innovation: float,
+                     S_scalar: float,
+                     r_is_maxed: bool,
+                     geom_ez: Optional[float] = None):
+        """
+        Call once for each USED measurement (i.e., after gating and EKF update).
+        Updates EMA NIS -> R scaling. Optionally nudges Q if R is saturated.
+        """
+        if not np.isfinite(S_scalar) or S_scalar <= 0:
+            return
+        nis = float((innovation * innovation) / S_scalar)
+        ema = self._ema_nis.get(link, 1.0)
+        alpha = self.cfg.ema_alpha
+        ema = (1.0 - alpha) * ema + alpha * nis
+        self._ema_nis[link] = ema
+
+        # R scaling tracks EMA NIS directly (bounded)
+        r_scale = self._r_scale.get(link, 1.0)
+        # smooth multiplicative update
+        r_scale = r_scale ** (1.0 - alpha) * (ema ** alpha)
+        r_scale = float(np.clip(r_scale, self.cfg.r_min_scale, self.cfg.r_max_scale))
+        self._r_scale[link] = r_scale
+
+        # Optional: Q inflation when NIS remains high AND R is already large
+        if self.cfg.q_adapt:
+            self._maybe_adapt_Q(ema_nis=ema, r_is_maxed=r_is_maxed, geom_ez=geom_ez)
+
+    # ---------- internals ----------
+    def _adapt_gate_sigma(self, link: Link):
+        tgt = self.cfg.gate_target_accept
+        acc = self._acc_pass.get(link, 0)
+        tot = self._acc_tot.get(link, 1)
+        rate = acc / max(1, tot)  # acceptance rate
+        sigma = self._gate_sigma.get(link, self.cfg.gate_sigma_init)
+        # multiplicative update toward target acceptance
+        # if rate < tgt → increase sigma; else decrease
+        delta = self.cfg.gate_gain * (tgt - rate)
+        sigma = sigma * math.exp(delta)
+        sigma = float(np.clip(sigma, self.cfg.gate_sigma_min, self.cfg.gate_sigma_max))
+        self._gate_sigma[link] = sigma
+        # reset counters to avoid drift
+        self._acc_pass[link] = 0
+        self._acc_tot[link] = 0
+
+    def _maybe_adapt_Q(self, ema_nis: float, r_is_maxed: bool, geom_ez: Optional[float]):
+        """
+        Conservative covariance-matching:
+        - If EMA NIS >> 1 and R already near max, increase Q a bit.
+        - If EMA NIS << 1 and R not deflated, decrease Q a bit.
+        ez (|bearing_z|) can bias z vs xy scaling.
+        """
+        tol = self.cfg.nis_tol
+        # decide which axis to emphasize (geometry helps separate z from xy)
+        ez = float(np.clip(geom_ez if geom_ez is not None else 0.5, 0.0, 1.0))
+        bias_z = (ez > 0.7)  # high vertical observability → adjust z more
+
+        if ema_nis > (1.0 + tol) and r_is_maxed:
+            k = self.cfg.q_gain * (ema_nis - 1.0)
+            if bias_z:
+                self._q_scale_z = float(np.clip(self._q_scale_z * (1.0 + self.cfg.q_alpha * k),
+                                                self.cfg.q_min_scale_z, self.cfg.q_max_scale_z))
+            else:
+                self._q_scale_xy = float(np.clip(self._q_scale_xy * (1.0 + self.cfg.q_alpha * k),
+                                                 self.cfg.q_min_scale_xy, self.cfg.q_max_scale_xy))
+
+        elif ema_nis < (1.0 - tol) and not r_is_maxed:
+            k = self.cfg.q_gain * (1.0 - ema_nis)
+            if bias_z:
+                self._q_scale_z = float(np.clip(self._q_scale_z * (1.0 - self.cfg.q_alpha * k),
+                                                self.cfg.q_min_scale_z, self.cfg.q_max_scale_z))
+            else:
+                self._q_scale_xy = float(np.clip(self._q_scale_xy * (1.0 - self.cfg.q_alpha * k),
+                                                 self.cfg.q_min_scale_xy, self.cfg.q_max_scale_xy))
+
+
+
+### evaluation_swarm.py
+# swarm_ml/evaluation_swarm.py
+import os, csv
+import numpy as np
+
+def rmse_xyz(est: np.ndarray, gt: np.ndarray) -> dict:
+    assert est.shape == gt.shape
+    e = est - gt
+    mse = np.mean(e**2, axis=0)
+    rmse = np.sqrt(mse)
+    return {"rmse_x": float(rmse[0]), "rmse_y": float(rmse[1]), "rmse_z": float(rmse[2]),
+            "rmse_3d": float(np.sqrt(np.mean(np.sum(e**2, axis=1))))}
+
+def nees(traj_mu: np.ndarray, traj_P: np.ndarray, gt: np.ndarray) -> float:
+    N = traj_mu.shape[0]
+    s = 0.0
+    for k in range(N):
+        e = (traj_mu[k, :3] - gt[k, :3]).reshape(3, 1)
+        Pk = traj_P[k, :3, :3]
+        s += float(e.T @ np.linalg.inv(Pk) @ e)
+    return s / (3*N)
+
+def save_csv(path: str, rows: list, header: list):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        for r in rows:
+            w.writerow(r)
+
+def evaluate_and_save(target_mu_seq, target_P_seq, gt_target_seq, out_dir):
+    rm = rmse_xyz(np.asarray(target_mu_seq)[:, :3], np.asarray(gt_target_seq)[:, :3])
+    n = nees(np.asarray(target_mu_seq), np.asarray(target_P_seq), np.asarray(gt_target_seq))
+    print(f"[SWARM] Target RMSE (m): {rm}  NEES: {n:.3f}")
+
+    # Save time series
+    rows = []
+    for k in range(len(target_mu_seq)):
+        mu = target_mu_seq[k][:3]
+        P = target_P_seq[k][:3, :3]
+        rows.append([k, mu[0], mu[1], mu[2], P[0,0], P[1,1], P[2,2]])
+    save_csv(os.path.join(out_dir, "target_estimate.csv"),
+             rows, ["k", "x", "y", "z", "var_x", "var_y", "var_z"])
+
+    save_csv(os.path.join(out_dir, "summary.csv"),
+             [[rm["rmse_x"], rm["rmse_y"], rm["rmse_z"], rm["rmse_3d"], n]],
+             ["rmse_x","rmse_y","rmse_z","rmse_3d","nees"])
+
+    return rm, n
+
+
+### los_adapter.py
+# swarm_ml/los_adapter.py
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List
+import numpy as np
+import pandas as pd
+import inspect, os, sys, importlib.util
+
+def _load_from_fs(fname="los_classification.py") -> Optional[object]:
+    """Search current repo recursively for los_classification.py and import it."""
+    root = os.getcwd()
+    for r, _, files in os.walk(root):
+        if fname in files:
+            path = os.path.join(r, fname)
+            spec = importlib.util.spec_from_file_location("los_classification", path)
+            mod = importlib.util.module_from_spec(spec)
+            try:
+                spec.loader.exec_module(mod)  # type: ignore
+                print(f"[LOS] Loaded {fname} from: {path}", flush=True)
+                return mod
+            except Exception as e:
+                print(f"[LOS] Failed to load {path}: {e}", flush=True)
+                return None
+    print(f"[LOS] {fname} not found under: {root}", flush=True)
+    return None
+
+try:
+    # Prefer a local copy under swarm_ml if you duplicated it
+    from swarm_ml import los_classification as losmod  # type: ignore
+except Exception:
+    try:
+        import los_classification as losmod  # repo root
+    except Exception:
+        losmod = _load_from_fs()  # <- NEW: auto-import from file if present
+
+@dataclass
+class LOSConfig:
+    use_cir: bool = False
+    default_score: float = 0.5
+    los_score_if_true: float = 0.9
+    los_score_if_false: float = 0.1
+    verbose: bool = True
+    per_row_average: bool = True
+
+class LOSAdapter:
+    """Auto-detect a LOS function in los_classification.py and return a score in [0,1]."""
+    def __init__(self, cfg: LOSConfig = LOSConfig()):
+        self.cfg = cfg
+        self.enabled = losmod is not None
+        self._printed = False
+        self._cand_funcs: List[str] = []
+        self._row_funcs: List[str] = []
+        self._chosen: Optional[str] = None
+        if self.enabled:
+            self._introspect()
+
+    def _print_once(self, msg: str):
+        if self.cfg.verbose and not self._printed:
+            print(msg, flush=True)
+
+    def _introspect(self):
+        names = dir(losmod)
+        funcs = [n for n in names if inspect.isfunction(getattr(losmod, n))]
+        self._cand_funcs = [n for n in funcs if any(k in n.lower() for k in
+                           ["predict_los_probability","predict_los_prob","predict_proba",
+                            "los_probability","los_prob","classify","score","predict"])]
+        self._row_funcs = [n for n in funcs if any(k in n.lower() for k in
+                           ["predict_row","classify_row","los_row"])]
+        self._chosen = (self._cand_funcs[0] if self._cand_funcs
+                        else self._row_funcs[0] if self._row_funcs else None)
+        if self.cfg.verbose:
+            self._print_once("[LOS] los_classification module found.")
+            self._print_once(f"[LOS] Functions: {funcs}")
+            self._print_once(f"[LOS] Batch candidates: {self._cand_funcs}, Row candidates: {self._row_funcs}")
+            self._print_once(f"[LOS] Selected callable: {self._chosen}")
+            self._printed = True
+
+    @staticmethod
+    def _as_score(out: Any, cfg: LOSConfig) -> Optional[float]:
+        try:
+            if out is None: return None
+            if isinstance(out, (float, int)):
+                v = float(out)
+                return float(np.clip(v,0,1)) if 0<=v<=1 else (cfg.los_score_if_true if v!=0 else cfg.los_score_if_false)
+            if isinstance(out, bool):
+                return cfg.los_score_if_true if out else cfg.los_score_if_false
+            if isinstance(out, dict):
+                for k in ("prob_los","los_prob","p_los","score","los"):
+                    if k in out:
+                        v = out[k]
+                        if isinstance(v, bool): return cfg.los_score_if_true if v else cfg.los_score_if_false
+                        return float(np.clip(float(v),0,1))
+            if hasattr(out, "__len__"):
+                arr = np.asarray(out, dtype=float).reshape(-1)
+                return float(np.clip(arr,0,1).mean())
+        except Exception:
+            return None
+        return None
+
+    def score(self, pair_df: pd.DataFrame, extras: Optional[Dict[str, Any]] = None) -> Optional[float]:
+        if not self.enabled or pair_df is None or pair_df.empty or self._chosen is None:
+            return None
+        func = getattr(losmod, self._chosen, None)
+        if func is None: return None
+
+        # Try DataFrame
+        try:
+            s = self._as_score(func(pair_df), self.cfg)
+            if s is not None: return s
+        except Exception as e:
+            self._print_once(f"[LOS] Batch call {self._chosen}(DataFrame) failed: {e}")
+
+        # Try ranges
+        try:
+            s = self._as_score(func(pair_df["range"].to_numpy(dtype=float)), self.cfg)
+            if s is not None: return s
+        except Exception as e:
+            self._print_once(f"[LOS] Batch call {self._chosen}(ranges) failed: {e}")
+
+        # Try row-wise average
+        if self.cfg.per_row_average:
+            scores=[]
+            for _, row in pair_df.iterrows():
+                for cand in self._row_funcs + self._cand_funcs:
+                    f = getattr(losmod, cand, None)
+                    if f is None: continue
+                    try:
+                        s = self._as_score(f(row.to_dict()), self.cfg)
+                        if s is not None: scores.append(s); break
+                    except Exception: continue
+            if scores: return float(np.clip(np.mean(scores),0,1))
+
+        # Fallback if no classifier available
+        if pair_df is not None and not pair_df.empty:
+            zs = pair_df["range"].to_numpy(dtype=float)
+            if zs.size >= 4:
+                q75, q25 = np.percentile(zs, 75), np.percentile(zs, 25)
+                iqr = max(1e-3, q75 - q25)
+                # Map smaller IQR to higher LOS score in [0.3, 0.8]
+                score = 0.8 - 0.5 * float(np.clip(iqr, 0.0, 1.0))
+                return score
+            else:
+                # With few samples, be cautiously neutral
+                return 0.5
+        return None
+
+
+### nees_tuner.py
+def scale_for_nees(nees_avg: float, target: float = 2.0, gain: float = 0.25) -> float:
+    """
+    Return multiplicative scale for measurement std to move NEES toward 'target'.
+    Example: new_std = old_std * scale_for_nees(last_nees)
+    """
+    nees_avg = max(1e-6, float(nees_avg))
+    err = (nees_avg / target) - 1.0
+    scale = 1.0 + gain * err
+    return float(max(0.6, min(1.6, scale)))
+
+
+
+### safety.py
+#swarm_ml/safety.py
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Dict, Iterable, Tuple, Optional
+import numpy as np
+
+@dataclass
+class SafetyLimits:
+    v_max: float = 2.0           # m/s
+    a_max: float = 1.0           # m/s^2 (simple first-order cap)
+    z_min: float = 0.5           # m
+    z_max: float = 10.0          # m
+    geofence_xy: Optional[Tuple[float,float,float,float]] = None  # (xmin,xmax,ymin,ymax)
+    keepouts: Tuple[Tuple[np.ndarray, float], ...] = tuple()       # spheres: (center, radius)
+
+def _cap_velocity(vec: np.ndarray, v_max: float) -> np.ndarray:
+    n = float(np.linalg.norm(vec))
+    return vec if n <= v_max or n == 0.0 else vec * (v_max / n)
+
+def _push_from_keepouts(p_next: np.ndarray, mv: np.ndarray, keepouts) -> np.ndarray:
+    if not keepouts: return mv
+    grad = np.zeros(3, float)
+    for c, r in keepouts:
+        rel = (p_next) - c.reshape(3)
+        d = float(np.linalg.norm(rel) + 1e-9)
+        if d < r:
+            grad += (rel / d) * (r - d)
+    if np.linalg.norm(grad) > 0:
+        mv = mv + 0.5 * grad
+    return mv
+
+def _clamp_altitude(p: np.ndarray, mv: np.ndarray, z_min: float, z_max: float) -> np.ndarray:
+    z_next = p[2] + mv[2]
+    if z_next < z_min: mv[2] = z_min - p[2]
+    if z_next > z_max: mv[2] = z_max - p[2]
+    return mv
+
+def _clamp_geofence(p: np.ndarray, mv: np.ndarray, fence) -> np.ndarray:
+    if fence is None: return mv
+    xmin, xmax, ymin, ymax = fence
+    x_next = p[0] + mv[0]; y_next = p[1] + mv[1]
+    if x_next < xmin: mv[0] = xmin - p[0]
+    if x_next > xmax: mv[0] = xmax - p[0]
+    if y_next < ymin: mv[1] = ymin - p[1]
+    if y_next > ymax: mv[1] = ymax - p[1]
+    return mv
+
+def project_to_safe(p_self: np.ndarray, move: np.ndarray,
+                    neighbors: Dict[str, np.ndarray], d_min: float = 1.5,
+                    limits: SafetyLimits = SafetyLimits()) -> np.ndarray:
+    """Project a proposed displacement to respect min inter‑robot spacing and basic limits."""
+    p_self = np.asarray(p_self, float).reshape(3)
+    mv = np.asarray(move,   float).reshape(3)
+
+    # Inter‑robot spacing barrier (repulsive correction)
+    grad = np.zeros(3, float)
+    for _, pn in neighbors.items():
+        pn = np.asarray(pn, float).reshape(3)
+        rel = (p_self + mv) - pn
+        d = float(np.linalg.norm(rel) + 1e-9)
+        if d < d_min:
+            grad += (rel / d) * (d_min - d)
+    if np.linalg.norm(grad) > 0:
+        mv = mv + 0.5 * grad
+
+    # Keep‑outs, geofence, altitude band
+    mv = _push_from_keepouts(p_self + mv, mv, limits.keepouts)
+    mv = _clamp_geofence(p_self, mv, limits.geofence_xy)
+    mv = _clamp_altitude(p_self, mv, limits.z_min, limits.z_max)
+
+    # Velocity cap (treat mv as Δx per planning tick; caller maps to velocity)
+    mv = _cap_velocity(mv, limits.v_max / 5.0)  # conservative per‑tick displacement
+    return mv
+
+
+
+### los_classification.py
+import numpy as np
+import pandas as pd
+
+
+def _score_from_iqr(zs: np.ndarray) -> float:
+    """Map intra-timestep dispersion to a LOS probability in [0.05, 0.95]."""
+    zs = np.asarray(zs, dtype=float).reshape(-1)
+    if zs.size < 5:
+        return 0.5
+    q25, q75 = np.percentile(zs, [25, 75])
+    iqr = max(1e-6, float(q75 - q25))
+    # Logistic: small IQR -> high LOS; midpoint around 0.15 m
+    k, x0 = 8.0, 0.15
+    p = 1.0 / (1.0 + np.exp(k * (iqr - x0)))
+    return float(np.clip(p, 0.05, 0.95))
+
+
+def predict_los_probability(obj) -> float:
+    """
+    Batch entrypoint for LOSAdapter. Accepts a DataFrame with a 'range' column
+    or a 1D array of ranges.
+    """
+    if isinstance(obj, pd.DataFrame):
+        zs = obj["range"].to_numpy(dtype=float)
+    else:
+        zs = np.asarray(obj, dtype=float).reshape(-1)
+    return _score_from_iqr(zs)
+
+
+def predict_row(row: dict) -> float:
+    """Optional row-wise fallback (neutral-ish)."""
+    try:
+        z = float(row.get("range", np.nan))
+        if not np.isfinite(z):
+            return 0.5
+    except Exception:
+        return 0.5
+    return 0.6
+
+
+
+### measure_adapter.py
+# swarm_ml/measure_adapter.py
+from dataclasses import dataclass
+from typing import Dict, Any, Optional, Tuple
+import numpy as np
+
+try:
+    from swarm_ml import los_classification as losmod  # optional
+except Exception:
+    try:
+        import los_classification as losmod
+    except Exception:
+        losmod = None
+
+@dataclass
+class AdapterConfig:
+    base_range_var: float = 0.35**2  # conservative default (m^2)
+    min_reliability: float = 1e-3
+    max_reliability: float = 1.0
+    bias_clip: float = 1.0
+    bias_beta: float = 0.01
+    alpha: float = 3.0
+    beta: float = -1.0
+    # Innovation adaptation
+    ema_alpha: float = 0.05        # EMA for whiteness
+    min_scale: float = 0.25
+    max_scale: float = 8.0
+    # New: LOS/geometry influences
+    los_influence: float = 0.5     # controls how strongly LOS adjusts reliability
+    geom_influence: float = 0.5    # controls how strongly |e_z| adjusts reliability
+
+class MeasureAdapter:
+    """
+    Bias-correct + reliability-shape + (optional) innovation-driven R scaling.
+    """
+    def __init__(self, cfg: AdapterConfig = AdapterConfig(), bias_model=None):
+        self.cfg = cfg
+        self.bias_model = bias_model
+        self._residual_memory: Dict[Tuple[str, str], float] = {}
+        self._whiten_ema: Dict[Tuple[str, str], float] = {}
+        self._rscale: Dict[Tuple[str, str], float] = {}
+        # Online bias estimator per (tracker,target) link
+        self._bias_ema: Dict[Tuple[str, str], float] = {}
+        self._bias_beta: float = float(self.cfg.bias_beta)  # slow learn-rate for constant bias
+        self._bias_clip: float = float(self.cfg.bias_clip)
+
+    @staticmethod
+    def _sigmoid(x: float) -> float:
+        return 1. / (1. + np.exp(-x))
+
+    def correct(self,
+                tracker_id: str,
+                target_id: str,
+                z: float,
+                tracker_pos: np.ndarray,
+                target_pred_pos: Optional[np.ndarray],
+                los_score: Optional[float],
+                features: Optional[np.ndarray] = None) -> Tuple[float, float, Dict[str, Any]]:
+        key = (tracker_id, target_id)
+
+        # Bias: model-predicted + online EMA estimate (both gently clipped)
+        bias_est = float(self._bias_ema.get(key, 0.0))
+        bias_model = 0.0
+        if self.bias_model is not None and features is not None:
+            pred = self.bias_model.predict(features)
+            bias_model = float(np.clip(pred, -self.cfg.bias_clip, self.cfg.bias_clip))
+        bias = float(np.clip(bias_model + bias_est, -self._bias_clip, self._bias_clip))
+        z_corr = float(z - bias)
+
+        # Reliability from LOS score (prob in [0,1])
+        if los_score is not None:
+            ls = float(np.clip(float(los_score), 0.0, 1.0))
+            # Map to a mild multiplier around 1.0
+            los_mult = 1.0 + self.cfg.los_influence * (ls - 0.5)  # 0.75..1.25 if influence=0.5
+        else:
+            los_mult = 1.0
+
+        # Reliability from geometry (|bearing_z|); small -> downweight, large -> upweight
+        if target_pred_pos is not None and tracker_pos is not None:
+            a = np.asarray(target_pred_pos, float) - np.asarray(tracker_pos, float)
+            nrm = np.linalg.norm(a) + 1e-9
+            ez = abs(a[2]) / nrm
+            geom_mult = 1.0 + self.cfg.geom_influence * (ez - 0.5)  # ~0.75..1.25 typically
+        else:
+            geom_mult = 1.0
+
+        # Compose reliability and clip
+        rrel = float(np.clip(los_mult * geom_mult, self.cfg.min_reliability, self.cfg.max_reliability))
+
+        # Base variance + reliability shaping
+        R_eff = self.cfg.base_range_var / max(rrel, 1e-6)
+
+        # Innovation-driven scaling (applied from previous steps)
+        scale = self._rscale.get(key, 1.0)
+        R_eff *= float(np.clip(scale, self.cfg.min_scale, self.cfg.max_scale))
+
+        meta = {
+            "bias": bias,
+            "bias_online": bias_est,
+            "bias_model": bias_model,
+            "reliability": rrel,
+            "R_eff": R_eff,
+            "z_in": z,
+            "z_corr": z_corr,
+            "scale": scale,
+        }
+        return z_corr, R_eff, meta
+
+    def update_from_innov(self, tracker_id: str, target_id: str, innov: Optional[float], S: Optional[float]):
+        """
+        After a filter update, call this with the scalar innovation and S.
+        Adjust a per-link variance scaling to drive E[(nu^2)/S] -> 1.
+        """
+        if innov is None or S is None or S <= 0:
+            return
+        key = (tracker_id, target_id)
+        whiten = float((innov * innov) / S)
+        ema = self._whiten_ema.get(key, 1.0)
+        ema = (1.0 - self.cfg.ema_alpha) * ema + self.cfg.ema_alpha * whiten
+        self._whiten_ema[key] = ema
+        # Scale future R by current EMA
+        self._rscale[key] = float(np.clip(ema, self.cfg.min_scale, self.cfg.max_scale))
+        # Slowly adapt online bias toward mean innovation
+        b = float(self._bias_ema.get(key, 0.0))
+        b = (1.0 - self._bias_beta) * b + self._bias_beta * float(innov)
+        self._bias_ema[key] = float(np.clip(b, -self._bias_clip, self._bias_clip))
+
+
+### train_biasnet_cli.py
+# swarm_ml/train_biasnet_cli.py
+import argparse, os, json, random
+from typing import List, Dict
+from .datasets import load_bias_samples_jsonl
+from .train_biasnet import train_biasnet
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--samples", required=True, help="Path to bias_samples.jsonl or .jsonl.gz")
+    p.add_argument("--out", required=True, help="Output dir for model")
+    p.add_argument("--val_split", type=float, default=None, help="Alias for --val_ratio")
+    p.add_argument("--val_ratio", type=float, default=0.2)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--batch_size", type=int, default=256)
+    args = p.parse_args()
+
+    random.seed(args.seed)
+
+    samples: List[Dict] = load_bias_samples_jsonl(args.samples)
+    print(f"[CLI] Loaded {len(samples):,} bias samples from {os.path.abspath(args.samples)}")
+    random.shuffle(samples)
+    n_total = len(samples)
+    val_ratio = args.val_ratio if (args.val_split is None) else args.val_split
+    n_val = max(1, int(val_ratio * n_total))
+    val_samples = samples[:n_val]
+    train_samples = samples[n_val:]
+
+    assert len(train_samples) > 0 and len(val_samples) > 0, "Not enough samples after split"
+
+    in_dim = len(train_samples[0]["features"])
+    model = train_biasnet(
+        train_samples=train_samples,
+        val_samples=val_samples,
+        in_dim=in_dim,
+        out_dir=args.out,
+        lr=args.lr,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        seed=args.seed
+    )
+
+    print(f"[OK] BiasNet trained. Artifacts in: {args.out}")
+
+
+### smoother.py
+# swarm_ml/smoother.py
+from dataclasses import dataclass
+import numpy as np
+
+@dataclass
+class CVNoise:
+    sigma_a_xy: float
+    sigma_a_z: float
+
+def F_mat(dt: float):
+    """Constant velocity transition matrix"""
+    I = np.eye(3)
+    return np.block([[I, dt*I],
+                     [np.zeros((3,3)), I]])
+
+def Q_mat(dt: float, noise: CVNoise):
+    """Constant velocity process noise matrix"""
+    qx = noise.sigma_a_xy**2
+    qy = noise.sigma_a_xy**2
+    qz = noise.sigma_a_z**2
+
+    def Q1(q):
+        return np.array([[ (dt**3)/3*q, (dt**2)/2*q ],
+                         [ (dt**2)/2*q,    dt*q    ]], dtype=float)
+
+    Q = np.zeros((6,6))
+    Q[np.ix_([0,3],[0,3])] = Q1(qx)
+    Q[np.ix_([1,4],[1,4])] = Q1(qy)
+    Q[np.ix_([2,5],[2,5])] = Q1(qz)
+    return Q
+
+def rts_smooth(mu_f, P_f, dts, noise: CVNoise):
+    """
+    Rauch-Tung-Striebel smoothing for constant velocity model.
+    mu_f, P_f: lists/arrays of filtered means and covariances (after fusion)
+    dts: list of time steps
+    Returns: smoothed means and covariances
+    """
+    N = len(mu_f)
+    mu_s = [m.copy() for m in mu_f]
+    P_s  = [S.copy() for S in P_f]
+
+    # Forward pass: store predictions
+    mu_p = [None]*N
+    P_p  = [None]*N
+    for k in range(N-1):
+        dt = float(dts[k+1])
+        F = F_mat(dt)
+        Q = Q_mat(dt, noise)
+        mu_p[k+1] = F @ mu_f[k]
+        P_p[k+1]  = F @ P_f[k] @ F.T + Q
+
+    # Backward pass
+    for k in range(N-2, -1, -1):
+        dt = float(dts[k+1])
+        F  = F_mat(dt)
+        # stable: solve instead of inverse
+        # Ck = P_k F^T (P_k+1|k)^-1  ->  solve(P_p, (F @ P_f[k]).T).T
+        FPk = F @ P_f[k]
+        Ck  = np.linalg.solve(P_p[k+1].T, FPk.T).T
+        mu_s[k] = mu_s[k] + Ck @ (mu_s[k+1] - mu_p[k+1])
+        P_s[k]  = P_s[k] + Ck @ (P_s[k+1] - P_p[k+1]) @ Ck.T
+        # light symmetrization for numerical hygiene
+        P_s[k]  = 0.5 * (P_s[k] + P_s[k].T)
+
+    return np.array(mu_s), np.array(P_s)
+
+### train_biasnet.py
+# swarm_ml/train_biasnet.py
+import argparse, os, json
+import numpy as np, torch
+from torch.utils.data import DataLoader
+from .models import BiasNet
+from .datasets import BiasNetDataset
+
+def train_biasnet(train_samples, val_samples, in_dim, out_dir, lr=1e-3, epochs=30, batch_size=256, seed=0):
+    torch.manual_seed(seed)
+    model = BiasNet(in_dim=in_dim)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+
+    train_ds = BiasNetDataset(train_samples)
+    val_ds = BiasNetDataset(val_samples)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size)
+
+    best_val = 1e9
+    os.makedirs(out_dir, exist_ok=True)
+    for ep in range(epochs):
+        model.train()
+        tr_loss = 0.0
+        for batch in train_loader:
+            # Support (x,y,w) tuples from dataset
+            if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                xb, yb, wb = batch
+            else:
+                xb, yb = batch
+                wb = torch.ones_like(yb)  # default unit weights
+
+            opt.zero_grad()
+            yhat = model(xb)
+            # Weighted SmoothL1; normalize weights to keep scale stable
+            per = torch.nn.functional.smooth_l1_loss(yhat, yb, reduction='none')
+            wnorm = wb / (wb.mean() + 1e-8)
+            loss = (wnorm * per).mean()
+            loss.backward()
+            opt.step()
+            tr_loss += loss.item() * xb.size(0)
+        tr_loss /= len(train_ds)
+
+        model.eval()
+        va_loss = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                    xb, yb, _ = batch
+                else:
+                    xb, yb = batch
+                yhat = model(xb)
+                va_loss += torch.nn.functional.smooth_l1_loss(yhat, yb).item() * xb.size(0)
+        va_loss /= len(val_ds)
+
+        print(f"[ep {ep+1:03d}] train={tr_loss:.4f} val={va_loss:.4f}")
+        if va_loss < best_val:
+            best_val = va_loss
+            torch.save(model.state_dict(), os.path.join(out_dir, "biasnet.pt"))
+
+    with open(os.path.join(out_dir, "biasnet_meta.json"), "w") as f:
+        json.dump({"in_dim": in_dim}, f, indent=2)
+    return model
+
+
+### __init__.py
+# swarm_ml/__init__.py
+from . import roles
+from . import features
+from . import measure_adapter
+from . import target_filter
+from . import fusion
+from . import datasets
+from . import models
+from . import train_biasnet
+from . import train_fusionnet
+from . import evaluation_swarm
+from . import tagmap
+
+__all__ = [
+    "roles",
+    "features", 
+    "measure_adapter",
+    "target_filter",
+    "fusion",
+    "datasets",
+    "models",
+    "train_biasnet",
+    "train_fusionnet", 
+    "evaluation_swarm",
+    "tagmap"
+]
+
+### target_filter.py
+# swarm_ml/target_filter.py
+from dataclasses import dataclass
+from typing import Tuple, Optional, Dict, Any
+import numpy as np
+from numpy.linalg import inv, slogdet
+
+@dataclass
+class IFConfig:
+    sigma_a_xy: float = 1.0     # horiz accel noise std (m/s^2)
+    sigma_a_z: float  = 0.5     # vertical accel noise std (m/s^2) -> tighter by default
+    p0_xy: float = 2.0          # initial pos std (x,y)
+    p0_z:  float = 2.0          # initial pos std (z)
+    v0_xy: float = 1.0          # initial vel std (x,y)
+    v0_z:  float = 1.0          # initial vel std (z)
+    gate_N_sigma: float = 3.0
+
+class TargetIF:
+    """
+    3D constant-velocity target filter in information form:
+      x = [p(3), v(3)], F = [[I, dt*I],[0,I]]
+      Q(dt) uses per-axis acceleration noise (sigma_a_xy, sigma_a_z).
+    Measurement: z = ||p - p_tracker|| + noise.
+    """
+    def __init__(self, x0: Optional[np.ndarray] = None, cfg: IFConfig = IFConfig()):
+        self.cfg = cfg
+        if x0 is None:
+            self.mu = np.zeros(6)
+        else:
+            self.mu = x0.reshape(6)
+
+        P0 = np.diag([
+            cfg.p0_xy**2, cfg.p0_xy**2, cfg.p0_z**2,
+            cfg.v0_xy**2, cfg.v0_xy**2, cfg.v0_z**2
+        ])
+        self.J = inv(P0)
+        self.h = self.J @ self.mu
+
+    @staticmethod
+    def _F(dt: float) -> np.ndarray:
+        I = np.eye(3)
+        return np.block([[I, dt*I],
+                         [np.zeros((3,3)), I]])
+
+    def _Q(self, dt: float) -> np.ndarray:
+        # axis-wise CV Q
+        qx = self.cfg.sigma_a_xy**2
+        qy = self.cfg.sigma_a_xy**2
+        qz = self.cfg.sigma_a_z**2
+        Q_axis = lambda q: np.block([
+            [ (dt**3)/3 * q, (dt**2)/2 * q ],
+            [ (dt**2)/2 * q,    dt * q     ]
+        ])
+        # build per-axis then assemble
+        Qx = Q_axis(qx); Qy = Q_axis(qy); Qz = Q_axis(qz)
+        Q = np.zeros((6,6))
+        Q[np.ix_([0,3],[0,3])] = Qx
+        Q[np.ix_([1,4],[1,4])] = Qy
+        Q[np.ix_([2,5],[2,5])] = Qz
+        return Q
+
+    def predict(self, dt: float):
+        F = self._F(dt)
+        Q = self._Q(dt)
+        P = inv(self.J)
+        mu = self.mu
+
+        mu_pred = F @ mu
+        P_pred = F @ P @ F.T + Q
+
+        self.J = inv(P_pred)
+        self.h = self.J @ mu_pred
+        self.mu = mu_pred
+
+    @staticmethod
+    def _range_linearize(mu: np.ndarray, tracker_pos: np.ndarray) -> Tuple[float, np.ndarray]:
+        p = mu[:3].reshape(3)
+        diff = p - tracker_pos.reshape(3)
+        d = float(np.linalg.norm(diff) + 1e-12)
+        H = np.zeros((1, 6))
+        H[0, :3] = (diff / d)
+        h0 = d
+        return h0, H
+
+    def correct(self, z: float, R: float, tracker_pos: np.ndarray) -> Dict[str, Any]:
+        h0, H = self._range_linearize(self.mu, tracker_pos)
+        S = H @ inv(self.J) @ H.T + R
+        innov = z - h0
+        if float(innov**2 / S) > self.cfg.gate_N_sigma**2:
+            return {"used": False, "innov": float(innov), "S": float(S)}
+
+        J_meas = (1.0/R) * (H.T @ H)
+        h_meas = (1.0/R) * (H.T @ (z - h0 + H @ self.mu))
+
+        self.J = self.J + J_meas
+        self.h = self.h + h_meas
+        self.mu = inv(self.J) @ self.h
+        return {"used": True, "innov": float(innov), "S": float(S), "h0": float(h0)}
+
+    def correct_height(self, dz_meas: float, z_trk: float, R_h: float) -> Dict[str, Any]:
+        """
+        Z-only linear update using height difference between target and tracker.
+          Measurement model: z = H x - z_trk + noise, H = [0 0 1 0 0 0]
+          where z ≈ (h_tgt - h_trk) and z_trk is the tracker's z in world frame
+          consistent with the geometry used elsewhere.
+        """
+        # Linear measurement setup
+        H = np.zeros((1, 6), dtype=float)
+        H[0, 2] = 1.0
+        # Predicted measurement at current state
+        h0 = float(H @ self.mu - z_trk)
+        # Gate on normalized innovation
+        P = inv(self.J)
+        S = float(H @ P @ H.T + R_h)
+        innov = float(dz_meas - h0)
+        if (innov * innov) / S > self.cfg.gate_N_sigma**2:
+            return {"used": False, "innov": float(innov), "S": float(S)}
+
+        # Information-form update (linear, no re-linearization needed)
+        J_meas = (1.0 / R_h) * (H.T @ H)
+        h_meas = (1.0 / R_h) * (H.T @ (dz_meas - h0 + H @ self.mu))
+
+        self.J = self.J + J_meas
+        self.h = self.h + h_meas
+        self.mu = inv(self.J) @ self.h
+        return {"used": True, "innov": float(innov), "S": float(S), "h0": float(h0)}
+
+    def posterior(self) -> Tuple[np.ndarray, np.ndarray]:
+        P = inv(self.J)
+        return self.mu.copy(), P
+
+    @staticmethod
+    def cov_metrics(P: np.ndarray) -> Dict[str, float]:
+        sign, logdet = slogdet(P)
+        return {"tr": float(np.trace(P)), "logdet": float(logdet)}
+
+
+### bridge.py
+#swarm_control/bridge.py
+from __future__ import annotations
+import asyncio, json, time
+from dataclasses import dataclass
+from typing import Dict, Tuple, Optional
+import numpy as np
+
+try:
+    # Optional dependency; only required in mavsdk mode
+    import mavsdk
+    from mavsdk.offboard import OffboardError, VelocityNedYaw
+except Exception:
+    mavsdk = None
+
+@dataclass
+class VehicleBinding:
+    sys_addr: str            # e.g. "udp://:14540" or "serial:///dev/ttyUSB0:57600"
+    frame: str = "ned"       # "ned" (world-aligned in our sim) or "local"
+    yaw_deg: float = 0.0
+
+class ControlBridge:
+    """
+    Publish/simulate vantage moves at a fixed rate.
+    Modes:
+      - none: no-op
+      - sim: mutate an internal state (for quick end-to-end smoke testing)
+      - mavsdk: send velocity-NED setpoints to each bound vehicle
+    """
+    def __init__(self, mode: str = "none", rate_hz: int = 5,
+                 bindings: Optional[Dict[str, VehicleBinding]] = None):
+        self.mode = mode
+        self.rate_hz = int(rate_hz)
+        self.bindings = bindings or {}
+        self._sim_state: Dict[str, np.ndarray] = {}   # id -> p(3)
+
+        # MAVSDK session
+        self._mav_tasks_started = False
+        self._mav_drones: Dict[str, any] = {}  # id -> System
+
+    # ---------- SIM BACKEND ----------
+    def set_sim_pose(self, robot_id: str, p_xyz: np.ndarray):
+        self._sim_state[robot_id] = np.asarray(p_xyz, float).reshape(3)
+
+    def get_sim_pose(self, robot_id: str) -> Optional[np.ndarray]:
+        return self._sim_state.get(robot_id, None)
+
+    # ---------- PUBLIC API ----------
+    def send_vantage_moves(self, t: float, moves: Dict[str, np.ndarray]):
+        if self.mode == "none":
+            return
+        if self.mode == "sim":
+            # Apply displacement directly to internal sim state; print JSON for logs
+            log = {}
+            for rid, dv in moves.items():
+                dv = np.asarray(dv, float).reshape(3)
+                p = self._sim_state.get(rid, np.zeros(3))
+                self._sim_state[rid] = p + dv
+                log[rid] = [float(dv[0]), float(dv[1]), float(dv[2])]
+            print(f"[CTRL sim] t={t:.2f}, moves={json.dumps(log)}")
+            return
+        if self.mode == "mavsdk":
+            if mavsdk is None:
+                print("[CTRL] MAVSDK not installed; cannot send commands.")
+                return
+            # Fire-and-forget asyncio task to stream one-shot velocities toward the desired Δx
+            asyncio.get_event_loop().create_task(self._send_mavsdk_once(moves))
+
+    # ---------- MAVSDK BACKEND ----------
+    async def _ensure_connected(self):
+        if self._mav_tasks_started:
+            return
+        for rid, bind in self.bindings.items():
+            sys = mavsdk.System()
+            await sys.connect(system_address=bind.sys_addr)
+            self._mav_drones[rid] = sys
+            async for state in sys.core.connection_state():
+                if state.is_connected:
+                    break
+            # Enter offboard with a neutral setpoint
+            try:
+                await sys.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, bind.yaw_deg))
+                await sys.offboard.start()
+            except OffboardError as e:
+                print(f"[CTRL] Offboard for {rid} failed: {e._result.result}")
+        self._mav_tasks_started = True
+
+    async def _send_mavsdk_once(self, moves: Dict[str, np.ndarray]):
+        await self._ensure_connected()
+        dt = 1.0 / max(1, self.rate_hz)
+        for rid, dv in moves.items():
+            if rid not in self._mav_drones:
+                continue
+            v_ned = dv / dt  # naive mapping: Δx per tick -> velocity
+            v_ned = np.clip(v_ned, -2.0, 2.0)  # quick cap; tighten via CLI later
+            vx, vy, vz = float(v_ned[0]), float(v_ned[1]), float(-v_ned[2])  # ENU->NED z sign
+            try:
+                await self._mav_drones[rid].offboard.set_velocity_ned(
+                    VelocityNedYaw(vx, vy, vz, self.bindings[rid].yaw_deg)
+                )
+            except OffboardError as e:
+                print(f"[CTRL] Velocity set failed for {rid}: {e._result.result}")
+
+
+### udp.py
+#swarm_net/udp.py
+from __future__ import annotations
+import socket, struct
+from dataclasses import dataclass
+from typing import Dict, Any, Optional
+import msgpack
+
+@dataclass
+class UdpGroup:
+    mcast_ip: str = "239.0.0.1"
+    port: int = 5001
+    ttl: int = 1
+
+def make_tx(g: UdpGroup):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, g.ttl)
+    addr = (g.mcast_ip, g.port)
+    def send(obj: Dict[str, Any]):
+        buf = msgpack.packb(obj, use_bin_type=True)
+        sock.sendto(buf, addr)
+    return send
+
+def make_rx(g: UdpGroup, iface_ip: str = "0.0.0.0"):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((iface_ip, g.port))
+    mreq = struct.pack("4sl", socket.inet_aton(g.mcast_ip), socket.INADDR_ANY)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    def recv():
+        data, _ = sock.recvfrom(65535)
+        return msgpack.unpackb(data, raw=False)
+    return recv
+
+# NEW: non-blocking receiver (returns None when no packet)
+def make_rx_nb(g: UdpGroup, iface_ip: str = "0.0.0.0"):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((iface_ip, g.port))
+    mreq = struct.pack("4sl", socket.inet_aton(g.mcast_ip), socket.INADDR_ANY)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    sock.setblocking(False)
+    def try_recv() -> Optional[Dict[str, Any]]:
+        try:
+            data, _ = sock.recvfrom(65535)
+            return msgpack.unpackb(data, raw=False)
+        except (BlockingIOError, InterruptedError):
+            return None
+    return try_recv
+
+
+### robot_node.py
+# agent/robot_node.py
+import argparse, time, json, os
+import numpy as np
+import pandas as pd
+
+# ---- Authors' devkit ----
+from miluv.data import DataLoader
+import miluv.utils as utils
+
+# EKF models (authors')
+try:
+    import examples.ekfutils.imu_three_robots_models as model
+except Exception:
+    import imu_three_robots_models as model  # local fallback
+
+# ---- Ours ----
+from swarm_net.udp import make_tx, make_rx_nb, UdpGroup
+from swarm_ml.features import se_translation_from_matrix, build_measurement_features
+from swarm_ml.tagmap import infer_tag_ids_by_robot, select_pair_rows, robust_range_aggregate, \
+                             robust_tracker_sensor_position, robust_target_offset
+from swarm_ml.measure_adapter import MeasureAdapter, AdapterConfig
+from swarm_ml.target_filter import TargetIF, IFConfig
+from swarm_ml.los_adapter import LOSAdapter, LOSConfig
+from swarm_ml.online_tuner import OnlineTuner, OnlineAdaptConfig
+from swarm_ml.safety import project_to_safe, SafetyLimits
+from swarm_control.bridge import ControlBridge
+
+def _concat_with_robot(data: dict, key: str) -> pd.DataFrame:
+    dfs = []
+    for robot in data.keys():
+        if key in data[robot]:
+            dfs.append(data[robot][key].assign(robot=robot))
+    if not dfs:
+        return pd.DataFrame(columns=["timestamp"])
+    return pd.concat(dfs, ignore_index=True)
+
+def _load_biasnet(path_dir: str):
+    if path_dir is None:
+        return None
+    import os, json, torch
+    from swarm_ml.models import BiasNet
+    with open(os.path.join(path_dir, "biasnet_meta.json"), "r") as f:
+        meta = json.load(f)
+    in_dim = int(meta["in_dim"])
+    m = BiasNet(in_dim)
+    state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu")
+    m.load_state_dict(state)
+    m.eval()
+    return m
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--id", required=True, help="This robot id (tracker), e.g., ifo002")
+    ap.add_argument("--target", required=True, help="Target robot id, e.g., ifo001")
+    ap.add_argument("--exp", required=True, help="Experiment name, e.g., default_3_random2_0")
+    ap.add_argument("--udp", default="239.0.0.1:5001")
+    ap.add_argument("--uwb_std", type=float, default=None)
+    ap.add_argument("--uwb_var", type=float, default=0.35**2)
+    ap.add_argument("--pair_corr", type=float, default=0.7)
+    ap.add_argument("--huber_delta", type=float, default=0.8)
+    ap.add_argument("--tags_per_robot", type=int, default=2)
+    ap.add_argument("--sigma_a_xy", type=float, default=1.0)
+    ap.add_argument("--sigma_a_z", type=float, default=0.5)
+    ap.add_argument("--gate_sigma", type=float, default=3.0)
+    ap.add_argument("--use_los", action="store_true")
+    ap.add_argument("--use_cir", action="store_true")
+    ap.add_argument("--los_verbose", action="store_true")
+    ap.add_argument("--biasnet_dir", default=None)
+    ap.add_argument("--use_height_tf", action="store_true")
+    ap.add_argument("--height_std", type=float, default=0.07)
+    ap.add_argument("--r_floor_blend", type=float, default=0.5,
+                    help="Blend factor for soft R floor with pair variance (0..1)")
+    # expose influences for quick A/B
+    ap.add_argument("--los_influence", type=float, default=0.5)
+    ap.add_argument("--geom_influence", type=float, default=0.5)
+    # online tuner (innovation-driven R scale, adaptive gating, optional Q adapt)
+    ap.add_argument("--online_tune", action="store_true")
+    ap.add_argument("--online_r_min_scale", type=float, default=0.75)
+    ap.add_argument("--online_r_max_scale", type=float, default=10.0)
+    ap.add_argument("--gate_target", type=float, default=0.97)
+    ap.add_argument("--gate_sigma_init", type=float, default=3.0)
+    ap.add_argument("--q_adapt", action="store_true")
+    ap.add_argument("--realtime", action="store_true", help="Sleep to approximate wall-time replay")
+    ap.add_argument("--allow_same_t_fanout", action="store_true", help="If set, allow using fused state at same timestamp (not recommended)")
+    ap.add_argument("--warmstart_once", action="store_true", help="Copy first older fused position into local filter state (one-shot)")
+    ap.add_argument("--control_mode", choices=["none","sim","mavsdk"], default="none",
+                    help="Where to send cmd_move displacements")
+    ap.add_argument("--control_rate", type=int, default=5, help="Setpoint rate (Hz) for ControlBridge")
+    args = ap.parse_args()
+
+    ip, port = args.udp.split(":")
+    tx = make_tx(UdpGroup(mcast_ip=ip, port=int(port)))
+    rx_nb = make_rx_nb(UdpGroup(mcast_ip=ip, port=int(port)))  # non-blocking poll
+    ctrl = ControlBridge(mode=args.control_mode, rate_hz=args.control_rate)
+
+    # ----------------- Load data -----------------
+    miluv = DataLoader(
+        args.exp,
+        exp_dir="./data/three_robots",
+        cir=False,
+        barometer=False,
+        height=args.use_height_tf,
+        imu="px4",
+        cam=None,
+        mag=False
+    )
+    data = miluv.data
+    robots = list(data.keys())
+    if args.id not in robots or args.target not in robots:
+        raise ValueError(f"robots in log: {robots}; --id={args.id}, --target={args.target}")
+
+    uwb_range = _concat_with_robot(data, "uwb_range")
+    height_df = _concat_with_robot(data, "height") if args.use_height_tf else pd.DataFrame(columns=["timestamp"])
+
+    # Query timestamps = union of UWB + height
+    query_timestamps = np.sort(np.unique(np.append(
+        uwb_range["timestamp"].to_numpy(),
+        height_df["timestamp"].to_numpy() if not height_df.empty else np.array([], dtype=float)
+    )))
+
+    # IMU at query times
+    imu_at_q = {r: miluv.query_by_timestamps(query_timestamps, robots=r, sensors="imu_px4")[r]
+                for r in robots}
+    gyro  = {r: imu_at_q[r]["imu_px4"][["timestamp","angular_velocity.x","angular_velocity.y","angular_velocity.z"]].reset_index(drop=True)
+             for r in robots}
+    accel = {r: imu_at_q[r]["imu_px4"][["timestamp","linear_acceleration.x","linear_acceleration.y","linear_acceleration.z"]].reset_index(drop=True)
+             for r in robots}
+
+    # Ground truth SE_2(3)
+    gt_se23 = {
+        r: utils.get_se23_poses(
+            data[r]["mocap_quat"](query_timestamps),
+            data[r]["mocap_pos"].derivative(nu=1)(query_timestamps),
+            data[r]["mocap_pos"](query_timestamps)
+        )
+        for r in robots
+    }
+
+    # Authors' multi-robot EKF (to get tracker/target poses online from IMU+UWB+height)
+    ekf_history = {
+        r: {
+            "pose": model.common.MatrixStateHistory(state_dim=5, covariance_dim=9),
+            "bias": model.common.VectorStateHistory(state_dim=6),
+        } for r in robots
+    }
+    ekf = model.EKF(
+        {r: gt_se23[r][0] for r in robots},  # init from GT (same as central script)
+        miluv.anchors,
+        miluv.tag_moment_arms
+    )
+
+    # Tag id map
+    tag_map = infer_tag_ids_by_robot(uwb_range, robots, top_n=args.tags_per_robot)
+
+    # Per-link TargetIF for *this* tracker
+    tf_cfg = IFConfig(sigma_a_xy=args.sigma_a_xy, sigma_a_z=args.sigma_a_z, gate_N_sigma=args.gate_sigma)
+    tf = TargetIF(x0=np.zeros(6), cfg=tf_cfg)
+
+    # Measurement adaptation (BiasNet/LOS/reliability shaping)
+    base_var = (args.uwb_std**2) if (args.uwb_std is not None) else args.uwb_var
+    mcfg = AdapterConfig(base_range_var=base_var,
+                         los_influence=args.los_influence,
+                         geom_influence=args.geom_influence)
+    meas_ai = MeasureAdapter(mcfg, bias_model=_load_biasnet(args.biasnet_dir))
+    los_adapter = LOSAdapter(LOSConfig(use_cir=args.use_cir, verbose=args.los_verbose)) if args.use_los else None
+
+    # Online tuner for R scaling, adaptive gating, optional Q adapt
+    tuner = OnlineTuner(OnlineAdaptConfig(
+        ema_alpha=0.05,
+        r_min_scale=args.online_r_min_scale, r_max_scale=args.online_r_max_scale,
+        gate_target_accept=args.gate_target, gate_sigma_init=args.gate_sigma_init,
+        q_adapt=args.q_adapt, q_alpha=0.05, q_gain=0.25
+    )) if args.online_tune else None
+
+    # Height aligned to query timestamps for optional z-only correction
+    height_at_q = {}
+    if args.use_height_tf and not height_df.empty:
+        for r in robots:
+            hdict = miluv.query_by_timestamps(query_timestamps, robots=r, sensors="height")[r]
+            height_at_q[r] = hdict["height"]["range"].to_numpy(dtype=float)
+
+    print(f"[AGENT] robot_node for {args.id}; target={args.target}; exp={args.exp}; udp={args.udp}")
+    print(f"[AGENT] tag_map: {tag_map}")
+
+    # Pre-group UWB by timestamp for speed
+    uwb_by_t = dict(tuple(uwb_range.groupby("timestamp"))) if "timestamp" in uwb_range.columns else {}
+
+    t0 = time.time()
+    last_wall = time.time()
+
+    # last fused state (for geometry & gating only)
+    last_fused_mu = None
+    last_fused_t  = None
+    did_warmstart = False
+    EPS = 1e-6
+    # neighbors' last known positions for safety projection
+    neighbor_pos = {}
+
+    # Prepare NIS log (per-node)
+    nis_log_path = os.path.join("logs", f"nis_node_{args.id}.csv")
+    try:
+        if not os.path.exists(nis_log_path):
+            with open(nis_log_path, "w") as f:
+                f.write("t,nis\n")
+    except Exception:
+        pass
+
+    # ----------------- Main loop -----------------
+    for i, t in enumerate(query_timestamps):
+        # drain any fused broadcasts (non-blocking)
+        while True:
+            m = rx_nb()
+            if m is None:
+                break
+            # schema check
+            if int(m.get("v", 0)) != 1:
+                continue
+            m_type = m.get("type")
+            if m_type == "fused":
+                # drop foreign experiments/targets
+                if m.get("exp") != args.exp or m.get("target") != args.target:
+                    continue
+                t_f = float(m.get("t", -1.0))
+                # accept only if strictly newer than what we have (drop reorders/dups)
+                if (last_fused_t is None) or (t_f > last_fused_t + EPS):
+                    last_fused_mu = np.asarray(m["mu"], float)
+                    last_fused_t  = t_f
+            elif m_type == "local":
+                # keep neighbor positions for safety projection
+                rid_nb = str(m.get("id", ""))
+                if rid_nb and rid_nb != args.id:
+                    p_nb = m.get("p", None)
+                    if p_nb is not None:
+                        try:
+                            neighbor_pos[rid_nb] = np.asarray(p_nb, float).reshape(3)
+                        except Exception:
+                            pass
+            elif m_type == "cmd_move":
+                # apply only if this cmd belongs to our exp/target and includes our id
+                if m.get("exp") != args.exp or m.get("target") != args.target:
+                    continue
+                moves = m.get("moves", {})
+                if args.id in moves:
+                    mv = np.asarray(moves[args.id], float).reshape(3)
+                    # project to safe displacement using our current tracker/body position
+                    p_self = se_translation_from_matrix(ekf.pose[args.id]).reshape(3)
+                    mv_safe = project_to_safe(p_self, mv, neighbors=neighbor_pos, limits=SafetyLimits())
+                    # execute
+                    try:
+                        ctrl.send_vantage_moves(float(m.get("t", 0.0)), {args.id: mv_safe})
+                        print(f"[AGENT {args.id}] exec cmd_move t={m.get('t'):.2f} mv={mv.tolist()} -> safe={mv_safe.tolist()}")
+                    except Exception as e:
+                        print(f"[AGENT {args.id}] control error: {e}")
+        dt = (t - query_timestamps[i-1]) if i > 0 else 0.0
+
+        # Authors' EKF (all robots) to keep tracker/target poses realistic
+        u_dict = {
+            r: np.array([
+                gyro[r].iloc[i]["angular_velocity.x"], gyro[r].iloc[i]["angular_velocity.y"], gyro[r].iloc[i]["angular_velocity.z"],
+                accel[r].iloc[i]["linear_acceleration.x"], accel[r].iloc[i]["linear_acceleration.y"], accel[r].iloc[i]["linear_acceleration.z"]
+            ]) for r in robots
+        }
+        ekf.predict(u_dict, dt)
+
+        df_t = uwb_by_t.get(t, None)
+        if df_t is not None and not df_t.empty:
+            # Feed all UWB to the authors' EKF (keeps poses tight)
+            for _, row in df_t.iterrows():
+                ekf.correct({"range": float(row["range"]),
+                             "to_id": int(row["to_id"]),
+                             "from_id": int(row["from_id"])})
+        if args.use_height_tf and (t in height_df["timestamp"].values):
+            hrows = height_df[height_df["timestamp"] == t]
+            for _, row in hrows.iterrows():
+                ekf.correct({"height": float(row["range"]), "robot": str(row["robot"])})
+
+        # Store EKF state history (not strictly required here)
+        for r in robots:
+            ekf_history[r]["pose"].add(t, ekf.pose[r], ekf.pose_covariance[r])
+            ekf_history[r]["bias"].add(t, ekf.bias[r], ekf.bias_covariance[r])
+
+        # This node’s local measurement set: only rows originated by this robot
+        pair_df = pd.DataFrame(columns=["timestamp"])  # default empty
+        if df_t is not None and not df_t.empty:
+            df_r = df_t[df_t["robot"] == args.id]
+            if not df_r.empty:
+                pair_df = select_pair_rows(df_r, trk_tags=tag_map.get(args.id, []),
+                                           tgt_tags=tag_map.get(args.target, []))
+
+        # Local TargetIF update for this tracker
+        # 1) predict (with optional Q adaptation from tuner)
+        if tuner is not None and args.q_adapt:
+            qxy_scale, qz_scale = tuner.get_q_scales()
+            tf.cfg.sigma_a_xy = args.sigma_a_xy * float(qxy_scale)
+            tf.cfg.sigma_a_z  = args.sigma_a_z  * float(qz_scale)
+        tf.predict(float(dt))
+
+        # 2) if we have a measurement, aggregate + adapt + correct
+        z_agg_center, R_eff, rel, los_score = 0.0, args.uwb_var, 0.0, 0.5
+        tracker_pos = se_translation_from_matrix(ekf.pose[args.id])
+        sensor_pos = tracker_pos  # default; overwritten when pair measurement available
+        target_pred_pos = None
+        if isinstance(last_fused_mu, np.ndarray) and (last_fused_t is not None):
+            # causal fanout (default): use only strictly older fused state
+            if args.allow_same_t_fanout or (last_fused_t + EPS < float(t)):
+                target_pred_pos = last_fused_mu[:3]
+                # optional warm-start once (only from strictly older fused)
+                if args.warmstart_once and (last_fused_t + EPS < float(t)) and (not did_warmstart):
+                    tf.mu[:3] = last_fused_mu[:3]
+                    did_warmstart = True
+        if pair_df is not None and not pair_df.empty:
+            z_agg, R_pair, _ = robust_range_aggregate(
+                pair_df, base_var=base_var, rho=args.pair_corr, huber_delta=args.huber_delta
+            )
+            # Effective sensor position (tracker tag position minus target tag offset)
+            sensor_pos = robust_tracker_sensor_position(
+                pair_df=pair_df,
+                trk=args.id, trk_tags=tag_map.get(args.id, []),
+                T_trk=ekf.pose[args.id], tag_moment_arms=miluv.tag_moment_arms,
+                huber_delta=args.huber_delta
+            )
+            tgt_offset_w = robust_target_offset(
+                pair_df=pair_df, tgt_tags=tag_map.get(args.target, []),
+                T_tgt=ekf.pose[args.target], tag_moment_arms=miluv.tag_moment_arms,
+                huber_delta=args.huber_delta
+            )
+            eff_sensor_pos = sensor_pos - tgt_offset_w
+            sensor_pos = eff_sensor_pos
+
+            # LOS score first (so features match training)
+            if los_adapter is not None:
+                try:
+                    s = los_adapter.score(pair_df, extras=None)
+                    if s is not None:
+                        los_score = float(s)
+                except Exception:
+                    pass
+
+            # Optional heights for feature parity (will be ignored if None)
+            h_trk = None
+            h_tgt = None
+            if args.use_height_tf and height_at_q:
+                try:
+                    if args.id in height_at_q:
+                        h_trk = float(height_at_q[args.id][i])
+                    if args.target in height_at_q:
+                        h_tgt = float(height_at_q[args.target][i])
+                except Exception:
+                    h_trk = None; h_tgt = None
+
+            # features (use fused target prediction if available)
+            feat = build_measurement_features(
+                tracker_pos=eff_sensor_pos,
+                target_pred_pos=None,          # match training (no geometry inputs)
+                uwb_range=float(z_agg),
+                los_score=los_score,
+                height_tracker=h_trk, height_target=h_tgt
+            )
+
+            # tuner pre-setup (R scale & gate)
+            link = (args.id, args.target)
+            r_scale = 1.0
+            if tuner is not None:
+                r_scale = tuner.get_r_scale(link)
+                meas_ai._rscale[link] = float(r_scale)
+                tf.cfg.gate_N_sigma = float(tuner.get_gate_sigma(link))
+
+            # measurement adaptation
+            z_corr, R_eff, meta = meas_ai.correct(
+                tracker_id=args.id, target_id=args.target, z=float(z_agg),
+                tracker_pos=eff_sensor_pos, target_pred_pos=target_pred_pos,
+                los_score=los_score, features=feat
+            )
+            # Soft floor with pair variance (configurable blend)
+            k = float(args.r_floor_blend)
+            R_eff = k * float(R_eff) + (1.0 - k) * float(max(R_eff, R_pair))
+            z_agg_center = float(z_corr)
+            rel = float(meta["reliability"])
+
+            # pre‑gate using predicted S with current R_eff
+            accepted = True
+            if tuner is not None:
+                h0, H = tf._range_linearize(tf.mu, eff_sensor_pos)
+                from numpy.linalg import inv
+                P_pred_local = inv(tf.J)
+                S_pred = float(H @ P_pred_local @ H.T + R_eff)
+                nu_pred = float(z_corr - h0)
+                gate_sigma = float(tuner.get_gate_sigma(link))
+                accepted = float((nu_pred * nu_pred) / S_pred) <= gate_sigma * gate_sigma
+                tuner.after_gating(link, accepted=accepted)
+
+            upd = tf.correct(z_agg_center, float(R_eff), tracker_pos=eff_sensor_pos) if accepted else {"used": False}
+            if upd.get("used", False):
+                meas_ai.update_from_innov(args.id, args.target, innov=upd.get("innov", None), S=upd.get("S", None))
+                if tuner is not None:
+                    tuner.after_update(
+                        link=link,
+                        innovation=float(upd.get("innov", 0.0)),
+                        S_scalar=float(upd.get("S", 1.0)),
+                        r_is_maxed=bool(float(r_scale) >= 0.6 * float(tuner.cfg.r_max_scale)),
+                        geom_ez=None
+                    )
+                # Log NIS to CSV
+                try:
+                    if upd.get("S", None) is not None and upd.get("innov", None) is not None:
+                        nis = float((upd["innov"] * upd["innov"]) / upd["S"]) if upd["S"] > 0 else float('nan')
+                        with open(nis_log_path, "a") as f:
+                            f.write(f"{float(t)},{nis}\n")
+                except Exception:
+                    pass
+
+            # Optional: z-only height difference
+            if args.use_height_tf and height_at_q:
+                if args.target in height_at_q and args.id in height_at_q:
+                    h_tgt = float(height_at_q[args.target][i])
+                    h_trk = float(height_at_q[args.id][i])
+                    if np.isfinite(h_tgt) and np.isfinite(h_trk):
+                        dz_meas = h_tgt - h_trk
+                        R_h = 2.0 * (args.height_std ** 2)
+                        z_trk = float(se_translation_from_matrix(ekf.pose[args.id])[2])
+                        tf.correct_height(dz_meas, z_trk, R_h)
+
+        mu_i, P_i = tf.posterior()
+        # Numerical hygiene: symmetrize and floor tiny negative eigs
+        P_i = 0.5 * (P_i + P_i.T)
+        me = float(np.linalg.eigvalsh(P_i).min())
+        if me < 1e-10:
+            P_i = P_i + np.eye(P_i.shape[0]) * (1e-10 - me + 1e-12)
+
+        # Node features for FusionNet (8‑vector)
+        var_pos = float(np.trace(P_i[:3, :3]))
+        geom_ez = 0.0
+        if target_pred_pos is not None:
+            diff = (target_pred_pos - sensor_pos)
+            nrm = float(np.linalg.norm(diff) + 1e-9)
+            geom_ez = float(abs(diff[2]) / nrm)
+        gate_sig = float(tf.cfg.gate_N_sigma)
+        nis_ema = float(meas_ai._whiten_ema.get((args.id, args.target), 1.0))
+        X = np.array([var_pos, rel, z_agg_center, float(R_eff), geom_ez, float(los_score),
+                      gate_sig, nis_ema], dtype=float)
+
+        # Broadcast compact message (+ our current effective sensor position 'p')
+        tx({
+            "v": 1,
+            "type": "local",
+            "t": float(t),
+            "id": str(args.id),
+            "target": str(args.target),
+            "exp": str(args.exp),
+            "mu": mu_i.tolist(),
+            "P": P_i.tolist(),
+            "X": X.tolist(),
+            "r_eff": float(R_eff),
+            "p": sensor_pos.tolist()
+        })
+
+        # pace if requested
+        if args.realtime:
+            # roughly follow log rate (assumes ~200Hz timestamps, sleep lightly)
+            now = time.time()
+            delay = max(0.0, (query_timestamps[min(i+1, len(query_timestamps)-1)] - t))
+            # cap to something reasonable to avoid long sleeps when log has gaps
+            delay = min(0.05, delay)
+            if now - last_wall < delay:
+                time.sleep(delay - (now - last_wall))
+            last_wall = time.time()
+
+    print(f"[AGENT] {args.id} finished streaming {len(query_timestamps)} timesteps.")
+
+if __name__ == "__main__":
+    main()
+
+
+### logger.py
+# agent/logger.py
+import argparse, time, collections, json, os
+import numpy as np
+import pandas as pd
+
+# Devkit for GT/eval
+from miluv.data import DataLoader
+import miluv.utils as utils
+
+from swarm_net.udp import make_rx, make_tx, UdpGroup
+from swarm_ml.fusion import CIFuser, CIFuserConfig
+from swarm_ml.distrib_ci import GossipFuser, CommsConfig
+from swarm_ml.evaluation_swarm import evaluate_and_save
+from swarm_ml.features import se_translation_from_matrix
+from swarm_ml.planning import suggest_vantage_moves, suggest_vantage_moves_eig
+
+def _load_fusionnet(path_dir: str):
+    if path_dir is None:
+        return None
+    import os, json, torch
+    from swarm_ml.models import FusionNet
+    with open(os.path.join(path_dir, "fusionnet_meta.json"), "r") as f:
+        meta = json.load(f)
+    in_dim = int(meta["in_dim"])
+    m = FusionNet(in_dim)
+    state = torch.load(os.path.join(path_dir, "fusionnet.pt"), map_location="cpu")
+    m.load_state_dict(state)
+    m.eval()
+    # expose expected input feature dim for assertion later
+    try:
+        m.input_dim = int(in_dim)
+    except Exception:
+        pass
+    return m
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--udp", default="239.0.0.1:5001")
+    ap.add_argument("--exp", required=True)
+    ap.add_argument("--target", required=True)
+    ap.add_argument("--trackers", default=None, help="Comma-separated tracker ids; if omitted, inferred from data")
+    ap.add_argument("--method", choices=["uniform","grid","learned","gossip"], default="grid")
+    ap.add_argument("--ci_objective", choices=["logdet","trace"], default="logdet")
+    ap.add_argument("--ci_grid", type=float, default=0.1)
+    ap.add_argument("--rounds", type=int, default=3, help="gossip rounds if --method=gossip")
+    ap.add_argument("--fusionnet_dir", default=None, help="Required if --method learned")
+    ap.add_argument("--out", default="outputs_decentralized")
+    ap.add_argument("--timeout_ms", type=int, default=300, help="Fuse if not all trackers arrive within this gap")
+    ap.add_argument("--fanout", action="store_true", help="Broadcast fused state to nodes")
+    ap.add_argument("--planner", choices=["none","heuristic","eig"], default="none",
+                    help="If not 'none', compute vantage moves at each fused timestamp and broadcast them")
+    args = ap.parse_args()
+
+    os.makedirs(args.out, exist_ok=True)
+
+    # Load GT sequence for evaluation and define timestamps
+    miluv = DataLoader(args.exp, exp_dir="./data/three_robots", cir=False, barometer=False,
+                       height=False, imu="px4", cam=None, mag=False)
+    data = miluv.data
+    robots = list(data.keys())
+    if args.target not in robots:
+        raise ValueError(f"--target={args.target} not in {robots}")
+
+    # Infer trackers from log if not provided
+    if args.trackers:
+        trackers = [s.strip() for s in args.trackers.split(",") if s.strip()]
+    else:
+        trackers = sorted([r for r in robots if r != args.target])
+
+    # Precompute GT target positions at the timestamps of interest
+    # Use the union of all UWB timestamps across robots
+    uwb_range = pd.concat([data[r]["uwb_range"].assign(robot=r) for r in robots], ignore_index=True)
+    query_timestamps = np.sort(uwb_range["timestamp"].unique())
+    gt_se23 = utils.get_se23_poses(
+        data[args.target]["mocap_quat"](query_timestamps),
+        data[args.target]["mocap_pos"].derivative(nu=1)(query_timestamps),
+        data[args.target]["mocap_pos"](query_timestamps)
+    )
+    gt_target_pos = np.array([se_translation_from_matrix(T) for T in gt_se23])
+
+    # CI fusers
+    fuser = CIFuser(CIFuserConfig(objective=args.ci_objective, grid_step=args.ci_grid))
+    if args.method == "learned":
+        fuser.weight_model = _load_fusionnet(args.fusionnet_dir)
+        if fuser.weight_model is None:
+            raise ValueError("--fusionnet_dir is required for learned method")
+    gossip = GossipFuser(CommsConfig(rounds=args.rounds, p_link=1.0, p_drop=0.0, seed=0))
+
+    # UDP receiver
+    ip, port = args.udp.split(":")
+    rx = make_rx(UdpGroup(mcast_ip=ip, port=int(port)))
+    tx_fused = make_tx(UdpGroup(mcast_ip=ip, port=int(port))) if args.fanout else None
+
+    # Accumulators
+    window = collections.defaultdict(dict)         # t -> {rid: (mu,P,X,r_eff)}
+    last_seen_t = {}                               # rid -> last timestamp
+    fused_mu, fused_P, fused_t = [], [], []
+    fusion_weights_file = None
+    fusion_weights_writer = None
+    fusion_cols = None
+    # Basic per-tracker counters
+    recv_count = collections.Counter()
+    missing_at_fuse = collections.Counter()
+
+    # Output directory per (exp,target)
+    out_dir = os.path.join(args.out, f"{args.exp}_{args.target}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    print(f"[LOGGER] listening on {args.udp}; exp={args.exp}; target={args.target}; "
+          f"trackers={trackers}; method={args.method}; timeout_ms={args.timeout_ms}; "
+          f"planner={args.planner}")
+
+    def maybe_fuse(tb: float):
+        # add this line right after the def
+        nonlocal fusion_weights_file, fusion_weights_writer, fusion_cols
+        # fuse when either (a) all trackers present or (b) timeout since the earliest arrival
+        parts = {}
+        node_feats = {}
+        present = list(window[tb].keys())
+        if not present:
+            return False
+        # TIMEOUT: if we have at least one and the oldest msg at this t waited > timeout_ms
+        ready = False
+        if all(trk in present for trk in trackers):
+            ready = True
+        else:
+            earliest = min(last_seen_t.get(trk, tb) for trk in present)
+            if (time.time() - earliest) * 1000.0 > args.timeout_ms:
+                ready = True
+        if not ready:
+            return False
+
+        # Build parts and node features from what we have
+        for rid, payload in window[tb].items():
+            mu = np.asarray(payload["mu"], float)
+            P  = np.asarray(payload["P"], float)
+            X  = np.asarray(payload.get("X", np.zeros(8)), float)
+            parts[rid] = (mu, P)
+            node_feats[rid] = X
+        # Optional: tracker positions and per-node effective R at this tb
+        tracker_pos = {rid: np.asarray(payload.get("p", []), float).reshape(-1)
+                       for rid, payload in window[tb].items() if "p" in payload}
+        r_eff_map   = {rid: float(payload.get("r_eff", 0.35**2))
+                       for rid, payload in window[tb].items()}
+
+        # Assert FusionNet feature dimensionality matches model expectation
+        if (args.method == "learned") and (fuser.weight_model is not None):
+            any_feats = next(iter(node_feats.values()), None)
+            if any_feats is not None:
+                expected = int(getattr(fuser.weight_model, "input_dim", len(any_feats)))
+                assert len(any_feats) == expected, (
+                    f"FusionNet expects {expected} features, got {len(any_feats)}. "
+                    f"Feature vector (ordered): [var_pos, rel, z_center, R_eff, geom_ez, los_score, gate_sigma, nis_ema] = {any_feats.tolist()}"
+                )
+
+        # Fuse (centralized or gossip) and record
+        if args.method == "gossip":
+            mu_star, P_star, w = gossip.fuse(parts)
+        else:
+            method = args.method if args.method in ("uniform","grid") else "learned"
+            mu_star, P_star, w = fuser.fuse(parts, method=method, node_features=node_feats if method=="learned" else None)
+
+        fused_mu.append(mu_star)
+        fused_P.append(P_star)
+        fused_t.append(float(tb))
+
+        # NEW: broadcast fused state for nodes to use in gating/features
+        if tx_fused:
+            tx_fused({
+                "v": 1,
+                "type": "fused",
+                "exp": args.exp,
+                "target": args.target,
+                "t": float(tb),
+                "mu": mu_star.tolist(),
+                "P":  P_star.tolist()
+            })
+
+        # Log weights: stable header order matches declared trackers
+        try:
+            import csv
+            if fusion_weights_file is None:
+                fusion_weights_file = open(os.path.join(out_dir, "fusion_weights.csv"), "w", newline="")
+                fusion_weights_writer = csv.writer(fusion_weights_file)
+                fusion_cols = [f"w_{rid}" for rid in trackers]
+                fusion_weights_writer.writerow(["timestamp"] + fusion_cols)
+            # write NaN when a tracker's weight is missing at this tb
+            row = [float(tb)] + [float(w.get(rid, float('nan'))) for rid in trackers]
+            fusion_weights_writer.writerow(row)
+        except Exception as e:
+            print(f"[LOGGER] fusion weights log error at t={tb:.3f}: {e}")
+
+        # Count missing trackers at fuse time (for diagnostics)
+        try:
+            for rid in trackers:
+                if rid not in present:
+                    missing_at_fuse[rid] += 1
+        except Exception:
+            pass
+
+        # Done with this t
+        window.pop(tb, None)
+
+        # --- Optional active sensing plan (requires --planner and at least one tracker position) ---
+        try:
+            if tx_fused and args.planner != "none" and len(tracker_pos) > 0:
+                if args.planner == "eig":
+                    moves = suggest_vantage_moves_eig(mu_star, P_star, tracker_pos, r_eff_map)
+                else:
+                    moves = suggest_vantage_moves(mu_star[:3], tracker_pos)
+                # Fanout the command to all nodes
+                tx_fused({
+                    "v": 1,
+                    "type": "cmd_move",
+                    "exp": args.exp,
+                    "target": args.target,
+                    "t": float(tb),
+                    "moves": {rid: [float(d) for d in mv] for rid, mv in moves.items()}
+                })
+        except Exception as e:
+            print(f"[LOGGER] planning error at t={tb:.3f}: {e}")
+        return True
+
+    # ---- Main receive loop ----
+    start_wall = time.time()
+    last_progress = start_wall
+    try:
+        while True:
+            m = rx()
+            # Schema/version filter
+            if int(m.get("v", 0)) != 1:
+                continue
+            m_type = m.get("type", "local")
+            # Ignore our own fanouts and planner commands
+            if m_type in ("fused", "cmd_move"):
+                continue
+            # Only tracker updates are eligible for fusion
+            if m_type != "local":
+                continue
+            # Drop foreign experiment/target traffic on the same multicast group
+            if (m.get("exp") != args.exp) or (m.get("target") != args.target):
+                continue
+            # Required fields present?
+            if not all(k in m for k in ("t", "id", "mu", "P")):
+                continue
+            tb = float(m["t"])
+            rid = str(m["id"])
+            mu = m["mu"]; P = m["P"]
+            X  = m.get("X", [0.0]*8)
+            r_eff = float(m.get("r_eff", 0.35**2))
+            p     = m.get("p", None)
+            window[tb][rid] = {"mu": mu, "P": P, "X": X, "r_eff": r_eff, "p": p}
+            last_seen_t[rid] = time.time()
+            recv_count[rid] += 1
+
+            # attempt fusion at this timestamp
+            maybe_fuse(tb)
+
+            # If we’ve fused all timestamps in the log, we can stop
+            if len(fused_t) >= len(query_timestamps):
+                break
+
+            # Light heartbeat
+            now = time.time()
+            if now - last_progress > 1.0:
+                print(f"[LOGGER] fused={len(fused_t)} / {len(query_timestamps)}")
+                last_progress = now
+    except KeyboardInterrupt:
+        print("[LOGGER] interrupted; finalizing...")
+    finally:
+        # Close weights file if opened
+        try:
+            if fusion_weights_file is not None:
+                fusion_weights_file.close()
+        except Exception:
+            pass
+
+    if not fused_mu:
+        print("[LOGGER] no fused states produced.")
+        return
+
+    # Align to GT timeline (map fused t to nearest GT index)
+    fused_t_arr = np.asarray(fused_t, float)
+    mu_arr = np.asarray(fused_mu)
+    P_arr  = np.asarray(fused_P)
+
+    # Save trajectory, evaluate, and write summary—same as centralized
+    df = pd.DataFrame(np.hstack([fused_t_arr.reshape(-1,1), mu_arr]),
+                      columns=["timestamp","px","py","pz","vx","vy","vz"])
+    out_csv = os.path.join(out_dir, "target_state.csv")
+    df.to_csv(out_csv, index=False)
+    print(f"[SAVE] Trajectory -> {out_csv}")
+
+    # Interpolate GT to fused timestamps (nearest)
+    idx = np.searchsorted(query_timestamps, fused_t_arr, side="left")
+    idx = np.clip(idx, 0, len(gt_target_pos)-1)
+    gt_sel = gt_target_pos[idx]
+
+    rm, nees_val = evaluate_and_save(mu_arr, P_arr, gt_sel, out_dir)
+
+    # Minimal roles manifest
+    with open(os.path.join(out_dir, "roles.json"), "w") as f:
+        json.dump({"target": args.target, "trackers": trackers}, f, indent=2)
+
+    # Diagnostics summary
+    try:
+        total_fused = len(fused_t)
+        print(f"[STATS] fused_timestamps={total_fused} / query={len(query_timestamps)}")
+        print(f"[STATS] recv_count={dict(recv_count)}")
+        print(f"[STATS] missing_at_fuse={dict(missing_at_fuse)}")
+    except Exception:
+        pass
+
+    print(f"[DONE] Results written to: {out_dir}")
+
+if __name__ == "__main__":
+    main()
+
+
+### swarm_batch_run.py
+# swarm_batch_run.py
+import argparse, subprocess, json, os
+
+def run_one(exp, argslist):
+    cmd = ["python", "swarm_target_tracking.py", "--exp", exp] + argslist
+    print("[RUN]", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--exps", nargs="+", required=True, help="List of experiments")
+    p.add_argument("--common", nargs="*", default=[], help="Args to forward to swarm_target_tracking.py")
+    args, unknown = p.parse_known_args()
+    
+    # Combine common args with any additional args
+    common_args = args.common + unknown
+
+    for exp in args.exps:
+        run_one(exp, common_args)
+
+### swarm_eval_table.py
+# swarm_eval_table.py
+import argparse, glob, os, csv
+import pandas as pd
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--root", default="outputs_swarm")
+    args = p.parse_args()
+
+    rows = []
+    for summ in glob.glob(os.path.join(args.root, "*", "summary.csv")):
+        exp_dir = os.path.dirname(summ)
+        exp_name = os.path.basename(exp_dir)
+        df = pd.read_csv(summ)
+        d = df.iloc[0].to_dict()
+        d["exp"] = exp_name
+        rows.append(d)
+    out = pd.DataFrame(rows).sort_values("exp")
+    out.to_csv(os.path.join(args.root, "all_summary.csv"), index=False)
+    print(out)
+
+### swarm_target_tracking.py
+# swarm_target_tracking.py
+import argparse, os, json
+import numpy as np
+import pandas as pd
+
+# ---- Authors' devkit imports (do not modify) ----
+from miluv.data import DataLoader
+import miluv.utils as utils
+
+# The EKF models live in the examples package in upstream devkit.
+try:
+    import examples.ekfutils.imu_three_robots_models as model
+except Exception:
+    import imu_three_robots_models as model  # fallback to local path if exported
+
+# ---- Our modules (new) ----
+from swarm_ml.roles import get_roles
+from swarm_ml.features import se_translation_from_matrix, build_measurement_features
+from swarm_ml.measure_adapter import MeasureAdapter, AdapterConfig
+from swarm_ml.target_filter import TargetIF, IFConfig
+from swarm_ml.fusion import CIFuser, CIFuserConfig
+from swarm_ml.evaluation_swarm import evaluate_and_save
+from swarm_ml.tagmap import infer_tag_ids_by_robot, select_pair_rows, robust_range_aggregate, robust_tracker_sensor_position, robust_target_offset
+from swarm_ml.smoother import rts_smooth, CVNoise
+from swarm_ml.los_adapter import LOSAdapter, LOSConfig
+from swarm_ml.online_tuner import OnlineTuner, OnlineAdaptConfig
+from swarm_ml.snapshots import SnapshotCollector
+from swarm_ml.distrib_ci import GossipFuser, CommsConfig
+from swarm_ml.planning import suggest_vantage_moves, suggest_vantage_moves_eig
+from swarm_ml.active_sensing import expected_trace_reduction
+from swarm_control.bridge import ControlBridge
+
+def _concat_with_robot(data: dict, key: str) -> pd.DataFrame:
+    dfs = []
+    for robot in data.keys():
+        if key in data[robot]:
+            dfs.append(data[robot][key].assign(robot=robot))
+    if not dfs:
+        return pd.DataFrame(columns=["timestamp"])
+    return pd.concat(dfs, ignore_index=True)
+
+def tag_world_position(T_rb: np.ndarray, tag_id: int, tag_moment_arms) -> np.ndarray:
+    """
+    Compute world position of a tag mounted on the tracker robot body.
+    - T_rb: 4x4 or 5x5 pose (R|p)
+    - tag_moment_arms: miluv.tag_moment_arms (assumed dict-like)
+    Fallback: return robot position if mapping not found.
+    """
+    try:
+        R = T_rb[:3, :3]
+        p = T_rb[:3, -1]
+        if isinstance(tag_moment_arms, dict):
+            if tag_id in tag_moment_arms:
+                arm = np.asarray(tag_moment_arms[tag_id], dtype=float).reshape(3)
+            else:
+                arm = None
+                for v in tag_moment_arms.values():
+                    if isinstance(v, dict) and tag_id in v:
+                        arm = np.asarray(v[tag_id], dtype=float).reshape(3); break
+                if arm is None:
+                    return p
+        else:
+            return p
+        return p + R @ arm
+    except Exception:
+        return T_rb[:3, -1]
+
+def load_biasnet(path_dir: str):
+    import json, torch
+    from swarm_ml.models import BiasNet
+    with open(os.path.join(path_dir, "biasnet_meta.json"), "r") as f:
+        meta = json.load(f)
+    in_dim = int(meta["in_dim"])
+    model = BiasNet(in_dim)
+    state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu")
+    model.load_state_dict(state)
+    model.eval()
+    return model
+
+def load_fusionnet(path_dir: str):
+    import json, torch
+    from swarm_ml.models import FusionNet
+    with open(os.path.join(path_dir, "fusionnet_meta.json"), "r") as f:
+        meta = json.load(f)
+    in_dim = int(meta["in_dim"])
+    model = FusionNet(in_dim)
+    state = torch.load(os.path.join(path_dir, "fusionnet.pt"), map_location="cpu")
+    model.load_state_dict(state)
+    model.eval()
+    return model
+
+def main(args):
+    exp_name = args.exp
+    os.makedirs(args.out, exist_ok=True)
+
+    # ----------------- Load data (authors' devkit) -----------------
+    miluv = DataLoader(
+        exp_name,
+        exp_dir="./data/three_robots",
+        cir=False,
+        barometer=False,
+        height=True if (args.use_height or args.use_height_tf) else False,
+        imu="px4",
+        cam=None,
+        mag=False
+    )
+    data = miluv.data
+    robots = list(data.keys())
+
+    # Inter-robot UWB ranges + (optional) height
+    uwb_range = _concat_with_robot(data, "uwb_range")
+    height_df = _concat_with_robot(data, "height") if (args.use_height or args.use_height_tf) else pd.DataFrame(columns=["timestamp"])
+
+    # Query timestamps (union of UWB and height times)
+    query_timestamps = np.sort(np.unique(np.append(
+        uwb_range["timestamp"].to_numpy(),
+        height_df["timestamp"].to_numpy() if not height_df.empty else np.array([], dtype=float)
+    )))
+
+    # IMU at query timestamps (authors' API)
+    imu_at_q = {
+        robot: miluv.query_by_timestamps(query_timestamps, robots=robot, sensors="imu_px4")[robot]
+        for robot in robots
+    }
+    gyro = {
+        robot: imu_at_q[robot]["imu_px4"][["timestamp", "angular_velocity.x", "angular_velocity.y", "angular_velocity.z"]].reset_index(drop=True)
+        for robot in robots
+    }
+    accel = {
+        robot: imu_at_q[robot]["imu_px4"][["timestamp", "linear_acceleration.x", "linear_acceleration.y", "linear_acceleration.z"]].reset_index(drop=True)
+        for robot in robots
+    }
+
+    # Ground truth (authors' tools)
+    gt_se23 = {
+        robot: utils.get_se23_poses(
+            data[robot]["mocap_quat"](query_timestamps),
+            data[robot]["mocap_pos"].derivative(nu=1)(query_timestamps),
+            data[robot]["mocap_pos"](query_timestamps)
+        )
+        for robot in robots
+    }
+
+    # ----------------- Initialize authors' multi-robot EKF -----------------
+    ekf_history = {
+        robot: {
+            "pose": model.common.MatrixStateHistory(state_dim=5, covariance_dim=9),
+            "bias": model.common.VectorStateHistory(state_dim=6),
+        }
+        for robot in robots
+    }
+
+    ekf = model.EKF(
+        {robot: gt_se23[robot][0] for robot in robots},  # authors' initialization from GT
+        miluv.anchors,
+        miluv.tag_moment_arms
+    )
+
+    # ----------------- Our swarm setup -----------------
+    roles = get_roles(exp_name, robots, default_target=args.target, uwb_range_df=uwb_range)
+    print(f"[SWARM] Target: {roles.target}; Trackers: {roles.trackers}")
+
+    # Infer tag IDs per robot for proper tracker↔target filtering
+    tag_map = infer_tag_ids_by_robot(uwb_range, robots, top_n=args.tags_per_robot)
+    print(f"[SWARM] Inferred tag IDs per robot: {tag_map}")
+
+    # Per-tracker target filters
+    tf_cfg = IFConfig(
+        sigma_a_xy=args.sigma_a_xy,
+        sigma_a_z=args.sigma_a_z,
+        p0_xy=args.p0, p0_z=args.p0,
+        v0_xy=args.v0, v0_z=args.v0,
+        gate_N_sigma=args.gate_sigma
+    )
+
+    # Optional: robust target initialization from first window
+    from swarm_ml.target_init import init_target_from_window
+    from swarm_ml.tagmap import robust_range_aggregate
+    p0_target = None
+    if args.init_window > 0:
+        def tracker_pose_fn(trk, t):
+            T_trk = ekf.pose.get(trk, None)
+            if T_trk is None:
+                return np.zeros(3)
+            return T_trk[:3, -1]
+        agg = lambda df_pair: robust_range_aggregate(df_pair, base_var=args.uwb_var,
+                                                     rho=args.pair_corr, huber_delta=args.huber_delta)
+        p0_target = init_target_from_window(query_timestamps, uwb_range, tag_map, roles.trackers,
+                                            roles.target, tracker_pose_fn, agg_fn=agg, window_len=args.init_window)
+        if p0_target is not None:
+            print(f"[SWARM] Initialized target p0 from window: {p0_target}", flush=True)
+
+    target_filters = {trk: TargetIF(x0=np.hstack([p0_target if p0_target is not None else np.zeros(3),
+                                                  np.zeros(3)]),
+                                    cfg=tf_cfg)
+                      for trk in roles.trackers}
+
+    # Measurement adapter (bias, reliability shaping, innovation scaling)
+    base_var = (args.uwb_std**2) if (args.uwb_std is not None) else args.uwb_var
+    mcfg = AdapterConfig(
+        base_range_var=base_var,
+        los_influence=args.los_influence,
+        geom_influence=args.geom_influence,
+        ema_alpha=args.ema_alpha,
+        min_scale=args.r_min_scale,
+        max_scale=args.r_max_scale,
+    )
+    meas_ai = MeasureAdapter(mcfg)
+
+    # LOS adapter
+    los_adapter = LOSAdapter(LOSConfig(use_cir=args.use_cir, verbose=args.los_verbose))
+
+    # Online self-calibration (causal, a-priori) using innovation statistics
+    tuner = None
+    if args.online_tune:
+        tuner = OnlineTuner(OnlineAdaptConfig(
+            ema_alpha=0.05,
+            r_min_scale=args.online_r_min_scale,
+            r_max_scale=args.online_r_max_scale,
+            gate_target_accept=args.gate_target,
+            gate_sigma_init=args.gate_sigma_init,
+            q_adapt=args.q_adapt,
+            q_alpha=0.05,
+            q_gain=0.25
+        ))
+
+    # Height aligned to query timestamps (zero-order hold) for z-only target update
+    height_at_q: dict = {}
+    if args.use_height_tf and not height_df.empty:
+        for r in robots:
+            hdict = miluv.query_by_timestamps(query_timestamps, robots=r, sensors="height")[r]
+            height_at_q[r] = hdict["height"]["range"].to_numpy(dtype=float)
+
+    # Load BiasNet if provided
+    if args.biasnet_dir is not None:
+        biasnet = load_biasnet(args.biasnet_dir)
+        meas_ai.bias_model = biasnet
+        print(f"[SWARM] BiasNet loaded from: {args.biasnet_dir}")
+
+    # CI fusion & (optional) learned weights
+    if args.ci_objective is None:
+        ci_obj = "trace" if args.use_height_tf else "logdet"
+    else:
+        ci_obj = args.ci_objective
+    fuser = CIFuser(CIFuserConfig(objective=ci_obj, grid_step=args.ci_grid))
+
+    if args.fusionnet_dir is not None:
+        fuser.weight_model = load_fusionnet(args.fusionnet_dir)
+        print(f"[SWARM] FusionNet loaded from: {args.fusionnet_dir} (CI learned weights)")
+
+    # Gossip fuser for decentralized CI
+    gossip = None
+    if args.decentralized:
+        gossip = GossipFuser(CommsConfig(
+            rounds=args.comm_rounds, p_link=args.comm_p, p_drop=args.comm_drop, seed=args.comm_seed))
+        print(f"[SWARM] Decentralized gossip CI enabled: p_link={args.comm_p}, p_drop={args.comm_drop}, rounds={args.comm_rounds}, seed={args.comm_seed}")
+
+    # Control bridge (optional live publish)
+    ctrl = ControlBridge(mode=args.control_mode, rate_hz=args.control_rate)
+
+    # Optional ML data collector (BiasNet samples + FusionNet snaps)
+    collector = None
+    if args.collect_bias or args.collect_fusion:
+        collector = SnapshotCollector(
+            query_timestamps=query_timestamps,
+            roles=roles,
+            tag_map=tag_map,
+            gt_T_by_robot=gt_se23,
+            tag_moment_arms=miluv.tag_moment_arms,
+            base_var=base_var,
+            pair_corr=args.pair_corr,
+            huber_delta=args.huber_delta,
+            los_verbose=args.los_verbose
+        )
+
+    mu_star_seq, P_star_seq = [], []
+    total_steps = len(query_timestamps)
+    meas_avail, meas_used = 0, 0
+    los_hits, los_misses = 0, 0
+    vertical_sensitivities = []
+    action_rows = []  # For action suggestions CSV
+
+    out_dir = os.path.join(args.out, f"{exp_name}_{roles.target}")
+
+    if args.collect_bias or args.collect_fusion:
+        print(f"[COLLECT] Enabled -> bias={args.collect_bias}, fusion={args.collect_fusion}")
+        print(f"[COLLECT] Output directory: {out_dir}")
+
+
+    w_csv = None; w_file = None
+    nis_rows = []
+    eig_scores_rows = []
+
+    # ----------------- Main loop -----------------
+    for i in range(total_steps):
+        t = query_timestamps[i]
+        dt = (t - query_timestamps[i - 1]) if i > 0 else 0.0
+
+        # --- Authors' EKF predict ---
+        u_dict = {
+            r: np.array([
+                gyro[r].iloc[i]["angular_velocity.x"], gyro[r].iloc[i]["angular_velocity.y"], gyro[r].iloc[i]["angular_velocity.z"],
+                accel[r].iloc[i]["linear_acceleration.x"], accel[r].iloc[i]["linear_acceleration.y"], accel[r].iloc[i]["linear_acceleration.z"]
+            ])
+            for r in robots
+        }
+        ekf.predict(u_dict, dt)
+
+        # --- Authors' EKF correct ---
+        idx = np.where(uwb_range["timestamp"] == t)[0]
+        if len(idx) > 0:
+            rdata = uwb_range.iloc[idx]
+            for _, row in rdata.iterrows():
+                ekf.correct({
+                    "range": float(row["range"]),
+                    "to_id": int(row["to_id"]),
+                    "from_id": int(row["from_id"]),
+                })
+        if args.use_height and not height_df.empty:
+            hidx = np.where(height_df["timestamp"] == t)[0]
+            if len(hidx) > 0:
+                hdata = height_df.iloc[hidx]
+                for _, row in hdata.iterrows():
+                    ekf.correct({
+                        "height": float(row["range"]),
+                        "robot": str(row["robot"]),
+                    })
+
+        # Store EKF state history for authors' devkit
+        for r in robots:
+            ekf_history[r]["pose"].add(t, ekf.pose[r], ekf.pose_covariance[r])
+            ekf_history[r]["bias"].add(t, ekf.bias[r], ekf.bias_covariance[r])
+
+        # --- Our parallel per-tracker target filtering ---
+        tracker_pos = {r: se_translation_from_matrix(ekf.pose[r]) for r in roles.trackers}
+        last_target_mu = mu_star_seq[-1] if len(mu_star_seq) > 0 else None
+        last_target_pos = last_target_mu[:3] if last_target_mu is not None else None
+
+        parts = {}
+        node_feats = {}
+        df_t = uwb_range[uwb_range["timestamp"] == t]
+
+        info_gain_map = {}
+        r_eff_map = {}
+        for trk in roles.trackers:
+            # Select only tracker↔target tag pairs (either direction)
+            pair_df = select_pair_rows(df_t,
+                                       trk_tags=tag_map.get(trk, []),
+                                       tgt_tags=tag_map.get(roles.target, []))
+            if pair_df.empty:
+                # predict-only
+                if tuner is not None and args.q_adapt:
+                    qxy_scale, qz_scale = tuner.get_q_scales()
+                    target_filters[trk].cfg.sigma_a_xy = args.sigma_a_xy * float(qxy_scale)
+                    target_filters[trk].cfg.sigma_a_z  = args.sigma_a_z  * float(qz_scale)
+                target_filters[trk].predict(dt)
+                mu_i, P_i = target_filters[trk].posterior()
+                parts[trk] = (mu_i, P_i)
+                var_pos = np.trace(P_i[:3, :3])
+                gate_sig = target_filters[trk].cfg.gate_N_sigma
+                nis_ema  = tuner._ema_nis.get((trk, roles.target), 1.0) if (tuner is not None) else 1.0
+                los_f    = 0.5
+                node_feats[trk] = np.array([var_pos, 0.0, 0.0, args.uwb_var, 0.0, los_f, gate_sig, nis_ema], dtype=float)
+                info_gain_map[trk] = 0.0
+                continue
+
+            # robust aggregation across all tag pairs at t
+            z_agg, R_pair, _ = robust_range_aggregate(pair_df, base_var=base_var,
+                                                      rho=args.pair_corr, huber_delta=args.huber_delta)
+            meas_avail += 1
+
+            # tracker sensor world pos and target-tag offset
+            sensor_pos = robust_tracker_sensor_position(
+                pair_df=pair_df,
+                trk=trk,
+                trk_tags=tag_map.get(trk, []),
+                T_trk=ekf.pose[trk],
+                tag_moment_arms=miluv.tag_moment_arms,
+                huber_delta=args.huber_delta
+            )
+            tgt_offset_w = robust_target_offset(
+                pair_df=pair_df,
+                tgt_tags=tag_map.get(roles.target, []),
+                T_tgt=ekf.pose[roles.target],
+                tag_moment_arms=miluv.tag_moment_arms,
+                huber_delta=args.huber_delta
+            )
+            eff_sensor_pos = sensor_pos - tgt_offset_w
+            z_agg_center   = float(z_agg)
+
+            # LOS score if enabled (compute BEFORE features to maintain train‑test parity)
+            los_score = None
+            if args.use_los:
+                los_score = los_adapter.score(pair_df, extras=None)
+                if los_score is None:
+                    los_misses += 1
+                else:
+                    los_hits += 1
+
+            # Optional heights for feature parity (ignored if None)
+            h_trk = None
+            h_tgt = None
+            if args.use_height_tf and height_at_q:
+                try:
+                    if trk in height_at_q:
+                        h_trk = float(height_at_q[trk][i])
+                    if roles.target in height_at_q:
+                        h_tgt = float(height_at_q[roles.target][i])
+                except Exception:
+                    h_trk = None; h_tgt = None
+
+            # Feature vector (must match training layout)
+            feat = build_measurement_features(
+                tracker_pos=eff_sensor_pos,
+                target_pred_pos=None,          # match training (no geometry inputs)
+                uwb_range=z_agg_center,
+                los_score=los_score,
+                height_tracker=h_trk,
+                height_target=h_tgt
+            )
+
+            # Per-link R scaling + gating from tuner
+            link = (trk, roles.target)
+            r_scale = 1.0
+            if tuner is not None:
+                r_scale = tuner.get_r_scale(link)
+                meas_ai._rscale[link] = float(r_scale)
+                target_filters[trk].cfg.gate_N_sigma = float(tuner.get_gate_sigma(link))
+
+            # Collect BiasNet sample (optional)
+            collector and args.collect_bias and collector.add_bias_sample(
+                i=i, trk=trk, pair_df=pair_df, z_agg=z_agg,
+                eff_sensor_pos_used=eff_sensor_pos, los_score=los_score
+            )
+
+            # Adapter correction (bias + reliability)
+            z_corr, R_eff, meta = meas_ai.correct(
+                tracker_id=trk, target_id=roles.target, z=z_agg_center,
+                tracker_pos=eff_sensor_pos, target_pred_pos=last_target_pos,
+                los_score=los_score, features=feat
+            )
+            # Soft R-floor blending to avoid hard lower-bounding
+            if True:
+                # blend factor from CLI
+                k = float(getattr(args, 'r_floor_blend', 0.5))
+                R_eff = k * float(R_eff) + (1.0 - k) * float(max(R_eff, R_pair))
+            else:
+                R_eff = max(R_eff, R_pair)
+            r_eff_map[trk] = float(R_eff)
+
+            # Local filter predict step (before gating)
+            if tuner is not None and args.q_adapt:
+                qxy_scale, qz_scale = tuner.get_q_scales()
+                target_filters[trk].cfg.sigma_a_xy = args.sigma_a_xy * float(qxy_scale)
+                target_filters[trk].cfg.sigma_a_z  = args.sigma_a_z  * float(qz_scale)
+            target_filters[trk].predict(dt)
+
+            # Compute approximate one-step information gain (trace reduction) for budgeting
+            try:
+                h0_tmp, H_tmp = target_filters[trk]._range_linearize(target_filters[trk].mu, eff_sensor_pos)
+                from numpy.linalg import inv
+                P_pred_local_for_gain = inv(target_filters[trk].J)
+                Hc = H_tmp.reshape(-1, 1)
+                J_add = (1.0 / float(R_eff)) * (Hc @ Hc.T)
+                # A-optimal trace reduction
+                gain_trace = float(np.trace(P_pred_local_for_gain) - np.trace(inv(target_filters[trk].J + J_add)))
+            except Exception:
+                gain_trace = 0.0
+            info_gain_map[trk] = max(0.0, gain_trace)
+
+            # Pre-gate (causal) using tuner's threshold if enabled
+            if tuner is not None:
+                h0, H = target_filters[trk]._range_linearize(target_filters[trk].mu, eff_sensor_pos)
+                from numpy.linalg import inv
+                P_pred_local = inv(target_filters[trk].J)
+                S_pred = float(np.einsum('i,ij,j->', H.ravel(), P_pred_local, H.ravel()) + R_eff)
+                nu_pred = float(z_corr - h0)
+                gate_sigma = float(tuner.get_gate_sigma(link))
+                accepted = (float((nu_pred * nu_pred) / S_pred) <= gate_sigma * gate_sigma)
+                tuner.after_gating(link, accepted=accepted)
+                if not accepted:
+                    info_gain_map[trk] = 0.0
+                    mu_i, P_i = target_filters[trk].posterior()
+                    parts[trk] = (mu_i, P_i)
+                    var_pos = np.trace(P_i[:3, :3])
+                    geom_ez = 0.0
+                    if last_target_pos is not None:
+                        b = (last_target_pos - eff_sensor_pos) / (np.linalg.norm(last_target_pos - eff_sensor_pos) + 1e-9)
+                        geom_ez = float(abs(b[2]))
+                    gate_sig = tuner.get_gate_sigma(link) if tuner is not None else target_filters[trk].cfg.gate_N_sigma
+                    nis_ema  = tuner._ema_nis.get(link, 1.0) if (tuner is not None) else 1.0
+                    los_f    = 0.5 if (los_score is None) else float(los_score)
+                    node_feats[trk] = np.array([var_pos, meta["reliability"], z_agg_center, R_eff, geom_ez, los_f, gate_sig, nis_ema], dtype=float)
+                    continue
+
+            # Optional: z-only height-difference correction
+            if args.use_height_tf and height_at_q:
+                if roles.target in height_at_q and trk in height_at_q:
+                    h_tgt = float(height_at_q[roles.target][i])
+                    h_trk = float(height_at_q[trk][i])
+                    if np.isfinite(h_tgt) and np.isfinite(h_trk):
+                        dz_meas = h_tgt - h_trk
+                        R_h = 2.0 * (args.height_std ** 2)
+                        z_trk = float(tracker_pos[trk][2])
+                        target_filters[trk].correct_height(dz_meas, z_trk, R_h)
+
+            upd = target_filters[trk].correct(z_corr, R_eff, tracker_pos=eff_sensor_pos)
+            if upd.get("used", False):
+                meas_used += 1
+                meas_ai.update_from_innov(tracker_id=trk, target_id=roles.target,
+                                          innov=upd.get("innov", None), S=upd.get("S", None))
+                geom_ez_val = None
+                if last_target_pos is not None:
+                    bearing = (last_target_pos - eff_sensor_pos) / np.linalg.norm(last_target_pos - eff_sensor_pos)
+                    geom_ez_val = float(abs(bearing[2]))
+                    vertical_sensitivities.append(geom_ez_val)
+                if tuner is not None:
+                    tuner.after_update(
+                        link=link,
+                        innovation=float(upd.get("innov", 0.0)),
+                        S_scalar=float(upd.get("S", 1.0)),
+                        r_is_maxed=bool(float(r_scale) >= 0.6 * float(tuner.cfg.r_max_scale)),
+                        geom_ez=geom_ez_val
+                    )
+                if upd.get("S", None) is not None and upd.get("innov", None) is not None:
+                    nis_rows.append([float(t), trk, float((upd['innov']**2)/upd['S']), float(upd['S']), float(R_eff)])
+
+            mu_i, P_i = target_filters[trk].posterior()
+            parts[trk] = (mu_i, P_i)
+            var_pos = np.trace(P_i[:3, :3])
+            geom_ez = 0.0
+            if last_target_pos is not None:
+                b = (last_target_pos - eff_sensor_pos) / (np.linalg.norm(last_target_pos - eff_sensor_pos) + 1e-9)
+                geom_ez = float(abs(b[2]))
+            gate_sig = tuner.get_gate_sigma(link) if tuner is not None else target_filters[trk].cfg.gate_N_sigma
+            nis_ema  = tuner._ema_nis.get(link, 1.0) if (tuner is not None) else 1.0
+            los_f    = 0.5 if (los_score is None) else float(los_score)
+            node_feats[trk] = np.array([var_pos, meta["reliability"], z_agg_center, R_eff, geom_ez, los_f, gate_sig, nis_ema], dtype=float)
+
+        # Collect FusionNet snapshot before fusion (node features + local posteriors)
+        if collector and args.collect_fusion:
+            collector.add_fusion_snap(i=i, parts=parts, node_feats=node_feats)
+
+        # Decide which trackers to keep under budget
+        keep_keys = list(parts.keys())
+        if args.budget_k is not None and len(keep_keys) > args.budget_k:
+            # Prefer information-gain (A-opt trace reduction); fallback to weights or reliability
+            try:
+                scored = [(k, float(info_gain_map.get(k, 0.0))) for k in keep_keys]
+                keep_keys = [k for k,_ in sorted(scored, key=lambda x: -x[1])[:args.budget_k]]
+            except Exception:
+                if fuser.weight_model is not None:
+                    X_stack = np.vstack([node_feats[k].reshape(1, -1) for k in keep_keys])
+                    w_pred = fuser.weight_model.predict_weights(X_stack)  # (N,)
+                    order = np.argsort(-w_pred)[:args.budget_k]
+                    keep_keys = [keep_keys[i] for i in order]
+                else:
+                    scored = [(k, float(node_feats[k][1])) for k in keep_keys]
+                    keep_keys = [k for k,_ in sorted(scored, key=lambda x: -x[1])[:args.budget_k]]
+
+        # Reduce to budgeted set
+        parts = {k: parts[k] for k in keep_keys}
+        node_feats = {k: node_feats[k] for k in keep_keys}
+
+        # CI fuse per-tracker posteriors (centralized or decentralized)
+        if args.decentralized:
+            if fuser.weight_model is not None and len(parts) > 0:
+                X_stack = np.vstack([node_feats[k].reshape(1, -1) for k in parts.keys()])
+                w_vec = fuser.weight_model.predict_weights(X_stack)
+                w_map = {k: float(w_vec[i]) for i, k in enumerate(parts.keys())}
+                mu_star, P_star, w = gossip.fuse(parts, weights=w_map)
+            else:
+                mu_star, P_star, w = gossip.fuse(parts)
+        else:
+            mu_star, P_star, w = fuser.fuse(parts, method=args.ci_method,
+                                            node_features={k: node_feats[k] for k in parts.keys()})
+        mu_star_seq.append(mu_star)
+        P_star_seq.append(P_star)
+
+        # Generate action suggestions for active sensing
+        if len(parts) > 0:
+            if args.planner == 'eig':
+                moves = suggest_vantage_moves_eig(mu_star, P_star, tracker_pos, r_eff_map)
+            else:
+                moves = suggest_vantage_moves(mu_star[:3], tracker_pos)
+            for trk, mv in moves.items():
+                action_rows.append([float(t), trk, float(mv[0]), float(mv[1]), float(mv[2])])
+            # EIG diagnostics for chosen move
+            if args.planner == 'eig':
+                for trk, mv in moves.items():
+                    try:
+                        p = tracker_pos[trk].reshape(3)
+                        cand_p = p + np.asarray(mv, float).reshape(3)
+                        eig_val = expected_trace_reduction(mu_star, P_star, cand_p, r_eff_map.get(trk, args.uwb_var))
+                        eig_scores_rows.append([float(t), trk, float(eig_val), float(r_eff_map.get(trk, args.uwb_var))])
+                    except Exception:
+                        pass
+            # Optional live publish (sim/mavsdk)
+            try:
+                ctrl.send_vantage_moves(float(t), moves)
+            except Exception:
+                pass
+
+        # Log CI weights to CSV
+        try:
+            if w_file is None:
+                import csv
+                os.makedirs(out_dir, exist_ok=True)
+                w_file = open(os.path.join(out_dir, "fusion_weights.csv"), "w", newline="")
+                w_csv = csv.writer(w_file)
+                w_csv.writerow(["timestamp"] + [f"w_{rid}" for rid in w.keys()])
+            w_csv.writerow([float(t)] + [float(w[rid]) for rid in w.keys()])
+        except Exception:
+            pass
+
+    # ----------------- Optional RTS smoothing -----------------
+    if args.smooth:
+        print("[SWARM] Applying RTS smoothing...")
+        dts = np.diff(query_timestamps, prepend=query_timestamps[0])
+        sax = max(args.smooth_sigma_a_xy, args.sigma_a_xy)
+        saz = max(args.smooth_sigma_a_z,  args.sigma_a_z)
+        mu_star_seq, P_star_seq = rts_smooth(
+            mu_star_seq, P_star_seq, dts, CVNoise(sigma_a_xy=sax, sigma_a_z=saz)
+        )
+
+    # ----------------- Evaluate target tracking -----------------
+    gt_tgt_pos = np.array([se_translation_from_matrix(T) for T in gt_se23[roles.target]])
+    rm, nees_val = evaluate_and_save(np.array(mu_star_seq), np.array(P_star_seq), gt_tgt_pos, out_dir)
+
+    with open(os.path.join(out_dir, "roles.json"), "w") as f:
+        json.dump({
+            "target": roles.target,
+            "trackers": roles.trackers,
+            "tag_map": tag_map,
+            "comm": {"p_link": args.comm_p, "p_drop": args.comm_drop, "rounds": args.comm_rounds, "seed": args.comm_seed}
+        }, f, indent=2)
+
+    # Save vertical sensitivity data
+    if vertical_sensitivities:
+        with open(os.path.join(out_dir, "vertical_sensitivity.json"), "w") as f:
+            json.dump({
+                "vertical_sensitivities": vertical_sensitivities,
+                "mean_sensitivity": float(np.mean(vertical_sensitivities)),
+                "median_sensitivity": float(np.median(vertical_sensitivities)),
+                "min_sensitivity": float(np.min(vertical_sensitivities)),
+                "max_sensitivity": float(np.max(vertical_sensitivities))
+            }, f, indent=2)
+
+    # Save trajectory and basic diagnostics
+    out_csv = os.path.join(out_dir, "target_state.csv")
+    ts = np.asarray(query_timestamps).reshape(-1, 1)
+    X = np.asarray(mu_star_seq)  # N x 6 [px,py,pz,vx,vy,vz]
+    df = pd.DataFrame(np.hstack([ts, X]),
+                      columns=["timestamp","px","py","pz","vx","vy","vz"])
+    df.to_csv(out_csv, index=False)
+    print(f"[SAVE] Trajectory -> {out_csv}")
+
+    # Persist collected data (always create files; collector handles empties)
+    if 'collector' in locals() and collector is not None:
+        coll_dir = args.collect_dir if args.collect_dir else out_dir
+        collector.save(coll_dir)
+
+    if nis_rows:
+        import csv
+        with open(os.path.join(out_dir, "nis_log.csv"), "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["timestamp","tracker","nis","S","R_eff"])
+            w.writerows(nis_rows)
+        # Rolling timeseries for quick visibility
+        try:
+            df_nis = pd.DataFrame(nis_rows, columns=["timestamp","tracker","nis","S","R_eff"])
+            df_nis = df_nis.sort_values("timestamp").reset_index(drop=True)
+            df_nis["roll_mean_global"] = df_nis["nis"].rolling(window=200, min_periods=1).mean()
+            df_nis["roll_mean_tracker"] = df_nis.groupby("tracker")["nis"].rolling(window=200, min_periods=1).mean().reset_index(level=0, drop=True)
+            # Add chi-square(1) reference bands
+            df_nis["q50"] = 0.455
+            df_nis["q90"] = 2.706
+            df_nis["q95"] = 3.841
+            df_nis["q99"] = 6.635
+            df_nis.to_csv(os.path.join(out_dir, "nis_timeseries.csv"), index=False)
+        except Exception:
+            pass
+
+    # Save action suggestions CSV
+    if action_rows:
+        import csv
+        with open(os.path.join(out_dir, "action_suggestions.csv"), "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["timestamp","tracker","dx","dy","dz"])
+            w.writerows(action_rows)
+
+    if 'w_file' in locals() and w_file is not None:
+        try:
+            w_file.close()
+        except Exception:
+            pass
+
+    # Save planner EIG diagnostics if available
+    if eig_scores_rows:
+        try:
+            import csv
+            with open(os.path.join(out_dir, "planner_eig_scores.csv"), "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["timestamp","tracker","eig_score","R_eff"])
+                w.writerows(eig_scores_rows)
+        except Exception:
+            pass
+
+    print(f"[SWARM] Measurements available (trk↔tgt) : {meas_avail}")
+    print(f"[SWARM] Measurements used after gating : {meas_used}")
+    print(f"[SWARM] LOS scores produced: {los_hits}, missing: {los_misses}")
+    if vertical_sensitivities:
+        print(f"[SWARM] Vertical sensitivity: mean={np.mean(vertical_sensitivities):.3f}, median={np.median(vertical_sensitivities):.3f}")
+    print(f"[DONE] Results written to: {out_dir}")
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--exp", required=True, help="Experiment name, e.g., default_3_random_0")
+    p.add_argument("--target", default=None, help="Robot id to treat as target (default: last in sort)")
+    p.add_argument("--use_height", action="store_true", help="Include height correction in authors' EKF")
+    p.add_argument("--use_height_tf", action="store_true", help="Use PX4 height to update the target filter (z-only)")
+    p.add_argument("--height_std", type=float, default=0.07, help="Std dev (m) of PX4 height per sensor; used for R_h")
+    p.add_argument("--sigma_a", type=float, default=1.0, help="Target process accel noise std (m/s^2) [legacy, use sigma_a_xy/z]")
+    p.add_argument("--sigma_a_xy", type=float, default=1.0, help="Horiz accel noise std (m/s^2)")
+    p.add_argument("--sigma_a_z", type=float, default=0.5, help="Vertical accel noise std (m/s^2)")
+    p.add_argument("--p0", type=float, default=2.0, help="Initial target position std (m)")
+    p.add_argument("--v0", type=float, default=1.0, help="Initial target velocity std (m/s)")
+    p.add_argument("--uwb_var", type=float, default=0.35**2, help="Baseline UWB variance (m^2)")
+    p.add_argument("--uwb_std", type=float, default=None, help="Alternative: give UWB std (m); overrides --uwb_var")
+    p.add_argument("--gate_sigma", type=float, default=3.0, help="Gating threshold in sigma")
+    p.add_argument("--ci_method", choices=["uniform", "grid", "learned"], default="grid")
+    p.add_argument("--ci_objective", choices=["logdet","trace"], default=None)
+    p.add_argument("--ci_grid", type=float, default=0.1, help="Grid step for CI weights")
+    p.add_argument("--tags_per_robot", type=int, default=2, help="How many tags to assume per robot")
+    p.add_argument("--pair_corr", type=float, default=0.7, help="Correlation between tag-pair ranges")
+    p.add_argument("--huber_delta", type=float, default=0.8, help="Huber delta for per-timestep range aggregation (m)")
+    p.add_argument("--use_los", action="store_true", help="Use LOS classifier to shape reliability")
+    p.add_argument("--use_cir", action="store_true", help="If available, enable CIR for LOS classifier")
+    p.add_argument("--los_verbose", action="store_true", help="Print one-time LOS adapter diagnostics")
+    p.add_argument("--los_influence", type=float, default=0.2, help="Strength of LOS->reliability (0..1)")
+    p.add_argument("--geom_influence", type=float, default=0.4, help="Strength of |e_z|->reliability (0..1)")
+    p.add_argument("--ema_alpha", type=float, default=0.0, help="EMA for innovation whiteness (MeasureAdapter)")
+    p.add_argument("--r_min_scale", type=float, default=0.5, help="Lower bound on R scaling")
+    p.add_argument("--r_max_scale", type=float, default=6.0, help="Upper bound on R scaling")
+    p.add_argument("--online_tune", action="store_true", help="Enable OnlineTuner (causal self-calibration)")
+    p.add_argument("--online_r_min_scale", type=float, default=0.75)
+    p.add_argument("--online_r_max_scale", type=float, default=10.0)
+    p.add_argument("--gate_target", type=float, default=0.97)
+    p.add_argument("--gate_sigma_init", type=float, default=3.0)
+    p.add_argument("--q_adapt", action="store_true", help="Let tuner gently scale process noise (Q)")
+    p.add_argument("--init_window", type=int, default=0,
+                   help="Use first N timesteps to robustly initialize target position (0=off)")
+    p.add_argument("--smooth", action="store_true", help="Enable RTS smoothing after filtering")
+    p.add_argument("--smooth_sigma_a_xy", type=float, default=1.0)
+    p.add_argument("--smooth_sigma_a_z", type=float, default=0.7)
+    p.add_argument("--biasnet_dir", default=None, help="Directory with biasnet.pt and biasnet_meta.json")
+    p.add_argument("--fusionnet_dir", default=None, help="Directory with fusionnet.pt and fusionnet_meta.json")
+    p.add_argument("--out", default="outputs_swarm")
+    p.add_argument("--collect_bias", action="store_true", help="Collect BiasNet samples during run")
+    p.add_argument("--collect_fusion", action="store_true", help="Collect FusionNet snaps during run")
+    p.add_argument("--collect_dir", default=None, help="Override output dir for collected data (default: experiment out dir)")
+    p.add_argument("--decentralized", action="store_true",
+                   help="Use decentralized gossip CI instead of centralized CI")
+    p.add_argument("--comm_p", type=float, default=1.0, help="Link probability in comms graph")
+    p.add_argument("--comm_drop", type=float, default=0.0, help="Packet drop probability per edge per round")
+    p.add_argument("--comm_rounds", type=int, default=1, help="Consensus rounds per timestep")
+    p.add_argument("--comm_seed", type=int, default=0, help="Seed for comms graph randomness")
+    p.add_argument("--budget_k", type=int, default=None,
+                   help="If set, only the top-k trackers (by FusionNet weight or reliability) update and fuse")
+    p.add_argument("--planner", choices=["heuristic","eig"], default="heuristic")
+    p.add_argument("--control_mode", choices=["none","sim","mavsdk"], default="none")
+    p.add_argument("--control_rate", type=int, default=5)
+    p.add_argument("--r_floor_blend", type=float, default=0.5, help="Blend factor for soft R floor (0..1)")
+    args = p.parse_args()
+    main(args)
+
+

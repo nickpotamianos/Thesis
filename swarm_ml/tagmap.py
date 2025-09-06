@@ -46,7 +46,10 @@ def select_pair_rows(df_t: pd.DataFrame,
 def robust_range_aggregate(pair_df: pd.DataFrame,
                            base_var: float,
                            rho: float = 0.7,
-                           huber_delta: float = 0.8) -> tuple[float, float, dict]:
+                           huber_delta: float = 0.8,
+                           use_dispersion: bool = True,
+                           disp_tau: float = 0.20,
+                           disp_gain: float = 0.6) -> tuple[float, float, dict]:
     """
     Robustly aggregate multiple tag-pair ranges for one tracker↔target at time t.
     - Location: Huber M-estimator (delta in meters).
@@ -68,7 +71,15 @@ def robust_range_aggregate(pair_df: pd.DataFrame,
     m_eff = max(1.0, m_eff)  # never below 1
 
     R_eff = base_var / m_eff
-    return z_agg, R_eff, {"m": int(m), "m_eff": float(m_eff)}
+    meta = {"m": int(m), "m_eff": float(m_eff)}
+    # Optional dispersion-aware inflation using IQR
+    if use_dispersion and m >= 3:
+        q25, q75 = np.percentile(zs, [25, 75])
+        iqr = float(max(1e-9, q75 - q25))
+        infl = 1.0 + float(disp_gain) * float(min(1.0, iqr / max(1e-9, disp_tau)))
+        R_eff *= infl
+        meta.update({"iqr": iqr, "R_infl": infl})
+    return z_agg, float(R_eff), meta
 
 def robust_tracker_sensor_position(pair_df: pd.DataFrame,
                                    trk: str,

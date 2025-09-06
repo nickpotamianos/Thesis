@@ -158,9 +158,13 @@ def main():
 
     # Measurement adaptation (BiasNet/LOS/reliability shaping)
     base_var = (args.uwb_std**2) if (args.uwb_std is not None) else args.uwb_var
-    mcfg = AdapterConfig(base_range_var=base_var,
-                         los_influence=args.los_influence,
-                         geom_influence=args.geom_influence)
+    mcfg = AdapterConfig(
+        base_range_var=base_var,
+        los_influence=args.los_influence,
+        geom_influence=args.geom_influence,
+        # If an OnlineTuner is active, delegate R scaling to it.
+        own_rscale=(not args.online_tune)
+    )
     meas_ai = MeasureAdapter(mcfg, bias_model=_load_biasnet(args.biasnet_dir))
     los_adapter = LOSAdapter(LOSConfig(use_cir=args.use_cir, verbose=args.los_verbose)) if args.use_los else None
 
@@ -327,19 +331,35 @@ def main():
             eff_sensor_pos = sensor_pos - tgt_offset_w
             sensor_pos = eff_sensor_pos
 
-            # features (use fused target prediction if available)
-            feat = build_measurement_features(
-                tracker_pos=eff_sensor_pos,
-                target_pred_pos=target_pred_pos,
-                uwb_range=float(z_agg),
-                los_score=None
-            )
+            # LOS score first (so features match training)
             if los_adapter is not None:
                 try:
                     s = los_adapter.score(pair_df, extras=None)
-                    if s is not None: los_score = float(s)
+                    if s is not None:
+                        los_score = float(s)
                 except Exception:
                     pass
+
+            # Optional heights for feature parity (will be ignored if None)
+            h_trk = None
+            h_tgt = None
+            if args.use_height_tf and height_at_q:
+                try:
+                    if args.id in height_at_q:
+                        h_trk = float(height_at_q[args.id][i])
+                    if args.target in height_at_q:
+                        h_tgt = float(height_at_q[args.target][i])
+                except Exception:
+                    h_trk = None; h_tgt = None
+
+            # features (use fused target prediction if available)
+            feat = build_measurement_features(
+                tracker_pos=eff_sensor_pos,
+                target_pred_pos=None,          # match training (no geometry inputs)
+                uwb_range=float(z_agg),
+                los_score=los_score,
+                height_tracker=h_trk, height_target=h_tgt
+            )
 
             # tuner pre-setup (R scale & gate)
             link = (args.id, args.target)

@@ -1,5 +1,5 @@
 # swarm_ml/train_fusionnet.py
-import argparse, os, json
+import argparse, os, json, random
 import numpy as np, torch
 from torch.utils.data import Dataset, DataLoader
 from .models import FusionNet
@@ -48,7 +48,7 @@ class FusionSnapDataset(Dataset):
     def __getitem__(self, i): return self.snaps[i]
 
 def train_fusionnet(snaps, in_dim, out_dir, lr=1e-3, epochs=20, batch_size=64, seed=0, fuser=None):
-    torch.manual_seed(seed)
+    torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
     model = FusionNet(in_dim=in_dim)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     ds = FusionSnapDataset(snaps)

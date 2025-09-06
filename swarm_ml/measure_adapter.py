@@ -27,6 +27,8 @@ class AdapterConfig:
     # New: LOS/geometry influences
     los_influence: float = 0.5     # controls how strongly LOS adjusts reliability
     geom_influence: float = 0.5    # controls how strongly |e_z| adjusts reliability
+    # Ownership of innovation-driven R scaling: if False, an external tuner owns R scaling.
+    own_rscale: bool = True
 
 class MeasureAdapter:
     """
@@ -42,6 +44,8 @@ class MeasureAdapter:
         self._bias_ema: Dict[Tuple[str, str], float] = {}
         self._bias_beta: float = float(self.cfg.bias_beta)  # slow learn-rate for constant bias
         self._bias_clip: float = float(self.cfg.bias_clip)
+        # Ownership flag for R scaling
+        self._own_rscale: bool = bool(getattr(self.cfg, "own_rscale", True))
 
     @staticmethod
     def _sigmoid(x: float) -> float:
@@ -117,8 +121,9 @@ class MeasureAdapter:
         ema = self._whiten_ema.get(key, 1.0)
         ema = (1.0 - self.cfg.ema_alpha) * ema + self.cfg.ema_alpha * whiten
         self._whiten_ema[key] = ema
-        # Scale future R by current EMA
-        self._rscale[key] = float(np.clip(ema, self.cfg.min_scale, self.cfg.max_scale))
+        # Scale future R by current EMA only if this adapter owns R scaling
+        if self._own_rscale:
+            self._rscale[key] = float(np.clip(ema, self.cfg.min_scale, self.cfg.max_scale))
         # Slowly adapt online bias toward mean innovation
         b = float(self._bias_ema.get(key, 0.0))
         b = (1.0 - self._bias_beta) * b + self._bias_beta * float(innov)

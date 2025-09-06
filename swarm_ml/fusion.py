@@ -5,9 +5,11 @@ import numpy as np
 from numpy.linalg import inv
 
 @dataclass
+@dataclass
 class CIFuserConfig:
     objective: str = "logdet"   # "logdet" or "trace"
     grid_step: float = 0.1      # weight grid for small N; safe & reproducible
+    max_grid_points: int = 5000 # safety cap for simplex grid size
 
 class CIFuser:
     """
@@ -47,13 +49,20 @@ class CIFuser:
         return {k: w for k in keys}
 
     @staticmethod
-    def _simplex_grid(n: int, step: float) -> np.ndarray:
+    def _simplex_grid(n: int, step: float, max_points: int = 5000) -> np.ndarray:
         """
         Generate simplex points of dimension n that sum to 1 with given step.
         """
         if n == 1:
             return np.array([[1.0]])
         levels = int(round(1.0 / step))
+        # Cap grid size: number of lattice points on simplex = C(levels + n - 1, n - 1)
+        def ncr(a, b):
+            from math import comb
+            return comb(int(a), int(b))
+        while n > 1 and ncr(levels + n - 1, n - 1) > max_points and levels > 1:
+            # coarsen the grid
+            levels = max(1, levels // 2)
         grids = []
         def rec(prefix, remain, depth):
             if depth == n-1:
@@ -62,7 +71,7 @@ class CIFuser:
             for i in range(remain+1):
                 rec(prefix + [i], remain - i, depth + 1)
         rec([], levels, 0)
-        arr = np.array(grids, dtype=float) / levels
+        arr = np.array(grids, dtype=float) / max(1, levels)
         return arr
 
     def _objective(self, P: np.ndarray) -> float:
@@ -97,7 +106,7 @@ class CIFuser:
             return mu, P, w
 
         # Grid-search CI weights (robust and dependency-free)
-        grid = self._simplex_grid(len(keys), self.cfg.grid_step)
+        grid = self._simplex_grid(len(keys), self.cfg.grid_step, self.cfg.max_grid_points)
         best_val = np.inf
         best_w = None
         best_mu, best_P = None, None

@@ -204,6 +204,8 @@ def main(args):
         ema_alpha=args.ema_alpha,
         min_scale=args.r_min_scale,
         max_scale=args.r_max_scale,
+        # If OnlineTuner is enabled, let it own R scaling.
+        own_rscale=(not args.online_tune),
     )
     meas_ai = MeasureAdapter(mcfg)
 
@@ -388,14 +390,7 @@ def main(args):
             eff_sensor_pos = sensor_pos - tgt_offset_w
             z_agg_center   = float(z_agg)
 
-            feat = build_measurement_features(
-                tracker_pos=eff_sensor_pos,
-                target_pred_pos=last_target_pos,
-                uwb_range=z_agg_center,
-                los_score=None
-            )
-
-            # LOS score if enabled
+            # LOS score if enabled (compute BEFORE features to maintain train‑test parity)
             los_score = None
             if args.use_los:
                 los_score = los_adapter.score(pair_df, extras=None)
@@ -403,6 +398,28 @@ def main(args):
                     los_misses += 1
                 else:
                     los_hits += 1
+
+            # Optional heights for feature parity (ignored if None)
+            h_trk = None
+            h_tgt = None
+            if args.use_height_tf and height_at_q:
+                try:
+                    if trk in height_at_q:
+                        h_trk = float(height_at_q[trk][i])
+                    if roles.target in height_at_q:
+                        h_tgt = float(height_at_q[roles.target][i])
+                except Exception:
+                    h_trk = None; h_tgt = None
+
+            # Feature vector (must match training layout)
+            feat = build_measurement_features(
+                tracker_pos=eff_sensor_pos,
+                target_pred_pos=None,          # match training (no geometry inputs)
+                uwb_range=z_agg_center,
+                los_score=los_score,
+                height_tracker=h_trk,
+                height_target=h_tgt
+            )
 
             # Per-link R scaling + gating from tuner
             link = (trk, roles.target)

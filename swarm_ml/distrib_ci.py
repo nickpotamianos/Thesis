@@ -84,10 +84,16 @@ class GossipFuser:
         # What a central observer would see (nodes have converged if rounds are enough)
         J_bar = Jv.mean(axis=0)
         h_bar = hv.mean(axis=0)
-        # Add regularization for numerical stability
-        J_bar_reg = J_bar + 1e-6 * np.eye(J_bar.shape[0])
-        P = np.linalg.inv(J_bar_reg)
-        mu = P @ h_bar
+        # IMPORTANT: the centralized solution uses the SUM of information, not the MEAN.
+        # μ is invariant to a common scale on (J, h), but P = (Σ J_i)^-1 will be too large
+        # if we invert the mean. Multiply back by N to recover the sum.
+        N = len(keys)
+        J_sum = N * J_bar
+        h_sum = N * h_bar
+        # Add regularization for numerical stability before inversion
+        J_sum_reg = J_sum + 1e-6 * np.eye(J_sum.shape[0])
+        P = np.linalg.inv(J_sum_reg)
+        mu = P @ h_sum
 
         # Provide implicit weights (uniform if none were provided)
         if weights is None:

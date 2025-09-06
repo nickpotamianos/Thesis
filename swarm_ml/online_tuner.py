@@ -60,13 +60,33 @@ class OnlineTuner:
         # Global process noise scales (apply to all trackers/target model)
         self._q_scale_xy: float = 1.0
         self._q_scale_z: float = 1.0
+        # Compute a baseline gate sigma that matches the target acceptance for χ²(1):
+        # Find σ such that P(χ²₁ ≤ σ²) = gate_target_accept ⇒ erf(σ/√2) = p.
+        self._gate_sigma_default: float = self._sigma_for_accept(self.cfg.gate_target_accept)
+
+    @staticmethod
+    def _sigma_for_accept(p: float, iters: int = 12) -> float:
+        """
+        Solve erf(σ/√2) = p for σ using Newton iterations (no SciPy dependency).
+        Valid for 0<p<1. Monotone, well-behaved.
+        """
+        p = float(np.clip(p, 1e-6, 1.0 - 1e-6))
+        import math
+        s = 2.0  # initial guess (~95% acceptance)
+        for _ in range(iters):
+            f = math.erf(s / math.sqrt(2.0)) - p
+            df = math.sqrt(2.0 / math.pi) * math.exp(-0.5 * s * s)
+            s = s - f / max(df, 1e-9)
+            s = float(np.clip(s, 0.1, 6.0))
+        return float(s)
 
     # ---------- public API ----------
     def get_r_scale(self, link: Link) -> float:
         return float(self._r_scale.get(link, 1.0))
 
     def get_gate_sigma(self, link: Link) -> float:
-        return float(self._gate_sigma.get(link, self.cfg.gate_sigma_init))
+        # Default to the acceptance-calibrated sigma if not yet adapted.
+        return float(self._gate_sigma.get(link, self._gate_sigma_default))
 
     def get_q_scales(self) -> Tuple[float, float]:
         return float(self._q_scale_xy), float(self._q_scale_z)

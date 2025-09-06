@@ -6,8 +6,19 @@ import pandas as pd
 import inspect, os, sys, importlib.util
 
 def _load_from_fs(fname="los_classification.py") -> Optional[object]:
-    """Search current repo recursively for los_classification.py and import it."""
+    """Load LOS module from explicit path (LOS_MODULE_PATH) or search repo recursively."""
     root = os.getcwd()
+    # 1) Honor explicit environment variable
+    try:
+        env_path = os.environ.get("LOS_MODULE_PATH", None)
+        if env_path and os.path.exists(env_path):
+            spec = importlib.util.spec_from_file_location("los_classification", env_path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)  # type: ignore
+            print(f"[LOS] Loaded {fname} from explicit path: {env_path}", flush=True)
+            return mod
+    except Exception as e:
+        print(f"[LOS] Failed to load LOS module from LOS_MODULE_PATH: {e}", flush=True)
     for r, _, files in os.walk(root):
         if fname in files:
             path = os.path.join(r, fname)
