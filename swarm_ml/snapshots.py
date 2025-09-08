@@ -19,6 +19,7 @@ class FusionSnap:
     Ps: np.ndarray                     # (N_nodes, 6, 6) local posteriors P_i
     gt_pos: np.ndarray                 # (3,)
     los: Optional[Dict[str, float]] = None
+    exp: Optional[str] = None          # NEW: experiment id for split-aware training
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -28,7 +29,8 @@ class FusionSnap:
             "mus": self.mus.tolist(),
             "Ps": self.Ps.tolist(),
             "gt_pos": self.gt_pos.tolist(),
-            "los": None if self.los is None else {k: float(v) for k, v in self.los.items()}
+            "los": None if self.los is None else {k: float(v) for k, v in self.los.items()},
+            "exp": None if self.exp is None else str(self.exp),
         }
 
 
@@ -40,19 +42,21 @@ class SnapshotCollector:
     Saves JSONL files under the experiment out directory.
     """
     def __init__(self,
+                 exp_name: Optional[str],
                  query_timestamps: np.ndarray,
                  roles,
                  tag_map: Dict[str, List[int]],
-                 gt_T_by_robot: Dict[str, List[np.ndarray]],
-                 tag_moment_arms,
-                 base_var: float,
-                 pair_corr: float,
-                 huber_delta: float = 0.8,
-                 los_verbose: bool = False):
+                 gt_T_by_robot,
+                 tag_moment_arms=None,
+                 base_var=1.0,
+                 pair_corr=0.0,
+                 huber_delta=1.0,
+                 los_verbose=False):
         self.ts = np.asarray(query_timestamps, dtype=float)
         self.roles = roles
         self.tag_map = tag_map
         self.gt_T = gt_T_by_robot
+        self.exp_name = exp_name
         self.tag_moment_arms = tag_moment_arms
         self.base_var = float(base_var)
         self.pair_corr = float(pair_corr)
@@ -95,6 +99,7 @@ class SnapshotCollector:
             "features": feat.tolist(),
             "bias": float(z_agg - true_range),
             "meta": {
+                "exp": None if self.exp_name is None else str(self.exp_name),
                 "timestamp": t,
                 "tracker": trk,
                 "target": tgt,
@@ -116,7 +121,10 @@ class SnapshotCollector:
         Ps = np.stack([parts[k][1] for k in order], axis=0)
         gt_pos = self.gt_pos[self.roles.target][i][:3]
 
-        snap = FusionSnap(t, order, X, mus, Ps, gt_pos)
+        snap = FusionSnap(
+            timestamp=t, order=order, X=X, mus=mus, Ps=Ps, gt_pos=gt_pos,
+            los=None, exp=self.exp_name
+        )
         self._fuse_jsonl.append(snap.to_json())
 
         # ---- Persist ----
@@ -161,15 +169,18 @@ class SnapshotCollector:
         schema = {
             "node_features_layout": {
                 "0": "var_pos_trace",
-                "1": "reliability",
+                "1": "reliability", 
                 "2": "z_agg_center",
                 "3": "R_eff",
                 "4": "geom_ez_abs",
                 "5": "los_score",
                 "6": "gate_sigma",
-                "7": "nis_ema"
+                "7": "nis_ema",
+                "8": "R_pair",
+                "9": "m_eff",
+                "10": "iqr"
             },
-            "description": "Per-node feature indices used for FusionNet training",
+            "description": "Per-node feature indices used for FusionNet training (enhanced with tag-pair stats)",
         }
         with open(os.path.join(out_dir, "fusion_schema.json"), "w") as f:
             json.dump(schema, f, indent=2)

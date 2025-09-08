@@ -3,6 +3,30 @@ import argparse, os, json
 import numpy as np
 import pandas as pd
 
+def load_fusionnet(path_dir: str):
+    import os, json, torch
+    from swarm_ml.models import FusionNet
+    with open(os.path.join(path_dir, "fusionnet_meta.json"), "r") as f:
+        meta = json.load(f)
+    in_dim = int(meta["in_dim"])
+    x_mu = meta.get("x_mu", None)
+    x_std = meta.get("x_std", None)
+    
+    model = FusionNet(in_dim)
+    # weights_only=True to address the FutureWarning
+    state = torch.load(os.path.join(path_dir, "fusionnet.pt"), map_location="cpu", weights_only=True)
+    model.load_state_dict(state, strict=False)
+    
+    # Reinstall normalizer (stored during training by train_fusionnet.py)
+    if x_mu is not None and x_std is not None:
+        model.set_normalizer(x_mu, x_std)
+        print(f"[SWARM] FusionNet normalizer restored: {len(x_mu)} features")
+    else:
+        print(f"[SWARM] Warning: No normalizer data found in meta.json")
+    
+    model.eval()
+    return model
+
 # ---- Authors' devkit imports (do not modify) ----
 from miluv.data import DataLoader
 import miluv.utils as utils
@@ -77,14 +101,14 @@ def load_biasnet(path_dir: str):
     model.eval()
     return model
 
-def load_fusionnet(path_dir: str):
+def load_fusionnet_legacy(path_dir: str):
     import json, torch
     from swarm_ml.models import FusionNet
     with open(os.path.join(path_dir, "fusionnet_meta.json"), "r") as f:
         meta = json.load(f)
     in_dim = int(meta["in_dim"])
     model = FusionNet(in_dim)
-    state = torch.load(os.path.join(path_dir, "fusionnet.pt"), map_location="cpu")
+    state = torch.load(os.path.join(path_dir, "fusionnet.pt"), map_location="cpu", weights_only=True)
     model.load_state_dict(state)
     model.eval()
     return model
@@ -264,6 +288,7 @@ def main(args):
     collector = None
     if args.collect_bias or args.collect_fusion:
         collector = SnapshotCollector(
+            exp_name=exp_name,
             query_timestamps=query_timestamps,
             roles=roles,
             tag_map=tag_map,
@@ -362,12 +387,25 @@ def main(args):
                 gate_sig = target_filters[trk].cfg.gate_N_sigma
                 nis_ema  = tuner._ema_nis.get((trk, roles.target), 1.0) if (tuner is not None) else 1.0
                 los_f    = 0.5
-                node_feats[trk] = np.array([var_pos, 0.0, 0.0, args.uwb_var, 0.0, los_f, gate_sig, nis_ema], dtype=float)
+                # Consistent 11-dimensional features (fallback values for missing pairs)
+                node_feats[trk] = np.array([
+                    var_pos,                # 0
+                    0.0,                    # 1 - reliability
+                    0.0,                    # 2 - z_agg_center  
+                    args.uwb_var,           # 3 - R_eff
+                    0.0,                    # 4 - geom_ez
+                    los_f,                  # 5 - los_score
+                    gate_sig,               # 6 - gate_sigma
+                    nis_ema,                # 7 - nis_ema
+                    args.uwb_var,           # 8 - R_pair (fallback)
+                    1.0,                    # 9 - m_eff (single fallback)
+                    0.0                     # 10 - iqr (no spread)
+                ], dtype=float)
                 info_gain_map[trk] = 0.0
                 continue
 
             # robust aggregation across all tag pairs at t
-            z_agg, R_pair, _ = robust_range_aggregate(pair_df, base_var=base_var,
+            z_agg, R_pair, meta_pairs = robust_range_aggregate(pair_df, base_var=base_var,
                                                       rho=args.pair_corr, huber_delta=args.huber_delta)
             meas_avail += 1
 
@@ -390,10 +428,24 @@ def main(args):
             eff_sensor_pos = sensor_pos - tgt_offset_w
             z_agg_center   = float(z_agg)
 
+            # Optional: build a time-windowed set just for LOS/IQR
+            pair_df_los = pair_df
+            if args.los_window and args.los_window > 0.0:
+                t0, t1 = float(t - args.los_window), float(t + args.los_window)
+                df_win = uwb_range[(uwb_range["timestamp"] >= t0) &
+                                   (uwb_range["timestamp"] <= t1) &
+                                   (uwb_range["robot"] == trk)]
+                pair_df_los = select_pair_rows(
+                    df_win,
+                    trk_tags=tag_map.get(trk, []),
+                    tgt_tags=tag_map.get(roles.target, [])
+                )
+
             # LOS score if enabled (compute BEFORE features to maintain train‑test parity)
             los_score = None
             if args.use_los:
-                los_score = los_adapter.score(pair_df, extras=None)
+                # use the windowed set so m≥3 is common
+                los_score = los_adapter.score(pair_df_los, extras=None)
                 if los_score is None:
                     los_misses += 1
                 else:
@@ -492,7 +544,28 @@ def main(args):
                     gate_sig = tuner.get_gate_sigma(link) if tuner is not None else target_filters[trk].cfg.gate_N_sigma
                     nis_ema  = tuner._ema_nis.get(link, 1.0) if (tuner is not None) else 1.0
                     los_f    = 0.5 if (los_score is None) else float(los_score)
-                    node_feats[trk] = np.array([var_pos, meta["reliability"], z_agg_center, R_eff, geom_ez, los_f, gate_sig, nis_ema], dtype=float)
+                    # Enhanced features: add tag-pair stats for better discrimination
+                    m_eff = float(meta_pairs.get("m_eff", 1.0))   # effective pairs
+                    # Prefer IQR from the windowed set if available; fall back to per‑t meta
+                    if pair_df_los is not None and not pair_df_los.empty and pair_df_los.shape[0] >= 3:
+                        zs_los = pair_df_los["range"].to_numpy(dtype=float)
+                        q25, q75 = np.percentile(zs_los, [25, 75])
+                        iqr = float(max(0.0, q75 - q25))
+                    else:
+                        iqr = float(meta_pairs.get("iqr", 0.0))     # range IQR
+                    node_feats[trk] = np.array([
+                        var_pos,                 # 0
+                        meta["reliability"],     # 1
+                        z_agg_center,            # 2
+                        R_eff,                   # 3
+                        geom_ez,                 # 4
+                        los_f,                   # 5
+                        gate_sig,                # 6
+                        nis_ema,                 # 7
+                        R_pair,                  # 8  <- new: pair variance
+                        m_eff,                   # 9  <- new: effective pairs
+                        iqr                      # 10 <- new: range IQR
+                    ], dtype=float)
                     continue
 
             # Optional: z-only height-difference correction
@@ -537,7 +610,28 @@ def main(args):
             gate_sig = tuner.get_gate_sigma(link) if tuner is not None else target_filters[trk].cfg.gate_N_sigma
             nis_ema  = tuner._ema_nis.get(link, 1.0) if (tuner is not None) else 1.0
             los_f    = 0.5 if (los_score is None) else float(los_score)
-            node_feats[trk] = np.array([var_pos, meta["reliability"], z_agg_center, R_eff, geom_ez, los_f, gate_sig, nis_ema], dtype=float)
+            # Enhanced features: add tag-pair stats for better discrimination
+            m_eff = float(meta_pairs.get("m_eff", 1.0))   # effective pairs
+            # Prefer IQR from the windowed set if available; fall back to per‑t meta
+            if pair_df_los is not None and not pair_df_los.empty and pair_df_los.shape[0] >= 3:
+                zs_los = pair_df_los["range"].to_numpy(dtype=float)
+                q25, q75 = np.percentile(zs_los, [25, 75])
+                iqr = float(max(0.0, q75 - q25))
+            else:
+                iqr = float(meta_pairs.get("iqr", 0.0))     # range IQR
+            node_feats[trk] = np.array([
+                var_pos,                 # 0
+                meta["reliability"],     # 1
+                z_agg_center,            # 2
+                R_eff,                   # 3
+                geom_ez,                 # 4
+                los_f,                   # 5
+                gate_sig,                # 6
+                nis_ema,                 # 7
+                R_pair,                  # 8  <- new: pair variance
+                m_eff,                   # 9  <- new: effective pairs
+                iqr                      # 10 <- new: range IQR
+            ], dtype=float)
 
         # Collect FusionNet snapshot before fusion (node features + local posteriors)
         if collector and args.collect_fusion:
@@ -610,8 +704,12 @@ def main(args):
                 os.makedirs(out_dir, exist_ok=True)
                 w_file = open(os.path.join(out_dir, "fusion_weights.csv"), "w", newline="")
                 w_csv = csv.writer(w_file)
-                w_csv.writerow(["timestamp"] + [f"w_{rid}" for rid in w.keys()])
-            w_csv.writerow([float(t)] + [float(w[rid]) for rid in w.keys()])
+                # Stable header across the whole run: all declared trackers
+                header = ["timestamp"] + [f"w_{rid}" for rid in roles.trackers]
+                w_csv.writerow(header)
+            # Write a stable row in the same order; NaN if not present in this fuse
+            row = [float(t)] + [float(w.get(rid, float('nan'))) for rid in roles.trackers]
+            w_csv.writerow(row)
         except Exception:
             pass
 
@@ -737,6 +835,8 @@ if __name__ == "__main__":
     p.add_argument("--pair_corr", type=float, default=0.7, help="Correlation between tag-pair ranges")
     p.add_argument("--huber_delta", type=float, default=0.8, help="Huber delta for per-timestep range aggregation (m)")
     p.add_argument("--use_los", action="store_true", help="Use LOS classifier to shape reliability")
+    p.add_argument("--los_window", type=float, default=0.0,
+                   help="If >0, use ±this many seconds around t to compute LOS/IQR (range update still uses exact t)")
     p.add_argument("--use_cir", action="store_true", help="If available, enable CIR for LOS classifier")
     p.add_argument("--los_verbose", action="store_true", help="Print one-time LOS adapter diagnostics")
     p.add_argument("--los_influence", type=float, default=0.2, help="Strength of LOS->reliability (0..1)")

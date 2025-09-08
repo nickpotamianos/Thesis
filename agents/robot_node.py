@@ -10,8 +10,24 @@ import miluv.utils as utils
 # EKF models (authors')
 try:
     import examples.ekfutils.imu_three_robots_models as model
-except Exception:
-    import imu_three_robots_models as model  # local fallback
+except Exce        # This node's local measurement set: only rows originated by this robot
+        pair_df = pd.DataFrame(columns=["timestamp"])  # default empty
+        if df_t is not None and not df_t.empty:
+            df_r = df_t[df_t["robot"] == args.id]
+            if not df_r.empty:
+                pair_df = select_pair_rows(df_r, trk_tags=tag_map.get(args.id, []),
+                                           tgt_tags=tag_map.get(args.target, []))
+
+        # Optional LOS/IQR window
+        pair_df_los = pair_df
+        if args.los_window and args.los_window > 0.0:
+            t0, t1 = float(t - args.los_window), float(t + args.los_window)
+            df_win = uwb_range[(uwb_range["timestamp"] >= t0) &
+                               (uwb_range["timestamp"] <= t1) &
+                               (uwb_range["robot"] == args.id)]
+            pair_df_los = select_pair_rows(df_win,
+                                           trk_tags=tag_map.get(args.id, []),
+                                           tgt_tags=tag_map.get(args.target, []))    import imu_three_robots_models as model  # local fallback
 
 # ---- Ours ----
 from swarm_net.udp import make_tx, make_rx_nb, UdpGroup
@@ -63,6 +79,8 @@ def main():
     ap.add_argument("--sigma_a_z", type=float, default=0.5)
     ap.add_argument("--gate_sigma", type=float, default=3.0)
     ap.add_argument("--use_los", action="store_true")
+    ap.add_argument("--los_window", type=float, default=0.0,
+                    help="If >0, use ±this many seconds around t to compute LOS/IQR (range update still uses exact t)")
     ap.add_argument("--use_cir", action="store_true")
     ap.add_argument("--los_verbose", action="store_true")
     ap.add_argument("--biasnet_dir", default=None)
@@ -334,7 +352,8 @@ def main():
             # LOS score first (so features match training)
             if los_adapter is not None:
                 try:
-                    s = los_adapter.score(pair_df, extras=None)
+                    # use the windowed set so m≥3 is common
+                    s = los_adapter.score(pair_df_los, extras=None)
                     if s is not None:
                         los_score = float(s)
                 except Exception:

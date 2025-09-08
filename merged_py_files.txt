@@ -176,6 +176,7 @@ def build_biasnet_samples(
                 "features": feat.tolist(),
                 "bias": float(z_agg - true_range),
                 "meta": {
+                    "exp": str(exp_name),
                     "timestamp": float(t),
                     "tracker": trk,
                     "target": tgt,
@@ -383,7 +384,10 @@ def select_pair_rows(df_t: pd.DataFrame,
 def robust_range_aggregate(pair_df: pd.DataFrame,
                            base_var: float,
                            rho: float = 0.7,
-                           huber_delta: float = 0.8) -> tuple[float, float, dict]:
+                           huber_delta: float = 0.8,
+                           use_dispersion: bool = True,
+                           disp_tau: float = 0.20,
+                           disp_gain: float = 0.6) -> tuple[float, float, dict]:
     """
     Robustly aggregate multiple tag-pair ranges for one tracker↔target at time t.
     - Location: Huber M-estimator (delta in meters).
@@ -405,7 +409,22 @@ def robust_range_aggregate(pair_df: pd.DataFrame,
     m_eff = max(1.0, m_eff)  # never below 1
 
     R_eff = base_var / m_eff
-    return z_agg, R_eff, {"m": int(m), "m_eff": float(m_eff)}
+    meta = {"m": int(m), "m_eff": float(m_eff)}
+    # Optional dispersion-aware inflation using IQR
+    if use_dispersion:
+        if m >= 3:
+            q25, q75 = np.percentile(zs, [25, 75])
+            iqr = float(max(1e-9, q75 - q25))
+        elif m == 2:
+            # IQR-like proxy for two points
+            iqr = float(abs(zs[1] - zs[0]))
+        else:
+            iqr = 0.0
+        if iqr > 0.0:
+            infl = 1.0 + float(disp_gain) * float(min(1.0, iqr / max(1e-9, disp_tau)))
+            R_eff *= infl
+            meta.update({"iqr": iqr, "R_infl": infl})
+    return z_agg, float(R_eff), meta
 
 def robust_tracker_sensor_position(pair_df: pd.DataFrame,
                                    trk: str,
@@ -538,6 +557,9 @@ def expected_trace_reduction(mu: np.ndarray, P: np.ndarray,
     """
     _, H = TargetIF._range_linearize(mu, tracker_p)
     S = float(H @ P @ H.T + R)  # scalar
+    # numerical guard: ensure strictly positive S
+    if not np.isfinite(S) or S <= 1e-12:
+        S = 1e-12
     KPH = (P @ H.T) * (1.0 / S)  # (6,1)
     P_new = P - KPH @ (H @ P)    # Joseph not needed for scalar, deterministic linearization
     return float(np.trace(P) - np.trace(P_new))
@@ -569,6 +591,7 @@ class FusionSnap:
     Ps: np.ndarray                     # (N_nodes, 6, 6) local posteriors P_i
     gt_pos: np.ndarray                 # (3,)
     los: Optional[Dict[str, float]] = None
+    exp: Optional[str] = None          # NEW: experiment id for split-aware training
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -578,7 +601,8 @@ class FusionSnap:
             "mus": self.mus.tolist(),
             "Ps": self.Ps.tolist(),
             "gt_pos": self.gt_pos.tolist(),
-            "los": None if self.los is None else {k: float(v) for k, v in self.los.items()}
+            "los": None if self.los is None else {k: float(v) for k, v in self.los.items()},
+            "exp": None if self.exp is None else str(self.exp),
         }
 
 
@@ -590,19 +614,21 @@ class SnapshotCollector:
     Saves JSONL files under the experiment out directory.
     """
     def __init__(self,
+                 exp_name: Optional[str],
                  query_timestamps: np.ndarray,
                  roles,
                  tag_map: Dict[str, List[int]],
-                 gt_T_by_robot: Dict[str, List[np.ndarray]],
-                 tag_moment_arms,
-                 base_var: float,
-                 pair_corr: float,
-                 huber_delta: float = 0.8,
-                 los_verbose: bool = False):
+                 gt_T_by_robot,
+                 tag_moment_arms=None,
+                 base_var=1.0,
+                 pair_corr=0.0,
+                 huber_delta=1.0,
+                 los_verbose=False):
         self.ts = np.asarray(query_timestamps, dtype=float)
         self.roles = roles
         self.tag_map = tag_map
         self.gt_T = gt_T_by_robot
+        self.exp_name = exp_name
         self.tag_moment_arms = tag_moment_arms
         self.base_var = float(base_var)
         self.pair_corr = float(pair_corr)
@@ -645,6 +671,7 @@ class SnapshotCollector:
             "features": feat.tolist(),
             "bias": float(z_agg - true_range),
             "meta": {
+                "exp": None if self.exp_name is None else str(self.exp_name),
                 "timestamp": t,
                 "tracker": trk,
                 "target": tgt,
@@ -666,7 +693,10 @@ class SnapshotCollector:
         Ps = np.stack([parts[k][1] for k in order], axis=0)
         gt_pos = self.gt_pos[self.roles.target][i][:3]
 
-        snap = FusionSnap(t, order, X, mus, Ps, gt_pos)
+        snap = FusionSnap(
+            timestamp=t, order=order, X=X, mus=mus, Ps=Ps, gt_pos=gt_pos,
+            los=None, exp=self.exp_name
+        )
         self._fuse_jsonl.append(snap.to_json())
 
         # ---- Persist ----
@@ -711,18 +741,142 @@ class SnapshotCollector:
         schema = {
             "node_features_layout": {
                 "0": "var_pos_trace",
-                "1": "reliability",
+                "1": "reliability", 
                 "2": "z_agg_center",
                 "3": "R_eff",
                 "4": "geom_ez_abs",
                 "5": "los_score",
                 "6": "gate_sigma",
-                "7": "nis_ema"
+                "7": "nis_ema",
+                "8": "R_pair",
+                "9": "m_eff",
+                "10": "iqr"
             },
-            "description": "Per-node feature indices used for FusionNet training",
+            "description": "Per-node feature indices used for FusionNet training (enhanced with tag-pair stats)",
         }
         with open(os.path.join(out_dir, "fusion_schema.json"), "w") as f:
             json.dump(schema, f, indent=2)
+
+
+### train_fusionnet_old.py
+# swarm_ml/train_fusionnet.py
+import argparse, os, json, random
+import numpy as np, torch
+from torch.utils.data import Dataset, DataLoader
+from .models import FusionNet
+
+def _ci_fuse_torch(parts, w):
+    """
+    Torch implementation of CI fusion for differentiable training.
+
+    parts: dict[id] -> (mu_i (6,), P_i (6,6)) numpy arrays
+    w: torch.Tensor shape (N,) softmax weights
+    Returns: (mu_fused (6,), P_fused (6,6)) torch tensors
+    """
+    keys = list(parts.keys())
+    J_sum = None
+    h_sum = None
+    for i, rid in enumerate(keys):
+        mu_i_np, P_i_np = parts[rid]
+        mu_i = torch.tensor(mu_i_np, dtype=torch.float32)
+        P_i = torch.tensor(P_i_np, dtype=torch.float32)
+        # Numerical jitter for stability
+        P_i = P_i + torch.eye(P_i.shape[0], dtype=torch.float32) * 1e-6
+        J_i = torch.inverse(P_i)
+        h_i = J_i @ mu_i
+        wi = w[i]
+        if J_sum is None:
+            J_sum = wi * J_i
+            h_sum = wi * h_i
+        else:
+            J_sum = J_sum + wi * J_i
+            h_sum = h_sum + wi * h_i
+    P = torch.inverse(J_sum)
+    mu = P @ h_sum
+    return mu, P
+
+class FusionSnapDataset(Dataset):
+    """
+    Each sample contains:
+      - X: (N_nodes, d) per-tracker node features
+      - gt_pos: (3,) target 3D position (ground truth) at that time
+      - parts: dict of (mu_i, P_i) local posteriors
+    """
+    def __init__(self, snaps):
+        self.snaps = snaps
+
+    def __len__(self): return len(self.snaps)
+    def __getitem__(self, i): return self.snaps[i]
+
+def train_fusionnet(train_snaps, val_snaps, in_dim, out_dir, lr=1e-3, epochs=20, batch_size=64, seed=0):
+    torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
+    model = FusionNet(in_dim=in_dim)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    
+    # Separate datasets for training and validation
+    tr_ds = FusionSnapDataset(train_snaps)
+    va_ds = FusionSnapDataset(val_snaps)
+    tr_dl = DataLoader(tr_ds, batch_size=batch_size, shuffle=True, collate_fn=lambda b: b)
+    va_dl = DataLoader(va_ds, batch_size=batch_size, shuffle=False, collate_fn=lambda b: b)
+
+    best_val = 1e9
+    os.makedirs(out_dir, exist_ok=True)
+    
+    for ep in range(epochs):
+        # Training phase
+        model.train()
+        tot = 0.0; cnt = 0
+        for batch in tr_dl:
+            loss = 0.0
+            for snap in batch:
+                X = torch.tensor(snap["X"], dtype=torch.float32)      # (N,d)
+                y = torch.tensor(snap["gt_pos"], dtype=torch.float32) # (3,)
+                w = model(X)                                          # (N,)
+                mu_fused, P_fused = _ci_fuse_torch(snap["parts"], w)
+                e = mu_fused[:3] - y
+                P3 = P_fused[:3, :3] + torch.eye(3, dtype=torch.float32) * 1e-6
+                # Gaussian NLL: (e^T P^{-1} e) + logdet(P)
+                maha = (e.unsqueeze(0) @ torch.linalg.solve(P3, e.unsqueeze(1))).squeeze()
+                _, logdet = torch.slogdet(P3)
+                nll = maha + logdet
+                # Encourage non-degenerate weights
+                entropy = -(w * torch.log(w + 1e-8)).sum()
+                loss = loss + (nll - 0.01 * entropy)
+            loss = loss / len(batch)
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            tot += loss.item(); cnt += 1
+        tr_avg = tot / max(cnt, 1)
+
+        # Validation phase
+        model.eval()
+        val_tot = 0.0; val_cnt = 0
+        with torch.no_grad():
+            for batch in va_dl:
+                for snap in batch:
+                    X = torch.tensor(snap["X"], dtype=torch.float32)
+                    y = torch.tensor(snap["gt_pos"], dtype=torch.float32)
+                    w = model(X)
+                    mu_fused, P_fused = _ci_fuse_torch(snap["parts"], w)
+                    e = mu_fused[:3] - y
+                    P3 = P_fused[:3, :3] + torch.eye(3, dtype=torch.float32) * 1e-6
+                    maha = (e.unsqueeze(0) @ torch.linalg.solve(P3, e.unsqueeze(1))).squeeze()
+                    _, logdet = torch.slogdet(P3)
+                    val_tot += float(maha + logdet)
+                    val_cnt += 1
+        va_avg = val_tot / max(val_cnt, 1)
+
+        print(f"[ep {ep+1:03d}] train_nll={tr_avg:.4f}  val_nll={va_avg:.4f}")
+        
+        if va_avg < best_val:
+            best_val = va_avg
+            torch.save(model.state_dict(), os.path.join(out_dir, "fusionnet.pt"))
+
+    with open(os.path.join(out_dir, "fusionnet_meta.json"), "w") as f:
+        json.dump({"in_dim": in_dim}, f, indent=2)
+    return model
 
 
 ### features.py
@@ -963,11 +1117,13 @@ def get_roles(exp_name: str,
 
 ### train_fusionnet_cli.py
 # swarm_ml/train_fusionnet_cli.py
-import argparse, json, os, gzip
+import argparse, json, os, gzip, random
 import numpy as np
+import math
 from typing import List, Dict, Any
 from .train_fusionnet import train_fusionnet
 
+import numpy as np
 def _open_any(path: str):
     """
     Open either plain JSONL or GZ; auto-fallback across .jsonl <-> .jsonl.gz
@@ -988,12 +1144,15 @@ def load_fusion_snaps_jsonl(path: str):
             if not line:
                 continue
             obj = json.loads(line)
+            # Optional meta for split-aware training
+            ts = float(obj.get("timestamp", np.nan)) if "timestamp" in obj else np.nan
+            exp = obj.get("exp", None)
             X = np.asarray(obj["X"], dtype=float)
             mus = np.asarray(obj["mus"], dtype=float)
             Ps = np.asarray(obj["Ps"], dtype=float)
             gt = np.asarray(obj["gt_pos"], dtype=float)
             parts = {rid: (mus[i].copy(), Ps[i].copy()) for i, rid in enumerate(obj["order"]) }
-            snaps.append({"X": X, "parts": parts, "gt_pos": gt})
+            snaps.append({"X": X, "parts": parts, "gt_pos": gt, "timestamp": ts, "exp": exp})
     return snaps
 
 if __name__ == "__main__":
@@ -1003,24 +1162,66 @@ if __name__ == "__main__":
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--patience", type=int, default=5, help="Early-stop patience on val_nll")
+    p.add_argument("--resume_from", type=str, default=None, help="Optional directory with fusionnet.pt/meta to resume from")
+    p.add_argument("--split_mode", choices=["random","by_time","by_exp"], default="random")
+    p.add_argument("--val_exps", type=str, default=None, help="Comma-separated experiment ids to hold out when --split_mode=by_exp")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
     snaps = load_fusion_snaps_jsonl(args.snaps)
     print(f"[CLI] Loaded {len(snaps):,} fusion snaps from {os.path.abspath(args.snaps)}")
     assert len(snaps) > 0, "No fusion snaps found (file exists but contained zero lines)."
+    try:
+        n_nodes = [int(np.asarray(s['X']).shape[0]) for s in snaps]
+        print(f"[CLI] nodes/snap: mean={np.mean(n_nodes):.1f}  median={np.median(n_nodes):.0f}  "
+              f"min={np.min(n_nodes)}  max={np.max(n_nodes)}")
+    except Exception:
+        pass
 
-    in_dim = int(snaps[0]["X"].shape[1])
+    random.seed(args.seed)
+
+    # Split helpers
+    def _split_random(ss):
+        ss2 = ss[:]; random.shuffle(ss2)
+        n_val = max(1, int(0.2 * len(ss2)))
+        return ss2[n_val:], ss2[:n_val]
+    def _split_time(ss):
+        ss2 = sorted(ss, key=lambda s: float(s.get("timestamp", np.nan)))
+        n_val = max(1, int(0.2 * len(ss2)))
+        return ss2[:-n_val], ss2[-n_val:]
+    def _split_exp(ss):
+        val_exps = set([s.strip() for s in args.val_exps.split(",")]) if args.val_exps else set()
+        if not val_exps:
+            exps = sorted(set(s.get("exp", None) for s in ss))
+            random.shuffle(exps)
+            val_exps = set(exps[:max(1, int(round(0.2*len(exps))))])
+        tr = [s for s in ss if s.get("exp", None) not in val_exps]
+        va = [s for s in ss if s.get("exp", None) in val_exps]
+        return tr, va
+
+    if args.split_mode == "by_time":
+        train_snaps, val_snaps = _split_time(snaps)
+    elif args.split_mode == "by_exp":
+        train_snaps, val_snaps = _split_exp(snaps)
+    else:
+        train_snaps, val_snaps = _split_random(snaps)
+
+    in_dim = int(train_snaps[0]["X"].shape[1])
+    print(f"[CLI] split: train={len(train_snaps)}  val={len(val_snaps)}  in_dim={in_dim}")
     model = train_fusionnet(
-        snaps=snaps,
+        train_snaps=train_snaps,
+        val_snaps=val_snaps,
         in_dim=in_dim,
         out_dir=args.out,
         lr=args.lr,
         epochs=args.epochs,
         batch_size=args.batch_size,
-        seed=args.seed
+        seed=args.seed,
+        patience=args.patience,
+        resume_dir=args.resume_from
     )
-    print(f"[OK] FusionNet trained. Artifacts in: {args.out}")
+    print(f"[OK] FusionNet trained. Artifacts in: {os.path.abspath(args.out)}")
 
 
 ### target_init.py
@@ -1119,6 +1320,7 @@ from numpy.linalg import inv
 class CIFuserConfig:
     objective: str = "logdet"   # "logdet" or "trace"
     grid_step: float = 0.1      # weight grid for small N; safe & reproducible
+    max_grid_points: int = 5000 # safety cap for simplex grid size
 
 class CIFuser:
     """
@@ -1158,13 +1360,20 @@ class CIFuser:
         return {k: w for k in keys}
 
     @staticmethod
-    def _simplex_grid(n: int, step: float) -> np.ndarray:
+    def _simplex_grid(n: int, step: float, max_points: int = 5000) -> np.ndarray:
         """
         Generate simplex points of dimension n that sum to 1 with given step.
         """
         if n == 1:
             return np.array([[1.0]])
         levels = int(round(1.0 / step))
+        # Cap grid size: number of lattice points on simplex = C(levels + n - 1, n - 1)
+        def ncr(a, b):
+            from math import comb
+            return comb(int(a), int(b))
+        while n > 1 and ncr(levels + n - 1, n - 1) > max_points and levels > 1:
+            # coarsen the grid
+            levels = max(1, levels // 2)
         grids = []
         def rec(prefix, remain, depth):
             if depth == n-1:
@@ -1173,7 +1382,7 @@ class CIFuser:
             for i in range(remain+1):
                 rec(prefix + [i], remain - i, depth + 1)
         rec([], levels, 0)
-        arr = np.array(grids, dtype=float) / levels
+        arr = np.array(grids, dtype=float) / max(1, levels)
         return arr
 
     def _objective(self, P: np.ndarray) -> float:
@@ -1208,7 +1417,7 @@ class CIFuser:
             return mu, P, w
 
         # Grid-search CI weights (robust and dependency-free)
-        grid = self._simplex_grid(len(keys), self.cfg.grid_step)
+        grid = self._simplex_grid(len(keys), self.cfg.grid_step, self.cfg.max_grid_points)
         best_val = np.inf
         best_w = None
         best_mu, best_P = None, None
@@ -1230,6 +1439,7 @@ class CIFuser:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional, Sequence
 
 class BiasNet(nn.Module):
     """
@@ -1263,15 +1473,37 @@ class FusionNet(nn.Module):
     """
     def __init__(self, in_dim: int, hidden: int = 64):
         super().__init__()
+        self.in_dim = int(in_dim)
         self.enc = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
+            nn.Dropout(p=0.10),
             nn.ReLU()
         )
         self.score = nn.Linear(hidden, 1)
+        # Optional feature normalization (populated during training or by loader)
+        self.register_buffer("x_mu",  torch.zeros(1, in_dim))
+        self.register_buffer("x_std", torch.ones(1,  in_dim))
+        self._use_norm = False
+
+    def set_normalizer(self, mu: Sequence[float], std: Sequence[float]) -> None:
+        """
+        Install per-feature mean/std so training-time normalization is reproduced at inference.
+        """
+        mu = torch.as_tensor(mu, dtype=torch.float32).reshape(1, -1)
+        std = torch.as_tensor(std, dtype=torch.float32).reshape(1, -1)
+        std = torch.clamp(std, min=1e-6)
+        if mu.shape[1] != self.in_dim or std.shape[1] != self.in_dim:
+            raise ValueError(f"Normalizer dim mismatch: expected {self.in_dim}, got {mu.shape[1]}")
+        with torch.no_grad():
+            self.x_mu.copy_(mu)
+            self.x_std.copy_(std)
+        self._use_norm = True
 
     def forward(self, X):  # X: (N_nodes, d)
+        if self._use_norm:
+            X = (X - self.x_mu) / self.x_std
         H = self.enc(X)                   # (N,h)
         s = self.score(H).squeeze(-1)     # (N,)
         w = F.softmax(s, dim=0)           # (N,)
@@ -1297,10 +1529,11 @@ class FusionNet(nn.Module):
 
 ### train_fusionnet.py
 # swarm_ml/train_fusionnet.py
-import argparse, os, json
+import argparse, os, json, random
 import numpy as np, torch
 from torch.utils.data import Dataset, DataLoader
 from .models import FusionNet
+import math
 
 def _ci_fuse_torch(parts, w):
     """
@@ -1328,36 +1561,180 @@ def _ci_fuse_torch(parts, w):
         else:
             J_sum = J_sum + wi * J_i
             h_sum = h_sum + wi * h_i
-    P = torch.inverse(J_sum)
-    mu = P @ h_sum
-    return mu, P
+    # Final fusion
+    P_fused = torch.inverse(J_sum)
+    mu_fused = P_fused @ h_sum
+    return mu_fused, P_fused
 
 class FusionSnapDataset(Dataset):
     """
-    Each sample contains:
-      - X: (N_nodes, d) per-tracker node features
-      - gt_pos: (3,) target 3D position (ground truth) at that time
-      - parts: dict of (mu_i, P_i) local posteriors
+    PyTorch dataset for fusion snapshots.
+    Each snapshot contains features X, parts dict, and gt_pos.
     """
     def __init__(self, snaps):
         self.snaps = snaps
-
     def __len__(self): return len(self.snaps)
     def __getitem__(self, i): return self.snaps[i]
 
-def train_fusionnet(snaps, in_dim, out_dir, lr=1e-3, epochs=20, batch_size=64, seed=0, fuser=None):
-    torch.manual_seed(seed)
-    model = FusionNet(in_dim=in_dim)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr)
-    ds = FusionSnapDataset(snaps)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, collate_fn=lambda b: b)
+def _stack_all_X(snaps, in_dim):
+    Xs = []
+    for s in snaps:
+        X = np.asarray(s["X"], dtype=float)
+        X = X.reshape(-1, in_dim)
+        Xs.append(X)
+    return np.vstack(Xs) if Xs else np.zeros((0, in_dim), dtype=float)
 
-    best = 1e9
+def _pearson(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Lightweight Pearson r without SciPy; safe for tiny variance."""
+    a = a.detach().float(); b = b.detach().float()
+    a = a - a.mean(); b = b - b.mean()
+    denom = (a.std(unbiased=False) * b.std(unbiased=False)).item()
+    if not math.isfinite(denom) or denom <= 1e-12:
+        return float('nan')
+    return float((a * b).mean().item() / denom)
+
+def _weight_metrics(w: torch.Tensor, X: torch.Tensor | None) -> dict:
+    """
+    Return entropy (normalized to log(N)), HHI (∑w²), w_max, and
+    correlations with a few canonical features if present:
+      - reliability (idx=1), nis_ema (idx=7), var_pos_trace (idx=0)
+    """
+    N = max(1, int(w.shape[0]))
+    ent = float((-(w * torch.log(w + 1e-9)).sum()).item())
+    ent_norm = float(ent / max(1.0, math.log(N)))                 # ∈[0,1] where 1=uniform
+    hhi = float((w * w).sum().item())                             # ∈[1/N,1], larger=w concentrated
+    wmax = float(w.max().item())
+    out = {"ent_norm": ent_norm, "hhi": hhi, "w_max": wmax}
+    if X is not None and X.ndim == 2:
+        try:
+            if X.shape[1] > 1:  out["corr_rel"]     = _pearson(w, X[:, 1])   # reliability
+            if X.shape[1] > 7:  out["corr_nis"]     = _pearson(w, X[:, 7])   # nis_ema
+            if X.shape[1] > 0:  out["corr_varpos"]  = _pearson(w, X[:, 0])   # var_pos_trace
+        except Exception:
+            pass
+    return out
+
+def _epoch_nll(model, loader):
+    """
+    Validation pass with extra diagnostics:
+      returns (avg_nll, stats_dict)
+    """
+    model.eval()
+    nll_tot = 0.0; n = 0
+    # accumulators for diagnostics
+    acc = {"ent_norm": 0.0, "hhi": 0.0, "w_max": 0.0,
+           "maha": 0.0, "logdet": 0.0,
+           "corr_rel": 0.0, "corr_nis": 0.0, "corr_varpos": 0.0,
+           "cnt": 0, "corr_cnt": 0}
+    with torch.no_grad():
+        for batch in loader:
+            for snap in batch:
+                X = torch.tensor(snap["X"], dtype=torch.float32)      # (N,d)
+                y = torch.tensor(snap["gt_pos"], dtype=torch.float32) # (3,)
+                w = model(X)                                          # (N,)
+                mu_fused, P_fused = _ci_fuse_torch(snap["parts"], w)
+                e = mu_fused[:3] - y
+                P3 = P_fused[:3, :3] + torch.eye(3, dtype=torch.float32) * 1e-6
+                maha = (e.unsqueeze(0) @ torch.linalg.solve(P3, e.unsqueeze(1))).squeeze()
+                _, logdet = torch.slogdet(P3)
+                nll = float(maha + logdet)
+                nll_tot += nll; n += 1
+                # weight stats
+                m = _weight_metrics(w, X)
+                acc["ent_norm"] += m["ent_norm"]; acc["hhi"] += m["hhi"]; acc["w_max"] += m["w_max"]
+                acc["maha"] += float(maha); acc["logdet"] += float(logdet)
+                acc["cnt"] += 1
+                # correlations (may be NaN if feature missing)
+                for k in ("corr_rel","corr_nis","corr_varpos"):
+                    if k in m and math.isfinite(m[k]):
+                        acc[k] += m[k]; acc["corr_cnt"] += 1
+    stats = {
+        "w_ent_norm": acc["ent_norm"] / max(1, acc["cnt"]),
+        "w_hhi":      acc["hhi"]      / max(1, acc["cnt"]),
+        "w_max":      acc["w_max"]    / max(1, acc["cnt"]),
+        "maha":       acc["maha"]     / max(1, acc["cnt"]),
+        "logdet":     acc["logdet"]   / max(1, acc["cnt"]),
+    }
+    if acc["corr_cnt"] > 0:
+        stats["corr_rel"]     = acc["corr_rel"]    / acc["corr_cnt"]
+        stats["corr_nis"]     = acc["corr_nis"]    / acc["corr_cnt"]
+        stats["corr_varpos"]  = acc["corr_varpos"] / acc["corr_cnt"]
+    return (nll_tot / max(n, 1)), stats
+
+def train_fusionnet(
+    train_snaps,
+    val_snaps,
+    in_dim,
+    out_dir,
+    epochs=50,
+    lr=3e-4,
+    batch_size=512,
+    seed=42,
+    patience=5,
+    resume_dir=None,
+):
+    def _grad_global_norm(m: torch.nn.Module) -> float:
+        tot = 0.0
+        for p in m.parameters():
+            if p.grad is not None:
+                g = p.grad.detach().float()
+                tot += float(torch.sum(g*g).item())
+        return float(math.sqrt(max(0.0, tot)))
+
+    torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
     os.makedirs(out_dir, exist_ok=True)
+
+    model = FusionNet(in_dim)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=3, verbose=False)
+
+    # normalization from train set
+    X_train = _stack_all_X(train_snaps, in_dim)
+    if X_train.shape[0] > 0:
+        mu = X_train.mean(axis=0)
+        sd = X_train.std(axis=0)
+        sd[sd < 1e-6] = 1.0
+        model.set_normalizer(mu, sd)
+        print(f"[norm] feature_mean[min,max]=({mu.min():.3f},{mu.max():.3f}) "
+              f"feature_std[min,max]=({sd.min():.3f},{sd.max():.3f})")
+
+    # --- Resume (optional) ---
+    if resume_dir is not None:
+        try:
+            state = torch.load(os.path.join(resume_dir, "fusionnet.pt"), map_location="cpu")
+            model.load_state_dict(state, strict=False)
+            # Load normalizer if available
+            meta_p = os.path.join(resume_dir, "fusionnet_meta.json")
+            if os.path.exists(meta_p):
+                with open(meta_p, "r") as f:
+                    meta = json.load(f)
+                if "x_mu" in meta and "x_std" in meta:
+                    model.set_normalizer(meta["x_mu"], meta["x_std"])
+            print(f"[resume] Loaded weights from {resume_dir}")
+        except Exception as e:
+            print(f"[resume] Warning: could not resume from {resume_dir}: {e}")
+
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=3, verbose=False)
+
+    tr_ds = FusionSnapDataset(train_snaps)
+    va_ds = FusionSnapDataset(val_snaps)
+    tr_dl = DataLoader(tr_ds, batch_size=batch_size, shuffle=True,  collate_fn=lambda b: b)
+    va_dl = DataLoader(va_ds, batch_size=batch_size, shuffle=False, collate_fn=lambda b: b)
+
+    best_val = 1e9
+    best_ep = -1
+    bad = 0
+
     for ep in range(epochs):
         model.train()
         tot = 0.0; cnt = 0
-        for batch in dl:
+        # epoch accumulators for diagnostics
+        acc = {"ent_norm": 0.0, "hhi": 0.0, "w_max": 0.0,
+               "maha": 0.0, "logdet": 0.0, "g_norm": 0.0,
+               "corr_rel": 0.0, "corr_nis": 0.0, "corr_varpos": 0.0,
+               "cnt": 0, "corr_cnt": 0}
+        for batch in tr_dl:
             loss = 0.0
             for snap in batch:
                 X = torch.tensor(snap["X"], dtype=torch.float32)      # (N,d)
@@ -1366,31 +1743,77 @@ def train_fusionnet(snaps, in_dim, out_dir, lr=1e-3, epochs=20, batch_size=64, s
                 mu_fused, P_fused = _ci_fuse_torch(snap["parts"], w)
                 e = mu_fused[:3] - y
                 P3 = P_fused[:3, :3] + torch.eye(3, dtype=torch.float32) * 1e-6
-                # Gaussian NLL: (e^T P^{-1} e) + logdet(P)
                 maha = (e.unsqueeze(0) @ torch.linalg.solve(P3, e.unsqueeze(1))).squeeze()
                 _, logdet = torch.slogdet(P3)
                 nll = maha + logdet
-                # Encourage non-degenerate weights
                 entropy = -(w * torch.log(w + 1e-8)).sum()
                 loss = loss + (nll - 0.01 * entropy)
+                # accumulate diagnostics (per-snap)
+                m = _weight_metrics(w, X)
+                acc["ent_norm"] += m["ent_norm"]; acc["hhi"] += m["hhi"]; acc["w_max"] += m["w_max"]
+                acc["maha"] += float(maha); acc["logdet"] += float(logdet); acc["cnt"] += 1
+                for k in ("corr_rel","corr_nis","corr_varpos"):
+                    if k in m and math.isfinite(m[k]):
+                        acc[k] += m[k]; acc["corr_cnt"] += 1
             loss = loss / len(batch)
-
             opt.zero_grad()
             loss.backward()
+            # gradient norm BEFORE clipping (health)
+            acc["g_norm"] += _grad_global_norm(model)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             opt.step()
-
             tot += loss.item(); cnt += 1
+        tr_avg = tot / max(cnt, 1)
 
-        avg = tot / max(cnt, 1)
-        print(f"[ep {ep+1:03d}] train_nll={avg:.4f}")
-        if avg < best:
-            best = avg
+        va_avg, va_stats = _epoch_nll(model, va_dl)
+        sched.step(va_avg)
+        # finalize train stats
+        tr_stats = {
+            "w_ent_norm": acc["ent_norm"] / max(1, acc["cnt"]),
+            "w_hhi":      acc["hhi"]      / max(1, acc["cnt"]),
+            "w_max":      acc["w_max"]    / max(1, acc["cnt"]),
+            "maha":       acc["maha"]     / max(1, acc["cnt"]),
+            "logdet":     acc["logdet"]   / max(1, acc["cnt"]),
+            "g_norm":     acc["g_norm"]   / max(1, cnt),
+        }
+        if acc["corr_cnt"] > 0:
+            tr_stats["corr_rel"]    = acc["corr_rel"]    / acc["corr_cnt"]
+            tr_stats["corr_nis"]    = acc["corr_nis"]    / acc["corr_cnt"]
+            tr_stats["corr_varpos"] = acc["corr_varpos"] / acc["corr_cnt"]
+
+        # pretty print one compact, information-dense line
+        lr_now = opt.param_groups[0]['lr']
+        def g(d, k): return float(d.get(k, float('nan')))
+        print(
+            f"[ep {ep+1:03d}] "
+            f"train_nll={tr_avg:.4f}  val_nll={va_avg:.4f}  lr={lr_now:.2e} | "
+            f"w(ent_norm)={g(tr_stats,'w_ent_norm'):.2f}/{g(va_stats,'w_ent_norm'):.2f}  "
+            f"w(HHI)={g(tr_stats,'w_hhi'):.3f}/{g(va_stats,'w_hhi'):.3f}  "
+            f"w_max={g(tr_stats,'w_max'):.2f}/{g(va_stats,'w_max'):.2f} | "
+            f"corr[w,rel]={g(tr_stats,'corr_rel'):.2f}/{g(va_stats,'corr_rel'):.2f}  "
+            f"corr[w,nis]={g(tr_stats,'corr_nis'):.2f}/{g(va_stats,'corr_nis'):.2f}  "
+            f"corr[w,var]={g(tr_stats,'corr_varpos'):.2f}/{g(va_stats,'corr_varpos'):.2f} | "
+            f"maha={g(tr_stats,'maha'):.3f}/{g(va_stats,'maha'):.3f}  "
+            f"logdet={g(tr_stats,'logdet'):.3f}/{g(va_stats,'logdet'):.3f}  "
+            f"||grad||={g(tr_stats,'g_norm'):.2e}"
+        )
+
+        if va_avg + 1e-6 < best_val:
+            best_val = va_avg; best_ep = ep; bad = 0
             torch.save(model.state_dict(), os.path.join(out_dir, "fusionnet.pt"))
+            with open(os.path.join(out_dir, "fusionnet_meta.json"), "w") as f:
+                json.dump({"in_dim": in_dim, "x_mu": model.x_mu.squeeze(0).tolist(), "x_std": model.x_std.squeeze(0).tolist()}, f, indent=2)
+        else:
+            bad += 1
+            if bad >= patience:
+                print(f"[early-stop] no val improvement for {patience} epochs (best ep {best_ep+1})")
+                break
 
-    with open(os.path.join(out_dir, "fusionnet_meta.json"), "w") as f:
-        json.dump({"in_dim": in_dim}, f, indent=2)
+    # Save final meta even if no improvement (keeps normalizer available)
+    if not os.path.exists(os.path.join(out_dir, "fusionnet_meta.json")):
+        with open(os.path.join(out_dir, "fusionnet_meta.json"), "w") as f:
+            json.dump({"in_dim": in_dim, "x_mu": model.x_mu.squeeze(0).tolist(), "x_std": model.x_std.squeeze(0).tolist()}, f, indent=2)
     return model
-
 
 ### online_tuner.py
 #/swarm_ml/online_tuner.py
@@ -1455,13 +1878,33 @@ class OnlineTuner:
         # Global process noise scales (apply to all trackers/target model)
         self._q_scale_xy: float = 1.0
         self._q_scale_z: float = 1.0
+        # Compute a baseline gate sigma that matches the target acceptance for χ²(1):
+        # Find σ such that P(χ²₁ ≤ σ²) = gate_target_accept ⇒ erf(σ/√2) = p.
+        self._gate_sigma_default: float = self._sigma_for_accept(self.cfg.gate_target_accept)
+
+    @staticmethod
+    def _sigma_for_accept(p: float, iters: int = 12) -> float:
+        """
+        Solve erf(σ/√2) = p for σ using Newton iterations (no SciPy dependency).
+        Valid for 0<p<1. Monotone, well-behaved.
+        """
+        p = float(np.clip(p, 1e-6, 1.0 - 1e-6))
+        import math
+        s = 2.0  # initial guess (~95% acceptance)
+        for _ in range(iters):
+            f = math.erf(s / math.sqrt(2.0)) - p
+            df = math.sqrt(2.0 / math.pi) * math.exp(-0.5 * s * s)
+            s = s - f / max(df, 1e-9)
+            s = float(np.clip(s, 0.1, 6.0))
+        return float(s)
 
     # ---------- public API ----------
     def get_r_scale(self, link: Link) -> float:
         return float(self._r_scale.get(link, 1.0))
 
     def get_gate_sigma(self, link: Link) -> float:
-        return float(self._gate_sigma.get(link, self.cfg.gate_sigma_init))
+        # Default to the acceptance-calibrated sigma if not yet adapted.
+        return float(self._gate_sigma.get(link, self._gate_sigma_default))
 
     def get_q_scales(self) -> Tuple[float, float]:
         return float(self._q_scale_xy), float(self._q_scale_z)
@@ -1597,7 +2040,13 @@ def nees(traj_mu: np.ndarray, traj_P: np.ndarray, gt: np.ndarray) -> float:
     for k in range(N):
         e = (traj_mu[k, :3] - gt[k, :3]).reshape(3, 1)
         Pk = traj_P[k, :3, :3]
-        s += float(e.T @ np.linalg.inv(Pk) @ e)
+        # numerically stable: solve instead of explicit inverse; add tiny jitter if needed
+        try:
+            u = np.linalg.solve(Pk, e)
+        except np.linalg.LinAlgError:
+            Pk = Pk + 1e-9 * np.eye(3)
+            u = np.linalg.solve(Pk, e)
+        s += float(e.T @ u)
     return s / (3*N)
 
 def save_csv(path: str, rows: list, header: list):
@@ -1608,10 +2057,25 @@ def save_csv(path: str, rows: list, header: list):
         for r in rows:
             w.writerow(r)
 
+def nees_conf_int_normal_approx(n_steps: int, d: int = 3, alpha: float = 0.05) -> tuple[float,float]:
+    """
+    For average NEES = (1/(dN)) * chi2_{dN}, mean=1, var=2/(dN).
+    Use normal approx (good for moderate/large N): 1 ± z * sqrt(2/(dN)), z≈1.96 at 95%.
+    """
+    if n_steps <= 0:
+        return (0.0, 0.0)
+    z = 1.959963984540054  # Φ^{-1}(0.975)
+    sigma = np.sqrt(2.0 / max(1, d*n_steps))
+    lo = 1.0 - z * sigma
+    hi = 1.0 + z * sigma
+    return float(lo), float(hi)
+
 def evaluate_and_save(target_mu_seq, target_P_seq, gt_target_seq, out_dir):
     rm = rmse_xyz(np.asarray(target_mu_seq)[:, :3], np.asarray(gt_target_seq)[:, :3])
     n = nees(np.asarray(target_mu_seq), np.asarray(target_P_seq), np.asarray(gt_target_seq))
-    print(f"[SWARM] Target RMSE (m): {rm}  NEES: {n:.3f}")
+    lo, hi = nees_conf_int_normal_approx(n_steps=len(target_mu_seq), d=3, alpha=0.05)
+    ok = (n >= lo) and (n <= hi)
+    print(f"[SWARM] Target RMSE (m): {rm}  NEES: {n:.3f}  95% band≈[{lo:.3f},{hi:.3f}]  {'OK' if ok else 'OUT-OF-BAND'}")
 
     # Save time series
     rows = []
@@ -1638,8 +2102,19 @@ import pandas as pd
 import inspect, os, sys, importlib.util
 
 def _load_from_fs(fname="los_classification.py") -> Optional[object]:
-    """Search current repo recursively for los_classification.py and import it."""
+    """Load LOS module from explicit path (LOS_MODULE_PATH) or search repo recursively."""
     root = os.getcwd()
+    # 1) Honor explicit environment variable
+    try:
+        env_path = os.environ.get("LOS_MODULE_PATH", None)
+        if env_path and os.path.exists(env_path):
+            spec = importlib.util.spec_from_file_location("los_classification", env_path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)  # type: ignore
+            print(f"[LOS] Loaded {fname} from explicit path: {env_path}", flush=True)
+            return mod
+    except Exception as e:
+        print(f"[LOS] Failed to load LOS module from LOS_MODULE_PATH: {e}", flush=True)
     for r, _, files in os.walk(root):
         if fname in files:
             path = os.path.join(r, fname)
@@ -1867,21 +2342,58 @@ def project_to_safe(p_self: np.ndarray, move: np.ndarray,
 
 
 ### los_classification.py
+#swarm-ml/los_classification.py
 import numpy as np
 import pandas as pd
 
 
 def _score_from_iqr(zs: np.ndarray) -> float:
-    """Map intra-timestep dispersion to a LOS probability in [0.05, 0.95]."""
+    """
+    Map intra‑timestep dispersion to a LOS probability in [0.05, 0.95].
+    Works with small m by shrinking toward 0.5 (including m=2).
+    """
     zs = np.asarray(zs, dtype=float).reshape(-1)
-    if zs.size < 5:
-        return 0.5
+    m = zs.size
+    if m < 2:
+        return 0.5  # truly too little data
+
+    # Use an "IQR-like" spread for small m as well
+    if m == 2:
+        iqr = abs(float(zs[1] - zs[0]))
+        # gentle logistic and heavy shrink so we don't overreact with 2 pts
+        k, x0 = 6.0, 0.12
+        p_raw = 1.0 / (1.0 + np.exp(k * (iqr - x0)))
+        p_raw = float(np.clip(p_raw, 0.05, 0.95))
+        shrink = 0.25  # 25% of the deviation from 0.5 when m=2
+        return 0.5 + shrink * (p_raw - 0.5)
+
+    # Use an "IQR-like" spread for small m as well
+    if m == 2:
+        iqr = abs(float(zs[1] - zs[0]))
+        # gentle logistic and heavy shrink so we don't overreact with 2 pts
+        k, x0 = 6.0, 0.12
+        p_raw = 1.0 / (1.0 + np.exp(k * (iqr - x0)))
+        p_raw = float(np.clip(p_raw, 0.05, 0.95))
+        shrink = 0.25  # 25% of the deviation from 0.5 when m=2
+        return 0.5 + shrink * (p_raw - 0.5)
+
     q25, q75 = np.percentile(zs, [25, 75])
     iqr = max(1e-6, float(q75 - q25))
-    # Logistic: small IQR -> high LOS; midpoint around 0.15 m
-    k, x0 = 8.0, 0.15
-    p = 1.0 / (1.0 + np.exp(k * (iqr - x0)))
-    return float(np.clip(p, 0.05, 0.95))
+
+    # Logistic: small IQR → high LOS; parameters slightly relaxed for small m
+    # (wider "good" region and gentler slope)
+    if m < 5:
+        k, x0 = 6.0, 0.12
+    else:
+        k, x0 = 8.0, 0.15
+
+    p_raw = 1.0 / (1.0 + np.exp(k * (iqr - x0)))
+    p_raw = float(np.clip(p_raw, 0.05, 0.95))
+
+    # Small‑sample shrinkage toward neutral so 3–4 samples don't over‑swing.
+    # m=3→33% of the deviation from 0.5, m=4→66%, m≥5→100%.
+    shrink = min(1.0, (m - 2) / 3.0)
+    return 0.5 + shrink * (p_raw - 0.5)
 
 
 def predict_los_probability(obj) -> float:
@@ -1938,6 +2450,8 @@ class AdapterConfig:
     # New: LOS/geometry influences
     los_influence: float = 0.5     # controls how strongly LOS adjusts reliability
     geom_influence: float = 0.5    # controls how strongly |e_z| adjusts reliability
+    # Ownership of innovation-driven R scaling: if False, an external tuner owns R scaling.
+    own_rscale: bool = True
 
 class MeasureAdapter:
     """
@@ -1953,6 +2467,8 @@ class MeasureAdapter:
         self._bias_ema: Dict[Tuple[str, str], float] = {}
         self._bias_beta: float = float(self.cfg.bias_beta)  # slow learn-rate for constant bias
         self._bias_clip: float = float(self.cfg.bias_clip)
+        # Ownership flag for R scaling
+        self._own_rscale: bool = bool(getattr(self.cfg, "own_rscale", True))
 
     @staticmethod
     def _sigmoid(x: float) -> float:
@@ -2028,8 +2544,9 @@ class MeasureAdapter:
         ema = self._whiten_ema.get(key, 1.0)
         ema = (1.0 - self.cfg.ema_alpha) * ema + self.cfg.ema_alpha * whiten
         self._whiten_ema[key] = ema
-        # Scale future R by current EMA
-        self._rscale[key] = float(np.clip(ema, self.cfg.min_scale, self.cfg.max_scale))
+        # Scale future R by current EMA only if this adapter owns R scaling
+        if self._own_rscale:
+            self._rscale[key] = float(np.clip(ema, self.cfg.min_scale, self.cfg.max_scale))
         # Slowly adapt online bias toward mean innovation
         b = float(self._bias_ema.get(key, 0.0))
         b = (1.0 - self._bias_beta) * b + self._bias_beta * float(innov)
@@ -2049,22 +2566,63 @@ if __name__ == "__main__":
     p.add_argument("--out", required=True, help="Output dir for model")
     p.add_argument("--val_split", type=float, default=None, help="Alias for --val_ratio")
     p.add_argument("--val_ratio", type=float, default=0.2)
+    p.add_argument("--split_mode", choices=["random","by_time","by_exp","by_tracker"], default="random")
+    p.add_argument("--val_exps", type=str, default=None, help="Comma-separated experiment ids to hold out when --split_mode=by_exp")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--batch_size", type=int, default=256)
     args = p.parse_args()
 
-    random.seed(args.seed)
+    os.makedirs(args.out, exist_ok=True)
 
     samples: List[Dict] = load_bias_samples_jsonl(args.samples)
     print(f"[CLI] Loaded {len(samples):,} bias samples from {os.path.abspath(args.samples)}")
-    random.shuffle(samples)
-    n_total = len(samples)
-    val_ratio = args.val_ratio if (args.val_split is None) else args.val_split
-    n_val = max(1, int(val_ratio * n_total))
-    val_samples = samples[:n_val]
-    train_samples = samples[n_val:]
+    random.seed(args.seed)
+
+    # ----- split helpers -----
+    def _by_time_split(ss):
+        ss_sorted = sorted(ss, key=lambda s: float(s.get("meta", {}).get("timestamp", 0.0)))
+        n_total = len(ss_sorted)
+        n_val = max(1, int((args.val_split if args.val_split is not None else args.val_ratio) * n_total))
+        return ss_sorted[:-n_val], ss_sorted[-n_val:]
+
+    def _by_exp_split(ss):
+        val_exps = set([s.strip() for s in args.val_exps.split(",")]) if args.val_exps else set()
+        if not val_exps:
+            # fallback: hash split by exp
+            exps = sorted(set(s.get("meta", {}).get("exp", "") for s in ss))
+            n_val_e = max(1, int(round(len(exps) * (args.val_split if args.val_split is not None else args.val_ratio))))
+            random.shuffle(exps)
+            val_exps = set(exps[:n_val_e])
+        val = [s for s in ss if s.get("meta", {}).get("exp", None) in val_exps]
+        tr  = [s for s in ss if s.get("meta", {}).get("exp", None) not in val_exps]
+        return tr, val
+
+    def _by_tracker_split(ss):
+        trks = sorted(set(s.get("meta", {}).get("tracker","") for s in ss))
+        n_val_t = max(1, int(round(len(trks) * (args.val_split if args.val_split is not None else args.val_ratio))))
+        random.shuffle(trks)
+        val_trks = set(trks[:n_val_t])
+        val = [s for s in ss if s.get("meta", {}).get("tracker","") in val_trks]
+        tr  = [s for s in ss if s.get("meta", {}).get("tracker","") not in val_trks]
+        return tr, val
+
+    # ----- choose split -----
+    if args.split_mode == "by_time":
+        train_samples, val_samples = _by_time_split(samples)
+    elif args.split_mode == "by_exp":
+        train_samples, val_samples = _by_exp_split(samples)
+    elif args.split_mode == "by_tracker":
+        train_samples, val_samples = _by_tracker_split(samples)
+    else:
+        # random split (reproducible)
+        samples_shuf = samples[:]
+        random.shuffle(samples_shuf)
+        n_total = len(samples_shuf)
+        n_val = max(1, int((args.val_split if args.val_split is not None else args.val_ratio) * n_total))
+        val_samples = samples_shuf[:n_val]
+        train_samples = samples_shuf[n_val:]
 
     assert len(train_samples) > 0 and len(val_samples) > 0, "Not enough samples after split"
 
@@ -2126,11 +2684,20 @@ def rts_smooth(mu_f, P_f, dts, noise: CVNoise):
     mu_s = [m.copy() for m in mu_f]
     P_s  = [S.copy() for S in P_f]
 
+    # Normalize dts: accept either length N-1 (preferred) or length N with dts[0]=0
+    dts = np.asarray(dts).reshape(-1)
+    if dts.size == N - 1:
+        def _dt_at(k): return float(dts[k])
+    elif dts.size == N:
+        def _dt_at(k): return float(dts[k+1])
+    else:
+        raise ValueError(f"dts length must be N-1 or N; got {dts.size} for N={N}")
+
     # Forward pass: store predictions
     mu_p = [None]*N
     P_p  = [None]*N
     for k in range(N-1):
-        dt = float(dts[k+1])
+        dt = _dt_at(k)
         F = F_mat(dt)
         Q = Q_mat(dt, noise)
         mu_p[k+1] = F @ mu_f[k]
@@ -2138,7 +2705,7 @@ def rts_smooth(mu_f, P_f, dts, noise: CVNoise):
 
     # Backward pass
     for k in range(N-2, -1, -1):
-        dt = float(dts[k+1])
+        dt = _dt_at(k)
         F  = F_mat(dt)
         # stable: solve instead of inverse
         # Ck = P_k F^T (P_k+1|k)^-1  ->  solve(P_p, (F @ P_f[k]).T).T
@@ -2153,14 +2720,14 @@ def rts_smooth(mu_f, P_f, dts, noise: CVNoise):
 
 ### train_biasnet.py
 # swarm_ml/train_biasnet.py
-import argparse, os, json
+import argparse, os, json, random
 import numpy as np, torch
 from torch.utils.data import DataLoader
 from .models import BiasNet
 from .datasets import BiasNetDataset
 
 def train_biasnet(train_samples, val_samples, in_dim, out_dir, lr=1e-3, epochs=30, batch_size=256, seed=0):
-    torch.manual_seed(seed)
+    torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
     model = BiasNet(in_dim=in_dim)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
 
@@ -2484,6 +3051,9 @@ class ControlBridge:
                 print(f"[CTRL] Velocity set failed for {rid}: {e._result.result}")
 
 
+### __init__.py
+# swarm_net module
+
 ### udp.py
 #swarm_net/udp.py
 from __future__ import annotations
@@ -2548,8 +3118,24 @@ import miluv.utils as utils
 # EKF models (authors')
 try:
     import examples.ekfutils.imu_three_robots_models as model
-except Exception:
-    import imu_three_robots_models as model  # local fallback
+except Exce        # This node's local measurement set: only rows originated by this robot
+        pair_df = pd.DataFrame(columns=["timestamp"])  # default empty
+        if df_t is not None and not df_t.empty:
+            df_r = df_t[df_t["robot"] == args.id]
+            if not df_r.empty:
+                pair_df = select_pair_rows(df_r, trk_tags=tag_map.get(args.id, []),
+                                           tgt_tags=tag_map.get(args.target, []))
+
+        # Optional LOS/IQR window
+        pair_df_los = pair_df
+        if args.los_window and args.los_window > 0.0:
+            t0, t1 = float(t - args.los_window), float(t + args.los_window)
+            df_win = uwb_range[(uwb_range["timestamp"] >= t0) &
+                               (uwb_range["timestamp"] <= t1) &
+                               (uwb_range["robot"] == args.id)]
+            pair_df_los = select_pair_rows(df_win,
+                                           trk_tags=tag_map.get(args.id, []),
+                                           tgt_tags=tag_map.get(args.target, []))    import imu_three_robots_models as model  # local fallback
 
 # ---- Ours ----
 from swarm_net.udp import make_tx, make_rx_nb, UdpGroup
@@ -2601,6 +3187,8 @@ def main():
     ap.add_argument("--sigma_a_z", type=float, default=0.5)
     ap.add_argument("--gate_sigma", type=float, default=3.0)
     ap.add_argument("--use_los", action="store_true")
+    ap.add_argument("--los_window", type=float, default=0.0,
+                    help="If >0, use ±this many seconds around t to compute LOS/IQR (range update still uses exact t)")
     ap.add_argument("--use_cir", action="store_true")
     ap.add_argument("--los_verbose", action="store_true")
     ap.add_argument("--biasnet_dir", default=None)
@@ -2696,9 +3284,13 @@ def main():
 
     # Measurement adaptation (BiasNet/LOS/reliability shaping)
     base_var = (args.uwb_std**2) if (args.uwb_std is not None) else args.uwb_var
-    mcfg = AdapterConfig(base_range_var=base_var,
-                         los_influence=args.los_influence,
-                         geom_influence=args.geom_influence)
+    mcfg = AdapterConfig(
+        base_range_var=base_var,
+        los_influence=args.los_influence,
+        geom_influence=args.geom_influence,
+        # If an OnlineTuner is active, delegate R scaling to it.
+        own_rscale=(not args.online_tune)
+    )
     meas_ai = MeasureAdapter(mcfg, bias_model=_load_biasnet(args.biasnet_dir))
     los_adapter = LOSAdapter(LOSConfig(use_cir=args.use_cir, verbose=args.los_verbose)) if args.use_los else None
 
@@ -2868,7 +3460,8 @@ def main():
             # LOS score first (so features match training)
             if los_adapter is not None:
                 try:
-                    s = los_adapter.score(pair_df, extras=None)
+                    # use the windowed set so m≥3 is common
+                    s = los_adapter.score(pair_df_los, extras=None)
                     if s is not None:
                         los_score = float(s)
                 except Exception:
@@ -3027,13 +3620,12 @@ from swarm_ml.features import se_translation_from_matrix
 from swarm_ml.planning import suggest_vantage_moves, suggest_vantage_moves_eig
 
 def _load_fusionnet(path_dir: str):
-    if path_dir is None:
-        return None
     import os, json, torch
     from swarm_ml.models import FusionNet
     with open(os.path.join(path_dir, "fusionnet_meta.json"), "r") as f:
         meta = json.load(f)
     in_dim = int(meta["in_dim"])
+    x_mu, x_std = meta.get("x_mu", None), meta.get("x_std", None)
     m = FusionNet(in_dim)
     state = torch.load(os.path.join(path_dir, "fusionnet.pt"), map_location="cpu")
     m.load_state_dict(state)
@@ -3043,6 +3635,12 @@ def _load_fusionnet(path_dir: str):
         m.input_dim = int(in_dim)
     except Exception:
         pass
+    # Install normalizer if available
+    try:
+        if x_mu is not None and x_std is not None:
+            m.set_normalizer(x_mu, x_std)
+    except Exception as e:
+        print(f"[LOGGER] Warning: could not set FusionNet normalizer: {e}")
     return m
 
 def main():
@@ -3329,6 +3927,9 @@ if __name__ == "__main__":
     main()
 
 
+### __init__.py
+# agents module
+
 ### swarm_batch_run.py
 # swarm_batch_run.py
 import argparse, subprocess, json, os
@@ -3377,6 +3978,30 @@ if __name__ == "__main__":
 import argparse, os, json
 import numpy as np
 import pandas as pd
+
+def load_fusionnet(path_dir: str):
+    import os, json, torch
+    from swarm_ml.models import FusionNet
+    with open(os.path.join(path_dir, "fusionnet_meta.json"), "r") as f:
+        meta = json.load(f)
+    in_dim = int(meta["in_dim"])
+    x_mu = meta.get("x_mu", None)
+    x_std = meta.get("x_std", None)
+    
+    model = FusionNet(in_dim)
+    # weights_only=True to address the FutureWarning
+    state = torch.load(os.path.join(path_dir, "fusionnet.pt"), map_location="cpu", weights_only=True)
+    model.load_state_dict(state, strict=False)
+    
+    # Reinstall normalizer (stored during training by train_fusionnet.py)
+    if x_mu is not None and x_std is not None:
+        model.set_normalizer(x_mu, x_std)
+        print(f"[SWARM] FusionNet normalizer restored: {len(x_mu)} features")
+    else:
+        print(f"[SWARM] Warning: No normalizer data found in meta.json")
+    
+    model.eval()
+    return model
 
 # ---- Authors' devkit imports (do not modify) ----
 from miluv.data import DataLoader
@@ -3452,14 +4077,14 @@ def load_biasnet(path_dir: str):
     model.eval()
     return model
 
-def load_fusionnet(path_dir: str):
+def load_fusionnet_legacy(path_dir: str):
     import json, torch
     from swarm_ml.models import FusionNet
     with open(os.path.join(path_dir, "fusionnet_meta.json"), "r") as f:
         meta = json.load(f)
     in_dim = int(meta["in_dim"])
     model = FusionNet(in_dim)
-    state = torch.load(os.path.join(path_dir, "fusionnet.pt"), map_location="cpu")
+    state = torch.load(os.path.join(path_dir, "fusionnet.pt"), map_location="cpu", weights_only=True)
     model.load_state_dict(state)
     model.eval()
     return model
@@ -3579,6 +4204,8 @@ def main(args):
         ema_alpha=args.ema_alpha,
         min_scale=args.r_min_scale,
         max_scale=args.r_max_scale,
+        # If OnlineTuner is enabled, let it own R scaling.
+        own_rscale=(not args.online_tune),
     )
     meas_ai = MeasureAdapter(mcfg)
 
@@ -3637,6 +4264,7 @@ def main(args):
     collector = None
     if args.collect_bias or args.collect_fusion:
         collector = SnapshotCollector(
+            exp_name=exp_name,
             query_timestamps=query_timestamps,
             roles=roles,
             tag_map=tag_map,
@@ -3735,12 +4363,25 @@ def main(args):
                 gate_sig = target_filters[trk].cfg.gate_N_sigma
                 nis_ema  = tuner._ema_nis.get((trk, roles.target), 1.0) if (tuner is not None) else 1.0
                 los_f    = 0.5
-                node_feats[trk] = np.array([var_pos, 0.0, 0.0, args.uwb_var, 0.0, los_f, gate_sig, nis_ema], dtype=float)
+                # Consistent 11-dimensional features (fallback values for missing pairs)
+                node_feats[trk] = np.array([
+                    var_pos,                # 0
+                    0.0,                    # 1 - reliability
+                    0.0,                    # 2 - z_agg_center  
+                    args.uwb_var,           # 3 - R_eff
+                    0.0,                    # 4 - geom_ez
+                    los_f,                  # 5 - los_score
+                    gate_sig,               # 6 - gate_sigma
+                    nis_ema,                # 7 - nis_ema
+                    args.uwb_var,           # 8 - R_pair (fallback)
+                    1.0,                    # 9 - m_eff (single fallback)
+                    0.0                     # 10 - iqr (no spread)
+                ], dtype=float)
                 info_gain_map[trk] = 0.0
                 continue
 
             # robust aggregation across all tag pairs at t
-            z_agg, R_pair, _ = robust_range_aggregate(pair_df, base_var=base_var,
+            z_agg, R_pair, meta_pairs = robust_range_aggregate(pair_df, base_var=base_var,
                                                       rho=args.pair_corr, huber_delta=args.huber_delta)
             meas_avail += 1
 
@@ -3763,10 +4404,24 @@ def main(args):
             eff_sensor_pos = sensor_pos - tgt_offset_w
             z_agg_center   = float(z_agg)
 
+            # Optional: build a time-windowed set just for LOS/IQR
+            pair_df_los = pair_df
+            if args.los_window and args.los_window > 0.0:
+                t0, t1 = float(t - args.los_window), float(t + args.los_window)
+                df_win = uwb_range[(uwb_range["timestamp"] >= t0) &
+                                   (uwb_range["timestamp"] <= t1) &
+                                   (uwb_range["robot"] == trk)]
+                pair_df_los = select_pair_rows(
+                    df_win,
+                    trk_tags=tag_map.get(trk, []),
+                    tgt_tags=tag_map.get(roles.target, [])
+                )
+
             # LOS score if enabled (compute BEFORE features to maintain train‑test parity)
             los_score = None
             if args.use_los:
-                los_score = los_adapter.score(pair_df, extras=None)
+                # use the windowed set so m≥3 is common
+                los_score = los_adapter.score(pair_df_los, extras=None)
                 if los_score is None:
                     los_misses += 1
                 else:
@@ -3865,7 +4520,28 @@ def main(args):
                     gate_sig = tuner.get_gate_sigma(link) if tuner is not None else target_filters[trk].cfg.gate_N_sigma
                     nis_ema  = tuner._ema_nis.get(link, 1.0) if (tuner is not None) else 1.0
                     los_f    = 0.5 if (los_score is None) else float(los_score)
-                    node_feats[trk] = np.array([var_pos, meta["reliability"], z_agg_center, R_eff, geom_ez, los_f, gate_sig, nis_ema], dtype=float)
+                    # Enhanced features: add tag-pair stats for better discrimination
+                    m_eff = float(meta_pairs.get("m_eff", 1.0))   # effective pairs
+                    # Prefer IQR from the windowed set if available; fall back to per‑t meta
+                    if pair_df_los is not None and not pair_df_los.empty and pair_df_los.shape[0] >= 3:
+                        zs_los = pair_df_los["range"].to_numpy(dtype=float)
+                        q25, q75 = np.percentile(zs_los, [25, 75])
+                        iqr = float(max(0.0, q75 - q25))
+                    else:
+                        iqr = float(meta_pairs.get("iqr", 0.0))     # range IQR
+                    node_feats[trk] = np.array([
+                        var_pos,                 # 0
+                        meta["reliability"],     # 1
+                        z_agg_center,            # 2
+                        R_eff,                   # 3
+                        geom_ez,                 # 4
+                        los_f,                   # 5
+                        gate_sig,                # 6
+                        nis_ema,                 # 7
+                        R_pair,                  # 8  <- new: pair variance
+                        m_eff,                   # 9  <- new: effective pairs
+                        iqr                      # 10 <- new: range IQR
+                    ], dtype=float)
                     continue
 
             # Optional: z-only height-difference correction
@@ -3910,7 +4586,28 @@ def main(args):
             gate_sig = tuner.get_gate_sigma(link) if tuner is not None else target_filters[trk].cfg.gate_N_sigma
             nis_ema  = tuner._ema_nis.get(link, 1.0) if (tuner is not None) else 1.0
             los_f    = 0.5 if (los_score is None) else float(los_score)
-            node_feats[trk] = np.array([var_pos, meta["reliability"], z_agg_center, R_eff, geom_ez, los_f, gate_sig, nis_ema], dtype=float)
+            # Enhanced features: add tag-pair stats for better discrimination
+            m_eff = float(meta_pairs.get("m_eff", 1.0))   # effective pairs
+            # Prefer IQR from the windowed set if available; fall back to per‑t meta
+            if pair_df_los is not None and not pair_df_los.empty and pair_df_los.shape[0] >= 3:
+                zs_los = pair_df_los["range"].to_numpy(dtype=float)
+                q25, q75 = np.percentile(zs_los, [25, 75])
+                iqr = float(max(0.0, q75 - q25))
+            else:
+                iqr = float(meta_pairs.get("iqr", 0.0))     # range IQR
+            node_feats[trk] = np.array([
+                var_pos,                 # 0
+                meta["reliability"],     # 1
+                z_agg_center,            # 2
+                R_eff,                   # 3
+                geom_ez,                 # 4
+                los_f,                   # 5
+                gate_sig,                # 6
+                nis_ema,                 # 7
+                R_pair,                  # 8  <- new: pair variance
+                m_eff,                   # 9  <- new: effective pairs
+                iqr                      # 10 <- new: range IQR
+            ], dtype=float)
 
         # Collect FusionNet snapshot before fusion (node features + local posteriors)
         if collector and args.collect_fusion:
@@ -3983,8 +4680,12 @@ def main(args):
                 os.makedirs(out_dir, exist_ok=True)
                 w_file = open(os.path.join(out_dir, "fusion_weights.csv"), "w", newline="")
                 w_csv = csv.writer(w_file)
-                w_csv.writerow(["timestamp"] + [f"w_{rid}" for rid in w.keys()])
-            w_csv.writerow([float(t)] + [float(w[rid]) for rid in w.keys()])
+                # Stable header across the whole run: all declared trackers
+                header = ["timestamp"] + [f"w_{rid}" for rid in roles.trackers]
+                w_csv.writerow(header)
+            # Write a stable row in the same order; NaN if not present in this fuse
+            row = [float(t)] + [float(w.get(rid, float('nan'))) for rid in roles.trackers]
+            w_csv.writerow(row)
         except Exception:
             pass
 
@@ -4110,6 +4811,8 @@ if __name__ == "__main__":
     p.add_argument("--pair_corr", type=float, default=0.7, help="Correlation between tag-pair ranges")
     p.add_argument("--huber_delta", type=float, default=0.8, help="Huber delta for per-timestep range aggregation (m)")
     p.add_argument("--use_los", action="store_true", help="Use LOS classifier to shape reliability")
+    p.add_argument("--los_window", type=float, default=0.0,
+                   help="If >0, use ±this many seconds around t to compute LOS/IQR (range update still uses exact t)")
     p.add_argument("--use_cir", action="store_true", help="If available, enable CIR for LOS classifier")
     p.add_argument("--los_verbose", action="store_true", help="Print one-time LOS adapter diagnostics")
     p.add_argument("--los_influence", type=float, default=0.2, help="Strength of LOS->reliability (0..1)")

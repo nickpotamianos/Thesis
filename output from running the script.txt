@@ -1,0 +1,676 @@
+nick@DESKTOP-ORVG1C6:~/Thesis$ cd /home/nick/Thesis && TARGETS="ifo001" ./run_fair_byexp_cv_zig.sh
+[DATASET] Eligible experiments: 10
+  - default_3_movingTriangle_0b
+  - default_3_random2_0
+  - default_3_random3_0b
+  - default_3_random3_1
+  - default_3_random3_2
+  - default_3_random_0
+  - default_3_random_0b
+  - default_3_zigzag_0
+  - default_3_zigzag_1
+  - default_3_zigzag_2
+
+[PARTITION] Non-Zigzag experiments: 7
+  - default_3_movingTriangle_0b
+  - default_3_random2_0
+  - default_3_random3_0b
+  - default_3_random3_1
+  - default_3_random3_2
+  - default_3_random_0
+  - default_3_random_0b
+[PARTITION] Zigzag experiments:     3
+  - default_3_zigzag_0
+  - default_3_zigzag_1
+  - default_3_zigzag_2
+
+[TARGETS] Will process targets: ifo001
+
+===================== NON-ZIG FOLD 1 / 7 : TEST = default_3_movingTriangle_0b =====================
+[DATASET] Building dataset at /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/datasets
+  [CACHE HIT] default_3_random2_0 (ifo001)
+  [CACHE HIT] default_3_random3_0b (ifo001)
+  [CACHE HIT] default_3_random3_1 (ifo001)
+  [CACHE HIT] default_3_random3_2 (ifo001)
+  [CACHE HIT] default_3_random_0 (ifo001)
+  [CACHE HIT] default_3_random_0b (ifo001)
+  [STATS] 21978 lines in bias_samples.jsonl
+  [STATS] 173819 lines in fusion_snaps.jsonl
+[SKIP] BiasNet models already trained -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/models
+[SKIP] FusionNet models already trained -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/models
+[EVAL] Test on default_3_movingTriangle_0b -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/eval
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+[SWARM] Target RMSE (m): {'rmse_x': 0.17379312888733336, 'rmse_y': 0.19807297748632519, 'rmse_z': 0.15631971377486165, 'rmse_3d': 0.3063866984276612}  NEES: 1.006  95% band≈[0.992,1.008]  OK
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/eval/ifo001/baseline/default_3_movingTriangle_0b_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4549
+[SWARM] Measurements used after gating : 4549
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.078, median=0.057
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/eval/ifo001/baseline/default_3_movingTriangle_0b_ifo001
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+/home/nick/Thesis/swarm_target_tracking.py:99: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu")
+[SWARM] BiasNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/models/biasnet_by_exp
+[SWARM] Target RMSE (m): {'rmse_x': 0.20671313588256426, 'rmse_y': 0.2007681823058652, 'rmse_z': 0.15624523182921868, 'rmse_3d': 0.32779682128137033}  NEES: 1.019  95% band≈[0.992,1.008]  OUT-OF-BAND
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/eval/ifo001/bn_by_exp/default_3_movingTriangle_0b_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4549
+[SWARM] Measurements used after gating : 4549
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.075, median=0.055
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/eval/ifo001/bn_by_exp/default_3_movingTriangle_0b_ifo001
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+/home/nick/Thesis/swarm_target_tracking.py:99: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu")
+[SWARM] BiasNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/models/biasnet_by_time
+[SWARM] Target RMSE (m): {'rmse_x': 0.20612294932708874, 'rmse_y': 0.20081656786408458, 'rmse_z': 0.15627248067863056, 'rmse_3d': 0.32746763563054754}  NEES: 1.020  95% band≈[0.992,1.008]  OUT-OF-BAND
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/eval/ifo001/bn_by_time/default_3_movingTriangle_0b_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4549
+[SWARM] Measurements used after gating : 4549
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.075, median=0.055
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/eval/ifo001/bn_by_time/default_3_movingTriangle_0b_ifo001
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+[SWARM] FusionNet normalizer restored: 11 features
+[SWARM] FusionNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/models/fusionnet_by_exp (CI learned weights)
+[SWARM] Target RMSE (m): {'rmse_x': 0.1666332906961719, 'rmse_y': 0.19411023705374544, 'rmse_z': 0.1588383846222444, 'rmse_3d': 0.30112301494023996}  NEES: 0.985  95% band≈[0.992,1.008]  OUT-OF-BAND
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/eval/ifo001/fn_by_exp/default_3_movingTriangle_0b_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4549
+[SWARM] Measurements used after gating : 4549
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.078, median=0.057
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/eval/ifo001/fn_by_exp/default_3_movingTriangle_0b_ifo001
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+[SWARM] FusionNet normalizer restored: 11 features
+[SWARM] FusionNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/models/fusionnet_by_time (CI learned weights)
+[SWARM] Target RMSE (m): {'rmse_x': 0.16746135981861351, 'rmse_y': 0.19320193277116116, 'rmse_z': 0.15776579025969917, 'rmse_3d': 0.30043358406656034}  NEES: 0.988  95% band≈[0.992,1.008]  OUT-OF-BAND
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/eval/ifo001/fn_by_time/default_3_movingTriangle_0b_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4549
+[SWARM] Measurements used after gating : 4549
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.078, median=0.057
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/eval/ifo001/fn_by_time/default_3_movingTriangle_0b_ifo001
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+/home/nick/Thesis/swarm_target_tracking.py:99: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu")
+[SWARM] BiasNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/models/biasnet_by_exp
+[SWARM] FusionNet normalizer restored: 11 features
+[SWARM] FusionNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/models/fusionnet_by_exp (CI learned weights)
+[SWARM] Target RMSE (m): {'rmse_x': 0.19468234938547208, 'rmse_y': 0.19709062612034375, 'rmse_z': 0.1578758201642973, 'rmse_3d': 0.3188584429794924}  NEES: 0.986  95% band≈[0.992,1.008]  OUT-OF-BAND
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/eval/ifo001/bnfn_by_exp/default_3_movingTriangle_0b_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4549
+[SWARM] Measurements used after gating : 4549
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.075, median=0.055
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/eval/ifo001/bnfn_by_exp/default_3_movingTriangle_0b_ifo001
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+/home/nick/Thesis/swarm_target_tracking.py:99: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu")
+[SWARM] BiasNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/models/biasnet_by_time
+[SWARM] FusionNet normalizer restored: 11 features
+[SWARM] FusionNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/models/fusionnet_by_time (CI learned weights)
+[SWARM] Target RMSE (m): {'rmse_x': 0.1936532963736569, 'rmse_y': 0.19516631177494534, 'rmse_z': 0.1572847802619207, 'rmse_3d': 0.3167490971577647}  NEES: 0.993  95% band≈[0.992,1.008]  OK
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/eval/ifo001/bnfn_by_time/default_3_movingTriangle_0b_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4549
+[SWARM] Measurements used after gating : 4549
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.075, median=0.055
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_1/eval/ifo001/bnfn_by_time/default_3_movingTriangle_0b_ifo001
+     rmse_x    rmse_y   rmse_z   rmse_3d      nees                                 exp
+0  0.173793  0.198073  0.15632  0.306387  1.006269  default_3_movingTriangle_0b_ifo001
+     rmse_x    rmse_y    rmse_z   rmse_3d      nees                                 exp
+0  0.206713  0.200768  0.156245  0.327797  1.019459  default_3_movingTriangle_0b_ifo001
+     rmse_x    rmse_y    rmse_z   rmse_3d      nees                                 exp
+0  0.206123  0.200817  0.156272  0.327468  1.019697  default_3_movingTriangle_0b_ifo001
+     rmse_x    rmse_y    rmse_z   rmse_3d      nees                                 exp
+0  0.194682  0.197091  0.157876  0.318858  0.985714  default_3_movingTriangle_0b_ifo001
+     rmse_x    rmse_y    rmse_z   rmse_3d      nees                                 exp
+0  0.193653  0.195166  0.157285  0.316749  0.993164  default_3_movingTriangle_0b_ifo001
+     rmse_x   rmse_y    rmse_z   rmse_3d      nees                                 exp
+0  0.166633  0.19411  0.158838  0.301123  0.985212  default_3_movingTriangle_0b_ifo001
+     rmse_x    rmse_y    rmse_z   rmse_3d      nees                                 exp
+0  0.167461  0.193202  0.157766  0.300434  0.988039  default_3_movingTriangle_0b_ifo001
+
+===================== NON-ZIG FOLD 2 / 7 : TEST = default_3_random2_0 =====================
+[DATASET] Building dataset at /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/datasets
+  [COLLECT] default_3_movingTriangle_0b (ifo001) -> /home/nick/Thesis/outputs_collect_cache/ifo001/default_3_movingTriangle_0b
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+[COLLECT] Enabled -> bias=True, fusion=True
+[COLLECT] Output directory: /home/nick/Thesis/outputs_collect_cache/ifo001/default_3_movingTriangle_0b/default_3_movingTriangle_0b_ifo001
+[SWARM] Target RMSE (m): {'rmse_x': 0.17379312888733336, 'rmse_y': 0.19807297748632519, 'rmse_z': 0.15631971377486165, 'rmse_3d': 0.3063866984276612}  NEES: 1.006  95% band≈[0.992,1.008]  OK
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_collect_cache/ifo001/default_3_movingTriangle_0b/default_3_movingTriangle_0b_ifo001/target_state.csv
+[COLLECT] bias samples: 4,549 -> /home/nick/Thesis/outputs_collect_cache/ifo001/default_3_movingTriangle_0b/default_3_movingTriangle_0b_ifo001/bias_samples.jsonl
+[COLLECT] fusion snaps: 35,543 -> /home/nick/Thesis/outputs_collect_cache/ifo001/default_3_movingTriangle_0b/default_3_movingTriangle_0b_ifo001/fusion_snaps.jsonl (+ .gz)
+[SWARM] Measurements available (trk↔tgt) : 4549
+[SWARM] Measurements used after gating : 4549
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.078, median=0.057
+[DONE] Results written to: /home/nick/Thesis/outputs_collect_cache/ifo001/default_3_movingTriangle_0b/default_3_movingTriangle_0b_ifo001
+  [CACHE HIT] default_3_random3_0b (ifo001)
+  [CACHE HIT] default_3_random3_1 (ifo001)
+  [CACHE HIT] default_3_random3_2 (ifo001)
+  [CACHE HIT] default_3_random_0 (ifo001)
+  [CACHE HIT] default_3_random_0b (ifo001)
+  [STATS] 21962 lines in bias_samples.jsonl
+  [STATS] 173643 lines in fusion_snaps.jsonl
+[TRAIN] BiasNet (by_exp/by_time) -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/models
+[CLI] Loaded 21,962 bias samples from /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/datasets/bias_samples.jsonl
+[ep 001] train=0.0251 val=0.0145
+[ep 002] train=0.0244 val=0.0147
+[ep 003] train=0.0245 val=0.0147
+[ep 004] train=0.0244 val=0.0145
+[ep 005] train=0.0244 val=0.0145
+[ep 006] train=0.0245 val=0.0157
+[ep 007] train=0.0244 val=0.0157
+[ep 008] train=0.0244 val=0.0149
+[ep 009] train=0.0244 val=0.0146
+[ep 010] train=0.0244 val=0.0147
+[ep 011] train=0.0244 val=0.0144
+[ep 012] train=0.0244 val=0.0144
+[ep 013] train=0.0244 val=0.0150
+[ep 014] train=0.0244 val=0.0146
+[ep 015] train=0.0244 val=0.0146
+[ep 016] train=0.0244 val=0.0148
+[ep 017] train=0.0244 val=0.0146
+[ep 018] train=0.0244 val=0.0143
+[ep 019] train=0.0243 val=0.0146
+[ep 020] train=0.0243 val=0.0142
+[ep 021] train=0.0244 val=0.0146
+[ep 022] train=0.0244 val=0.0147
+[ep 023] train=0.0244 val=0.0145
+[ep 024] train=0.0244 val=0.0150
+[ep 025] train=0.0244 val=0.0152
+[ep 026] train=0.0243 val=0.0145
+[ep 027] train=0.0244 val=0.0147
+[ep 028] train=0.0243 val=0.0142
+[ep 029] train=0.0244 val=0.0145
+[ep 030] train=0.0243 val=0.0145
+[OK] BiasNet trained. Artifacts in: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/models/biasnet_by_exp
+[CLI] Loaded 21,962 bias samples from /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/datasets/bias_samples.jsonl
+[ep 001] train=0.0251 val=0.0211
+[ep 002] train=0.0244 val=0.0207
+[ep 003] train=0.0244 val=0.0204
+[ep 004] train=0.0244 val=0.0208
+[ep 005] train=0.0244 val=0.0208
+[ep 006] train=0.0243 val=0.0205
+[ep 007] train=0.0243 val=0.0207
+[ep 008] train=0.0243 val=0.0215
+[ep 009] train=0.0245 val=0.0203
+[ep 010] train=0.0243 val=0.0203
+[ep 011] train=0.0245 val=0.0204
+[ep 012] train=0.0243 val=0.0205
+[ep 013] train=0.0243 val=0.0206
+[ep 014] train=0.0243 val=0.0205
+[ep 015] train=0.0243 val=0.0209
+[ep 016] train=0.0244 val=0.0205
+[ep 017] train=0.0243 val=0.0211
+[ep 018] train=0.0243 val=0.0206
+[ep 019] train=0.0244 val=0.0214
+[ep 020] train=0.0243 val=0.0205
+[ep 021] train=0.0243 val=0.0209
+[ep 022] train=0.0244 val=0.0210
+[ep 023] train=0.0244 val=0.0204
+[ep 024] train=0.0243 val=0.0213
+[ep 025] train=0.0243 val=0.0204
+[ep 026] train=0.0243 val=0.0211
+[ep 027] train=0.0243 val=0.0205
+[ep 028] train=0.0243 val=0.0206
+[ep 029] train=0.0243 val=0.0212
+[ep 030] train=0.0243 val=0.0208
+[OK] BiasNet trained. Artifacts in: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/models/biasnet_by_time
+[TRAIN] FusionNet (by_exp/by_time) -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/models
+[CLI] Loaded 173,643 fusion snaps from /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/datasets/fusion_snaps.jsonl
+[CLI] nodes/snap: mean=2.0  median=2  min=2  max=2
+[CLI] split: train=159606  val=14037  in_dim=11
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/torch/optim/lr_scheduler.py:60: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.
+  warnings.warn(
+[norm] feature_mean[min,max]=(0.000,5.547) feature_std[min,max]=(0.048,8.247)
+[ep 001] train_nll=-2.4580  val_nll=-3.7284  lr=1.00e-03 | w(ent_norm)=0.61/0.65  w(HHI)=0.571/0.539  w_max=0.64/0.59 | corr[w,rel]=-0.03/-0.04  corr[w,nis]=-0.32/-0.19  corr[w,var]=0.05/-0.05 | maha=3.447/1.881  logdet=-5.899/-5.610  ||grad||=1.75e+00
+[ep 002] train_nll=-2.6309  val_nll=-3.7396  lr=1.00e-03 | w(ent_norm)=0.60/0.64  w(HHI)=0.584/0.547  w_max=0.66/0.61 | corr[w,rel]=-0.03/-0.00  corr[w,nis]=-0.26/-0.17  corr[w,var]=0.05/-0.03 | maha=3.244/1.861  logdet=-5.869/-5.601  ||grad||=2.34e+00
+[ep 003] train_nll=-2.7044  val_nll=-3.7417  lr=1.00e-03 | w(ent_norm)=0.59/0.64  w(HHI)=0.588/0.543  w_max=0.66/0.60 | corr[w,rel]=-0.02/-0.02  corr[w,nis]=-0.23/-0.12  corr[w,var]=0.07/-0.07 | maha=3.152/1.868  logdet=-5.851/-5.610  ||grad||=2.95e+00
+[ep 004] train_nll=-2.7560  val_nll=-3.7096  lr=1.00e-03 | w(ent_norm)=0.59/0.64  w(HHI)=0.589/0.543  w_max=0.65/0.60 | corr[w,rel]=-0.02/0.00  corr[w,nis]=-0.22/-0.17  corr[w,var]=0.08/-0.03 | maha=3.092/1.904  logdet=-5.842/-5.613  ||grad||=3.13e+00
+[ep 005] train_nll=-2.7745  val_nll=-3.6968  lr=1.00e-03 | w(ent_norm)=0.59/0.63  w(HHI)=0.589/0.554  w_max=0.65/0.62 | corr[w,rel]=-0.02/-0.02  corr[w,nis]=-0.22/-0.20  corr[w,var]=0.08/-0.00 | maha=3.072/1.890  logdet=-5.841/-5.587  ||grad||=3.24e+00
+[ep 006] train_nll=-2.7821  val_nll=-3.6919  lr=1.00e-03 | w(ent_norm)=0.59/0.63  w(HHI)=0.588/0.555  w_max=0.65/0.62 | corr[w,rel]=-0.02/-0.02  corr[w,nis]=-0.22/-0.19  corr[w,var]=0.08/-0.04 | maha=3.066/1.894  logdet=-5.842/-5.586  ||grad||=3.24e+00
+[ep 007] train_nll=-2.7829  val_nll=-3.6826  lr=5.00e-04 | w(ent_norm)=0.59/0.64  w(HHI)=0.589/0.545  w_max=0.66/0.60 | corr[w,rel]=-0.02/0.01  corr[w,nis]=-0.21/-0.13  corr[w,var]=0.08/-0.03 | maha=3.062/1.925  logdet=-5.839/-5.607  ||grad||=3.25e+00
+[ep 008] train_nll=-2.8106  val_nll=-3.6831  lr=5.00e-04 | w(ent_norm)=0.59/0.63  w(HHI)=0.588/0.555  w_max=0.65/0.61 | corr[w,rel]=-0.03/0.02  corr[w,nis]=-0.20/-0.19  corr[w,var]=0.08/0.03 | maha=3.039/1.905  logdet=-5.844/-5.588  ||grad||=3.33e+00
+[early-stop] no val improvement for 5 epochs (best ep 3)
+[OK] FusionNet trained. Artifacts in: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/models/fusionnet_by_exp
+[CLI] Loaded 173,643 fusion snaps from /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/datasets/fusion_snaps.jsonl
+[CLI] nodes/snap: mean=2.0  median=2  min=2  max=2
+[CLI] split: train=138915  val=34728  in_dim=11
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/torch/optim/lr_scheduler.py:60: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.
+  warnings.warn(
+[norm] feature_mean[min,max]=(0.000,5.813) feature_std[min,max]=(0.045,8.848)
+[ep 001] train_nll=-2.5320  val_nll=-2.6004  lr=1.00e-03 | w(ent_norm)=0.63/0.60  w(HHI)=0.554/0.583  w_max=0.61/0.65 | corr[w,rel]=-0.04/-0.04  corr[w,nis]=-0.29/-0.34  corr[w,var]=0.02/0.03 | maha=3.349/3.360  logdet=-5.875/-5.961  ||grad||=1.46e+00
+[ep 002] train_nll=-2.6916  val_nll=-2.4988  lr=1.00e-03 | w(ent_norm)=0.61/0.59  w(HHI)=0.569/0.593  w_max=0.63/0.66 | corr[w,rel]=-0.03/-0.03  corr[w,nis]=-0.23/-0.08  corr[w,var]=0.01/0.19 | maha=3.155/3.414  logdet=-5.840/-5.913  ||grad||=2.08e+00
+[ep 003] train_nll=-2.8321  val_nll=-2.4469  lr=1.00e-03 | w(ent_norm)=0.60/0.57  w(HHI)=0.579/0.606  w_max=0.64/0.68 | corr[w,rel]=-0.02/-0.04  corr[w,nis]=-0.16/-0.08  corr[w,var]=0.04/0.20 | maha=2.981/3.425  logdet=-5.807/-5.872  ||grad||=2.84e+00
+[ep 004] train_nll=-2.8605  val_nll=-2.4010  lr=1.00e-03 | w(ent_norm)=0.60/0.60  w(HHI)=0.582/0.584  w_max=0.64/0.66 | corr[w,rel]=-0.02/-0.04  corr[w,nis]=-0.16/-0.03  corr[w,var]=0.03/0.19 | maha=2.941/3.516  logdet=-5.795/-5.917  ||grad||=3.16e+00
+[ep 005] train_nll=-2.8501  val_nll=-2.4180  lr=5.00e-04 | w(ent_norm)=0.60/0.58  w(HHI)=0.581/0.598  w_max=0.64/0.67 | corr[w,rel]=-0.02/-0.03  corr[w,nis]=-0.14/-0.07  corr[w,var]=0.03/0.19 | maha=2.950/3.476  logdet=-5.794/-5.894  ||grad||=3.32e+00
+[ep 006] train_nll=-2.8823  val_nll=-2.3907  lr=5.00e-04 | w(ent_norm)=0.60/0.59  w(HHI)=0.582/0.587  w_max=0.64/0.66 | corr[w,rel]=-0.03/-0.03  corr[w,nis]=-0.14/-0.05  corr[w,var]=0.04/0.20 | maha=2.914/3.524  logdet=-5.790/-5.915  ||grad||=3.32e+00
+[early-stop] no val improvement for 5 epochs (best ep 1)
+[OK] FusionNet trained. Artifacts in: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/models/fusionnet_by_time
+[EVAL] Test on default_3_random2_0 -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/eval
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+[SWARM] Target RMSE (m): {'rmse_x': 0.27595444603692765, 'rmse_y': 0.21796735845168935, 'rmse_z': 0.09893608169925883, 'rmse_3d': 0.36530668471841193}  NEES: 0.453  95% band≈[0.992,1.008]  OUT-OF-BAND
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/eval/ifo001/baseline/default_3_random2_0_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4565
+[SWARM] Measurements used after gating : 4564
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.184, median=0.171
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/eval/ifo001/baseline/default_3_random2_0_ifo001
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+/home/nick/Thesis/swarm_target_tracking.py:99: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu")
+[SWARM] BiasNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/models/biasnet_by_exp
+[SWARM] Target RMSE (m): {'rmse_x': 0.29310476691651527, 'rmse_y': 0.21774849975038718, 'rmse_z': 0.09892879492078459, 'rmse_3d': 0.3783010970076722}  NEES: 0.452  95% band≈[0.992,1.008]  OUT-OF-BAND
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/eval/ifo001/bn_by_exp/default_3_random2_0_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4565
+[SWARM] Measurements used after gating : 4564
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.182, median=0.172
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/eval/ifo001/bn_by_exp/default_3_random2_0_ifo001
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+/home/nick/Thesis/swarm_target_tracking.py:99: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu")
+[SWARM] BiasNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/models/biasnet_by_time
+[SWARM] Target RMSE (m): {'rmse_x': 0.29139897771393125, 'rmse_y': 0.21358425152456723, 'rmse_z': 0.09884983166975153, 'rmse_3d': 0.3745702683518442}  NEES: 0.451  95% band≈[0.992,1.008]  OUT-OF-BAND
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/eval/ifo001/bn_by_time/default_3_random2_0_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4565
+[SWARM] Measurements used after gating : 4564
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.183, median=0.172
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/eval/ifo001/bn_by_time/default_3_random2_0_ifo001
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+[SWARM] FusionNet normalizer restored: 11 features
+[SWARM] FusionNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/models/fusionnet_by_exp (CI learned weights)
+[SWARM] Target RMSE (m): {'rmse_x': 0.26241788081251294, 'rmse_y': 0.22006378382666747, 'rmse_z': 0.0956647025808464, 'rmse_3d': 0.35558817252844993}  NEES: 0.394  95% band≈[0.992,1.008]  OUT-OF-BAND
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/eval/ifo001/fn_by_exp/default_3_random2_0_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4565
+[SWARM] Measurements used after gating : 4564
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.184, median=0.171
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/eval/ifo001/fn_by_exp/default_3_random2_0_ifo001
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+[SWARM] FusionNet normalizer restored: 11 features
+[SWARM] FusionNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/models/fusionnet_by_time (CI learned weights)
+[SWARM] Target RMSE (m): {'rmse_x': 0.2631252411900671, 'rmse_y': 0.21726146454341178, 'rmse_z': 0.09707821138187235, 'rmse_3d': 0.35476980656755874}  NEES: 0.406  95% band≈[0.992,1.008]  OUT-OF-BAND
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/eval/ifo001/fn_by_time/default_3_random2_0_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4565
+[SWARM] Measurements used after gating : 4564
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.184, median=0.171
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/eval/ifo001/fn_by_time/default_3_random2_0_ifo001
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+/home/nick/Thesis/swarm_target_tracking.py:99: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu")
+[SWARM] BiasNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/models/biasnet_by_exp
+[SWARM] FusionNet normalizer restored: 11 features
+[SWARM] FusionNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/models/fusionnet_by_exp (CI learned weights)
+[SWARM] Target RMSE (m): {'rmse_x': 0.28007026228340937, 'rmse_y': 0.2221337873871762, 'rmse_z': 0.09534234656205855, 'rmse_3d': 0.36996342300615076}  NEES: 0.392  95% band≈[0.992,1.008]  OUT-OF-BAND
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/eval/ifo001/bnfn_by_exp/default_3_random2_0_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4565
+[SWARM] Measurements used after gating : 4564
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.183, median=0.172
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/eval/ifo001/bnfn_by_exp/default_3_random2_0_ifo001
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+/home/nick/Thesis/swarm_target_tracking.py:99: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu")
+[SWARM] BiasNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/models/biasnet_by_time
+[SWARM] FusionNet normalizer restored: 11 features
+[SWARM] FusionNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/models/fusionnet_by_time (CI learned weights)
+[SWARM] Target RMSE (m): {'rmse_x': 0.27909756411245223, 'rmse_y': 0.21312762417578276, 'rmse_z': 0.09663678575190796, 'rmse_3d': 0.3642217769996437}  NEES: 0.399  95% band≈[0.992,1.008]  OUT-OF-BAND
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/eval/ifo001/bnfn_by_time/default_3_random2_0_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4565
+[SWARM] Measurements used after gating : 4564
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.184, median=0.173
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_2/eval/ifo001/bnfn_by_time/default_3_random2_0_ifo001
+     rmse_x    rmse_y    rmse_z   rmse_3d      nees                         exp
+0  0.275954  0.217967  0.098936  0.365307  0.453394  default_3_random2_0_ifo001
+     rmse_x    rmse_y    rmse_z   rmse_3d      nees                         exp
+0  0.293105  0.217748  0.098929  0.378301  0.451601  default_3_random2_0_ifo001
+     rmse_x    rmse_y   rmse_z  rmse_3d      nees                         exp
+0  0.291399  0.213584  0.09885  0.37457  0.450845  default_3_random2_0_ifo001
+    rmse_x    rmse_y    rmse_z   rmse_3d      nees                         exp
+0  0.28007  0.222134  0.095342  0.369963  0.391688  default_3_random2_0_ifo001
+     rmse_x    rmse_y    rmse_z   rmse_3d      nees                         exp
+0  0.279098  0.213128  0.096637  0.364222  0.399314  default_3_random2_0_ifo001
+     rmse_x    rmse_y    rmse_z   rmse_3d     nees                         exp
+0  0.262418  0.220064  0.095665  0.355588  0.39388  default_3_random2_0_ifo001
+     rmse_x    rmse_y    rmse_z  rmse_3d      nees                         exp
+0  0.263125  0.217261  0.097078  0.35477  0.406454  default_3_random2_0_ifo001
+
+===================== NON-ZIG FOLD 3 / 7 : TEST = default_3_random3_0b =====================
+[DATASET] Building dataset at /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/datasets
+  [CACHE HIT] default_3_movingTriangle_0b (ifo001)
+  [CACHE HIT] default_3_random2_0 (ifo001)
+  [CACHE HIT] default_3_random3_1 (ifo001)
+  [CACHE HIT] default_3_random3_2 (ifo001)
+  [CACHE HIT] default_3_random_0 (ifo001)
+  [CACHE HIT] default_3_random_0b (ifo001)
+  [STATS] 21635 lines in bias_samples.jsonl
+  [STATS] 171021 lines in fusion_snaps.jsonl
+[TRAIN] BiasNet (by_exp/by_time) -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/models
+[CLI] Loaded 21,635 bias samples from /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/datasets/bias_samples.jsonl
+[ep 001] train=0.0245 val=0.0147
+[ep 002] train=0.0240 val=0.0144
+[ep 003] train=0.0240 val=0.0146
+[ep 004] train=0.0239 val=0.0144
+[ep 005] train=0.0239 val=0.0149
+[ep 006] train=0.0239 val=0.0145
+[ep 007] train=0.0239 val=0.0142
+[ep 008] train=0.0239 val=0.0147
+[ep 009] train=0.0239 val=0.0148
+[ep 010] train=0.0239 val=0.0142
+[ep 011] train=0.0239 val=0.0142
+[ep 012] train=0.0239 val=0.0146
+[ep 013] train=0.0239 val=0.0143
+[ep 014] train=0.0239 val=0.0152
+[ep 015] train=0.0238 val=0.0145
+[ep 016] train=0.0238 val=0.0142
+[ep 017] train=0.0238 val=0.0142
+[ep 018] train=0.0238 val=0.0148
+[ep 019] train=0.0238 val=0.0144
+[ep 020] train=0.0239 val=0.0145
+[ep 021] train=0.0239 val=0.0146
+[ep 022] train=0.0238 val=0.0142
+[ep 023] train=0.0238 val=0.0143
+[ep 024] train=0.0239 val=0.0142
+[ep 025] train=0.0238 val=0.0147
+[ep 026] train=0.0238 val=0.0146
+[ep 027] train=0.0238 val=0.0143
+[ep 028] train=0.0238 val=0.0148
+[ep 029] train=0.0238 val=0.0142
+[ep 030] train=0.0238 val=0.0143
+[OK] BiasNet trained. Artifacts in: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/models/biasnet_by_exp
+[CLI] Loaded 21,635 bias samples from /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/datasets/bias_samples.jsonl
+[ep 001] train=0.0246 val=0.0201
+[ep 002] train=0.0240 val=0.0205
+[ep 003] train=0.0238 val=0.0201
+[ep 004] train=0.0238 val=0.0207
+[ep 005] train=0.0239 val=0.0201
+[ep 006] train=0.0239 val=0.0199
+[ep 007] train=0.0239 val=0.0202
+[ep 008] train=0.0238 val=0.0204
+[ep 009] train=0.0238 val=0.0209
+[ep 010] train=0.0238 val=0.0213
+[ep 011] train=0.0238 val=0.0200
+[ep 012] train=0.0238 val=0.0200
+[ep 013] train=0.0238 val=0.0200
+[ep 014] train=0.0238 val=0.0206
+[ep 015] train=0.0238 val=0.0203
+[ep 016] train=0.0238 val=0.0202
+[ep 017] train=0.0238 val=0.0203
+[ep 018] train=0.0239 val=0.0216
+[ep 019] train=0.0238 val=0.0201
+[ep 020] train=0.0238 val=0.0209
+[ep 021] train=0.0239 val=0.0205
+[ep 022] train=0.0238 val=0.0206
+[ep 023] train=0.0238 val=0.0202
+[ep 024] train=0.0238 val=0.0201
+[ep 025] train=0.0238 val=0.0204
+[ep 026] train=0.0238 val=0.0205
+[ep 027] train=0.0237 val=0.0204
+[ep 028] train=0.0238 val=0.0205
+[ep 029] train=0.0238 val=0.0205
+[ep 030] train=0.0237 val=0.0204
+[OK] BiasNet trained. Artifacts in: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/models/biasnet_by_time
+[TRAIN] FusionNet (by_exp/by_time) -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/models
+[CLI] Loaded 171,021 fusion snaps from /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/datasets/fusion_snaps.jsonl
+[CLI] nodes/snap: mean=2.0  median=2  min=2  max=2
+[CLI] split: train=156984  val=14037  in_dim=11
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/torch/optim/lr_scheduler.py:60: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.
+  warnings.warn(
+[norm] feature_mean[min,max]=(0.000,6.029) feature_std[min,max]=(0.049,8.539)
+[ep 001] train_nll=-3.0496  val_nll=-3.7167  lr=1.00e-03 | w(ent_norm)=0.64/0.67  w(HHI)=0.547/0.522  w_max=0.60/0.57 | corr[w,rel]=-0.03/-0.05  corr[w,nis]=-0.26/-0.21  corr[w,var]=0.10/0.21 | maha=2.837/1.909  logdet=-5.880/-5.626  ||grad||=1.18e+00
+[ep 002] train_nll=-3.1006  val_nll=-3.7088  lr=1.00e-03 | w(ent_norm)=0.63/0.65  w(HHI)=0.552/0.539  w_max=0.61/0.59 | corr[w,rel]=-0.03/-0.02  corr[w,nis]=-0.21/-0.19  corr[w,var]=0.12/0.13 | maha=2.771/1.888  logdet=-5.865/-5.597  ||grad||=1.22e+00
+[ep 003] train_nll=-3.1244  val_nll=-3.6939  lr=1.00e-03 | w(ent_norm)=0.63/0.64  w(HHI)=0.554/0.542  w_max=0.61/0.59 | corr[w,rel]=-0.03/-0.03  corr[w,nis]=-0.20/-0.15  corr[w,var]=0.12/0.16 | maha=2.744/1.884  logdet=-5.862/-5.578  ||grad||=1.28e+00
+[ep 004] train_nll=-3.1324  val_nll=-3.6857  lr=1.00e-03 | w(ent_norm)=0.63/0.65  w(HHI)=0.554/0.540  w_max=0.61/0.59 | corr[w,rel]=-0.03/-0.02  corr[w,nis]=-0.19/-0.19  corr[w,var]=0.13/0.08 | maha=2.736/1.902  logdet=-5.862/-5.588  ||grad||=1.39e+00
+[ep 005] train_nll=-3.1530  val_nll=-3.6889  lr=5.00e-04 | w(ent_norm)=0.63/0.64  w(HHI)=0.554/0.547  w_max=0.62/0.60 | corr[w,rel]=-0.03/-0.03  corr[w,nis]=-0.19/-0.20  corr[w,var]=0.13/0.10 | maha=2.716/1.875  logdet=-5.862/-5.564  ||grad||=1.51e+00
+[ep 006] train_nll=-3.1598  val_nll=-3.6830  lr=5.00e-04 | w(ent_norm)=0.63/0.64  w(HHI)=0.554/0.544  w_max=0.62/0.59 | corr[w,rel]=-0.03/-0.04  corr[w,nis]=-0.18/-0.19  corr[w,var]=0.13/0.11 | maha=2.709/1.888  logdet=-5.863/-5.571  ||grad||=1.73e+00
+[early-stop] no val improvement for 5 epochs (best ep 1)
+[OK] FusionNet trained. Artifacts in: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/models/fusionnet_by_exp
+[CLI] Loaded 171,021 fusion snaps from /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/datasets/fusion_snaps.jsonl
+[CLI] nodes/snap: mean=2.0  median=2  min=2  max=2
+[CLI] split: train=136817  val=34204  in_dim=11
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/torch/optim/lr_scheduler.py:60: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.
+  warnings.warn(
+[norm] feature_mean[min,max]=(0.000,6.178) feature_std[min,max]=(0.048,8.998)
+[ep 001] train_nll=-3.1920  val_nll=-2.6106  lr=1.00e-03 | w(ent_norm)=0.66/0.64  w(HHI)=0.532/0.547  w_max=0.57/0.59 | corr[w,rel]=-0.04/-0.04  corr[w,nis]=-0.20/-0.20  corr[w,var]=0.07/-0.01 | maha=2.698/3.251  logdet=-5.883/-5.861  ||grad||=1.15e+00
+[ep 002] train_nll=-3.2337  val_nll=-2.6196  lr=1.00e-03 | w(ent_norm)=0.65/0.64  w(HHI)=0.536/0.548  w_max=0.58/0.60 | corr[w,rel]=-0.04/-0.05  corr[w,nis]=-0.14/-0.17  corr[w,var]=0.09/0.02 | maha=2.641/3.236  logdet=-5.868/-5.856  ||grad||=1.03e+00
+[ep 003] train_nll=-3.2605  val_nll=-2.5924  lr=1.00e-03 | w(ent_norm)=0.65/0.64  w(HHI)=0.539/0.548  w_max=0.59/0.60 | corr[w,rel]=-0.04/-0.03  corr[w,nis]=-0.14/-0.07  corr[w,var]=0.09/-0.00 | maha=2.609/3.266  logdet=-5.863/-5.858  ||grad||=1.09e+00
+[ep 004] train_nll=-3.2711  val_nll=-2.5870  lr=1.00e-03 | w(ent_norm)=0.65/0.65  w(HHI)=0.541/0.542  w_max=0.59/0.60 | corr[w,rel]=-0.03/-0.02  corr[w,nis]=-0.13/-0.09  corr[w,var]=0.08/0.01 | maha=2.596/3.286  logdet=-5.861/-5.872  ||grad||=1.33e+00
+[ep 005] train_nll=-3.2727  val_nll=-2.6272  lr=1.00e-03 | w(ent_norm)=0.64/0.62  w(HHI)=0.543/0.562  w_max=0.60/0.63 | corr[w,rel]=-0.03/-0.04  corr[w,nis]=-0.13/-0.10  corr[w,var]=0.07/0.03 | maha=2.592/3.198  logdet=-5.859/-5.825  ||grad||=1.31e+00
+[ep 006] train_nll=-3.2868  val_nll=-2.5655  lr=1.00e-03 | w(ent_norm)=0.64/0.63  w(HHI)=0.544/0.560  w_max=0.60/0.63 | corr[w,rel]=-0.03/-0.03  corr[w,nis]=-0.13/-0.03  corr[w,var]=0.07/0.03 | maha=2.576/3.264  logdet=-5.856/-5.829  ||grad||=1.41e+00
+[ep 007] train_nll=-3.2728  val_nll=-2.5914  lr=1.00e-03 | w(ent_norm)=0.64/0.62  w(HHI)=0.545/0.563  w_max=0.60/0.63 | corr[w,rel]=-0.03/-0.03  corr[w,nis]=-0.12/-0.06  corr[w,var]=0.07/0.02 | maha=2.590/3.238  logdet=-5.856/-5.829  ||grad||=1.54e+00
+[ep 008] train_nll=-3.2910  val_nll=-2.6181  lr=1.00e-03 | w(ent_norm)=0.64/0.62  w(HHI)=0.546/0.569  w_max=0.60/0.64 | corr[w,rel]=-0.03/-0.04  corr[w,nis]=-0.11/-0.06  corr[w,var]=0.08/0.03 | maha=2.570/3.196  logdet=-5.854/-5.814  ||grad||=1.61e+00
+[ep 009] train_nll=-3.3085  val_nll=-2.6186  lr=5.00e-04 | w(ent_norm)=0.64/0.61  w(HHI)=0.547/0.573  w_max=0.60/0.64 | corr[w,rel]=-0.03/-0.05  corr[w,nis]=-0.10/-0.04  corr[w,var]=0.08/0.06 | maha=2.552/3.178  logdet=-5.854/-5.797  ||grad||=1.77e+00
+[ep 010] train_nll=-3.3181  val_nll=-2.6389  lr=5.00e-04 | w(ent_norm)=0.64/0.61  w(HHI)=0.548/0.570  w_max=0.61/0.64 | corr[w,rel]=-0.03/-0.04  corr[w,nis]=-0.09/-0.05  corr[w,var]=0.08/0.07 | maha=2.540/3.167  logdet=-5.852/-5.805  ||grad||=1.85e+00
+[ep 011] train_nll=-3.3349  val_nll=-2.5646  lr=5.00e-04 | w(ent_norm)=0.64/0.62  w(HHI)=0.549/0.563  w_max=0.61/0.63 | corr[w,rel]=-0.03/-0.04  corr[w,nis]=-0.09/0.01  corr[w,var]=0.08/0.04 | maha=2.522/3.261  logdet=-5.851/-5.826  ||grad||=1.86e+00
+[ep 012] train_nll=-3.3433  val_nll=-2.5260  lr=5.00e-04 | w(ent_norm)=0.64/0.62  w(HHI)=0.549/0.565  w_max=0.61/0.64 | corr[w,rel]=-0.03/-0.03  corr[w,nis]=-0.09/0.00  corr[w,var]=0.08/-0.01 | maha=2.512/3.303  logdet=-5.849/-5.829  ||grad||=2.03e+00
+[ep 013] train_nll=-3.3395  val_nll=-2.5828  lr=5.00e-04 | w(ent_norm)=0.64/0.62  w(HHI)=0.550/0.567  w_max=0.61/0.63 | corr[w,rel]=-0.03/-0.04  corr[w,nis]=-0.09/0.00  corr[w,var]=0.08/0.04 | maha=2.516/3.237  logdet=-5.849/-5.820  ||grad||=2.08e+00
+[ep 014] train_nll=-3.3295  val_nll=-2.5322  lr=2.50e-04 | w(ent_norm)=0.64/0.62  w(HHI)=0.550/0.570  w_max=0.61/0.64 | corr[w,rel]=-0.03/-0.04  corr[w,nis]=-0.09/-0.00  corr[w,var]=0.08/-0.01 | maha=2.525/3.287  logdet=-5.848/-5.819  ||grad||=2.18e+00
+[ep 015] train_nll=-3.3412  val_nll=-2.5368  lr=2.50e-04 | w(ent_norm)=0.63/0.62  w(HHI)=0.551/0.566  w_max=0.61/0.64 | corr[w,rel]=-0.03/-0.03  corr[w,nis]=-0.09/-0.02  corr[w,var]=0.07/-0.01 | maha=2.513/3.297  logdet=-5.848/-5.834  ||grad||=2.27e+00
+[early-stop] no val improvement for 5 epochs (best ep 10)
+[OK] FusionNet trained. Artifacts in: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/models/fusionnet_by_time
+[EVAL] Test on default_3_random3_0b -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/eval
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+[SWARM] Target RMSE (m): {'rmse_x': 0.9766968377005568, 'rmse_y': 0.4099738760966092, 'rmse_z': 0.16280218130848761, 'rmse_3d': 1.071690180086925}  NEES: 1.942  95% band≈[0.992,1.008]  OUT-OF-BAND
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/eval/ifo001/baseline/default_3_random3_0b_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4892
+[SWARM] Measurements used after gating : 4892
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.147, median=0.118
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/eval/ifo001/baseline/default_3_random3_0b_ifo001
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+/home/nick/Thesis/swarm_target_tracking.py:99: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu")
+[SWARM] BiasNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/models/biasnet_by_exp
+[SWARM] Target RMSE (m): {'rmse_x': 1.3723005198113631, 'rmse_y': 0.5724424177231656, 'rmse_z': 0.16350614276912753, 'rmse_3d': 1.4958720857768972}  NEES: 2.771  95% band≈[0.992,1.008]  OUT-OF-BAND
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/eval/ifo001/bn_by_exp/default_3_random3_0b_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4892
+[SWARM] Measurements used after gating : 4892
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.142, median=0.115
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/eval/ifo001/bn_by_exp/default_3_random3_0b_ifo001
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+/home/nick/Thesis/swarm_target_tracking.py:99: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu")
+[SWARM] BiasNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/models/biasnet_by_time
+[SWARM] Target RMSE (m): {'rmse_x': 1.5444828081046902, 'rmse_y': 0.6306751781379458, 'rmse_z': 0.16405461439046332, 'rmse_3d': 1.676332974487188}  NEES: 3.226  95% band≈[0.992,1.008]  OUT-OF-BAND
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/eval/ifo001/bn_by_time/default_3_random3_0b_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4892
+[SWARM] Measurements used after gating : 4892
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.140, median=0.112
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/eval/ifo001/bn_by_time/default_3_random3_0b_ifo001
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+[SWARM] FusionNet normalizer restored: 11 features
+[SWARM] FusionNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/models/fusionnet_by_exp (CI learned weights)
+[SWARM] Target RMSE (m): {'rmse_x': 0.924620078081357, 'rmse_y': 0.33458147298564794, 'rmse_z': 0.14299608636789948, 'rmse_3d': 0.9936372233229555}  NEES: 1.419  95% band≈[0.992,1.008]  OUT-OF-BAND
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/eval/ifo001/fn_by_exp/default_3_random3_0b_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4892
+[SWARM] Measurements used after gating : 4892
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.148, median=0.118
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/eval/ifo001/fn_by_exp/default_3_random3_0b_ifo001
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+[SWARM] FusionNet normalizer restored: 11 features
+[SWARM] FusionNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/models/fusionnet_by_time (CI learned weights)
+[SWARM] Target RMSE (m): {'rmse_x': 0.9162382426989829, 'rmse_y': 0.34886784567966833, 'rmse_z': 0.1500774371187249, 'rmse_3d': 0.9918288805360633}  NEES: 1.476  95% band≈[0.992,1.008]  OUT-OF-BAND
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/eval/ifo001/fn_by_time/default_3_random3_0b_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4892
+[SWARM] Measurements used after gating : 4892
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.148, median=0.119
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/eval/ifo001/fn_by_time/default_3_random3_0b_ifo001
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+/home/nick/Thesis/swarm_target_tracking.py:99: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu")
+[SWARM] BiasNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/models/biasnet_by_exp
+[SWARM] FusionNet normalizer restored: 11 features
+[SWARM] FusionNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/models/fusionnet_by_exp (CI learned weights)
+[SWARM] Target RMSE (m): {'rmse_x': 1.24375156493674, 'rmse_y': 0.5086621968863915, 'rmse_z': 0.14369885388335293, 'rmse_3d': 1.3514083566529027}  NEES: 1.859  95% band≈[0.992,1.008]  OUT-OF-BAND
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/eval/ifo001/bnfn_by_exp/default_3_random3_0b_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4892
+[SWARM] Measurements used after gating : 4892
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.142, median=0.116
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/eval/ifo001/bnfn_by_exp/default_3_random3_0b_ifo001
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}
+/home/nick/Thesis/swarm_target_tracking.py:99: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu")
+[SWARM] BiasNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/models/biasnet_by_time
+[SWARM] FusionNet normalizer restored: 11 features
+[SWARM] FusionNet loaded from: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/models/fusionnet_by_time (CI learned weights)
+[SWARM] Target RMSE (m): {'rmse_x': 1.3227654151736916, 'rmse_y': 0.5529217178104306, 'rmse_z': 0.15061871056778753, 'rmse_3d': 1.4415674682716546}  NEES: 1.993  95% band≈[0.992,1.008]  OUT-OF-BAND
+[SAVE] Trajectory -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/eval/ifo001/bnfn_by_time/default_3_random3_0b_ifo001/target_state.csv
+[SWARM] Measurements available (trk↔tgt) : 4892
+[SWARM] Measurements used after gating : 4892
+[SWARM] LOS scores produced: 0, missing: 0
+[SWARM] Vertical sensitivity: mean=0.144, median=0.117
+[DONE] Results written to: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_3/eval/ifo001/bnfn_by_time/default_3_random3_0b_ifo001
+     rmse_x    rmse_y    rmse_z  rmse_3d      nees                          exp
+0  0.976697  0.409974  0.162802  1.07169  1.942151  default_3_random3_0b_ifo001
+     rmse_x    rmse_y    rmse_z   rmse_3d      nees                          exp
+0  1.372301  0.572442  0.163506  1.495872  2.770516  default_3_random3_0b_ifo001
+     rmse_x    rmse_y    rmse_z   rmse_3d     nees                          exp
+0  1.544483  0.630675  0.164055  1.676333  3.22559  default_3_random3_0b_ifo001
+     rmse_x    rmse_y    rmse_z   rmse_3d      nees                          exp
+0  1.243752  0.508662  0.143699  1.351408  1.858678  default_3_random3_0b_ifo001
+     rmse_x    rmse_y    rmse_z   rmse_3d      nees                          exp
+0  1.322765  0.552922  0.150619  1.441567  1.992652  default_3_random3_0b_ifo001
+    rmse_x    rmse_y    rmse_z   rmse_3d      nees                          exp
+0  0.92462  0.334581  0.142996  0.993637  1.418986  default_3_random3_0b_ifo001
+     rmse_x    rmse_y    rmse_z   rmse_3d      nees                          exp
+0  0.916238  0.348868  0.150077  0.991829  1.476199  default_3_random3_0b_ifo001
+
+===================== NON-ZIG FOLD 4 / 7 : TEST = default_3_random3_1 =====================
+[DATASET] Building dataset at /home/nick/Thesis/outputs_cv_byexp_nozig/fold_4/datasets
+  [CACHE HIT] default_3_movingTriangle_0b (ifo001)
+  [CACHE HIT] default_3_random2_0 (ifo001)
+  [CACHE HIT] default_3_random3_0b (ifo001)
+  [CACHE HIT] default_3_random3_2 (ifo001)
+  [CACHE HIT] default_3_random_0 (ifo001)
+  [CACHE HIT] default_3_random_0b (ifo001)
+  [STATS] 21955 lines in bias_samples.jsonl
+  [STATS] 173642 lines in fusion_snaps.jsonl
+[TRAIN] BiasNet (by_exp/by_time) -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_4/models
+[CLI] Loaded 21,955 bias samples from /home/nick/Thesis/outputs_cv_byexp_nozig/fold_4/datasets/bias_samples.jsonl
+[ep 001] train=0.0227 val=0.0145
+[ep 002] train=0.0223 val=0.0148
+[ep 003] train=0.0222 val=0.0144
+[ep 004] train=0.0223 val=0.0144
+[ep 005] train=0.0222 val=0.0144
+[ep 006] train=0.0222 val=0.0149
+[ep 007] train=0.0222 val=0.0143
+[ep 008] train=0.0222 val=0.0147
+[ep 009] train=0.0222 val=0.0143
+[ep 010] train=0.0221 val=0.0149
+[ep 011] train=0.0222 val=0.0144
+[ep 012] train=0.0221 val=0.0143
+[ep 013] train=0.0221 val=0.0147
+[ep 014] train=0.0222 val=0.0144
+[ep 015] train=0.0221 val=0.0143
+[ep 016] train=0.0221 val=0.0143
+[ep 017] train=0.0222 val=0.0142
+[ep 018] train=0.0221 val=0.0144
+[ep 019] train=0.0221 val=0.0141
+[ep 020] train=0.0221 val=0.0145
+[ep 021] train=0.0221 val=0.0142
+[ep 022] train=0.0221 val=0.0148
+[ep 023] train=0.0221 val=0.0142
+[ep 024] train=0.0221 val=0.0145
+[ep 025] train=0.0221 val=0.0142
+[ep 026] train=0.0221 val=0.0144
+[ep 027] train=0.0221 val=0.0146
+[ep 028] train=0.0221 val=0.0147
+[ep 029] train=0.0221 val=0.0145
+[ep 030] train=0.0221 val=0.0143
+[OK] BiasNet trained. Artifacts in: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_4/models/biasnet_by_exp
+[CLI] Loaded 21,955 bias samples from /home/nick/Thesis/outputs_cv_byexp_nozig/fold_4/datasets/bias_samples.jsonl
+[ep 001] train=0.0227 val=0.0197
+[ep 002] train=0.0220 val=0.0207
+[ep 003] train=0.0219 val=0.0203
+[ep 004] train=0.0219 val=0.0197
+[ep 005] train=0.0220 val=0.0201
+[ep 006] train=0.0220 val=0.0197
+[ep 007] train=0.0220 val=0.0204
+[ep 008] train=0.0220 val=0.0201
+[ep 009] train=0.0219 val=0.0215
+[ep 010] train=0.0220 val=0.0206
+[ep 011] train=0.0219 val=0.0201
+[ep 012] train=0.0219 val=0.0199
+[ep 013] train=0.0219 val=0.0201
+[ep 014] train=0.0219 val=0.0201
+[ep 015] train=0.0220 val=0.0198
+[ep 016] train=0.0219 val=0.0201
+[ep 017] train=0.0219 val=0.0207
+[ep 018] train=0.0219 val=0.0200
+[ep 019] train=0.0219 val=0.0200
+[ep 020] train=0.0219 val=0.0200
+[ep 021] train=0.0219 val=0.0198
+[ep 022] train=0.0219 val=0.0198
+[ep 023] train=0.0219 val=0.0203
+[ep 024] train=0.0219 val=0.0204
+[ep 025] train=0.0219 val=0.0204
+[ep 026] train=0.0219 val=0.0203
+[ep 027] train=0.0220 val=0.0200
+[ep 028] train=0.0219 val=0.0202
+[ep 029] train=0.0219 val=0.0200
+[ep 030] train=0.0219 val=0.0204
+[OK] BiasNet trained. Artifacts in: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_4/models/biasnet_by_time
+[TRAIN] FusionNet (by_exp/by_time) -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_4/models
+[CLI] Loaded 173,642 fusion snaps from /home/nick/Thesis/outputs_cv_byexp_nozig/fold_4/datasets/fusion_snaps.jsonl
+[CLI] nodes/snap: mean=2.0  median=2  min=2  max=2
+[CLI] split: train=159605  val=14037  in_dim=11
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/torch/optim/lr_scheduler.py:60: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.
+  warnings.warn(
+[norm] feature_mean[min,max]=(0.000,6.026) feature_std[min,max]=(0.047,8.519)
+[ep 001] train_nll=-2.8507  val_nll=-3.7174  lr=1.00e-03 | w(ent_norm)=0.62/0.65  w(HHI)=0.563/0.536  w_max=0.63/0.60 | corr[w,rel]=-0.02/-0.01  corr[w,nis]=-0.32/-0.28  corr[w,var]=0.03/0.00 | maha=3.046/1.906  logdet=-5.891/-5.623  ||grad||=1.71e+00
+[ep 002] train_nll=-3.0259  val_nll=-3.6987  lr=1.00e-03 | w(ent_norm)=0.61/0.64  w(HHI)=0.577/0.545  w_max=0.65/0.60 | corr[w,rel]=-0.02/0.01  corr[w,nis]=-0.27/-0.20  corr[w,var]=0.01/-0.05 | maha=2.842/1.895  logdet=-5.862/-5.593  ||grad||=2.04e+00
+[ep 003] train_nll=-3.1291  val_nll=-3.7148  lr=1.00e-03 | w(ent_norm)=0.60/0.64  w(HHI)=0.582/0.544  w_max=0.65/0.59 | corr[w,rel]=-0.02/0.01  corr[w,nis]=-0.22/-0.13  corr[w,var]=0.05/-0.04 | maha=2.716/1.872  logdet=-5.839/-5.587  ||grad||=2.40e+00
+[ep 004] train_nll=-3.1673  val_nll=-3.7125  lr=1.00e-03 | w(ent_norm)=0.60/0.64  w(HHI)=0.583/0.543  w_max=0.65/0.59 | corr[w,rel]=-0.02/-0.01  corr[w,nis]=-0.21/-0.10  corr[w,var]=0.05/-0.10 | maha=2.668/1.886  logdet=-5.830/-5.599  ||grad||=2.46e+00
+[ep 005] train_nll=-3.1777  val_nll=-3.6844  lr=5.00e-04 | w(ent_norm)=0.59/0.64  w(HHI)=0.585/0.542  w_max=0.65/0.58 | corr[w,rel]=-0.02/-0.01  corr[w,nis]=-0.20/-0.12  corr[w,var]=0.05/-0.08 | maha=2.654/1.907  logdet=-5.826/-5.592  ||grad||=2.49e+00
+[ep 006] train_nll=-3.2210  val_nll=-3.6850  lr=5.00e-04 | w(ent_norm)=0.59/0.63  w(HHI)=0.584/0.547  w_max=0.65/0.60 | corr[w,rel]=-0.02/0.00  corr[w,nis]=-0.20/-0.18  corr[w,var]=0.05/-0.02 | maha=2.611/1.898  logdet=-5.826/-5.583  ||grad||=2.43e+00
+[early-stop] no val improvement for 5 epochs (best ep 1)
+[OK] FusionNet trained. Artifacts in: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_4/models/fusionnet_by_exp
+[CLI] Loaded 173,642 fusion snaps from /home/nick/Thesis/outputs_cv_byexp_nozig/fold_4/datasets/fusion_snaps.jsonl
+[CLI] nodes/snap: mean=2.0  median=2  min=2  max=2
+[CLI] split: train=138914  val=34728  in_dim=11
+/home/nick/Thesis/miluv_env/lib/python3.12/site-packages/torch/optim/lr_scheduler.py:60: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.
+  warnings.warn(
+[norm] feature_mean[min,max]=(0.000,6.162) feature_std[min,max]=(0.045,8.954)
+[ep 001] train_nll=-3.0057  val_nll=-2.5916  lr=1.00e-03 | w(ent_norm)=0.64/0.61  w(HHI)=0.547/0.573  w_max=0.60/0.63 | corr[w,rel]=-0.03/-0.03  corr[w,nis]=-0.27/-0.27  corr[w,var]=-0.02/0.14 | maha=2.894/3.257  logdet=-5.893/-5.849  ||grad||=1.40e+00
+[ep 002] train_nll=-3.2286  val_nll=-2.4581  lr=1.00e-03 | w(ent_norm)=0.61/0.58  w(HHI)=0.568/0.600  w_max=0.63/0.67 | corr[w,rel]=-0.02/-0.03  corr[w,nis]=-0.17/-0.05  corr[w,var]=-0.01/0.21 | maha=2.626/3.307  logdet=-5.849/-5.766  ||grad||=1.97e+00
+[ep 003] train_nll=-3.2951  val_nll=-2.4123  lr=1.00e-03 | w(ent_norm)=0.61/0.58  w(HHI)=0.575/0.600  w_max=0.64/0.68 | corr[w,rel]=-0.01/-0.03  corr[w,nis]=-0.12/-0.04  corr[w,var]=0.01/0.22 | maha=2.533/3.344  logdet=-5.822/-5.756  ||grad||=2.49e+00
+[ep 004] train_nll=-3.3225  val_nll=-2.4332  lr=1.00e-03 | w(ent_norm)=0.60/0.58  w(HHI)=0.575/0.601  w_max=0.64/0.68 | corr[w,rel]=-0.02/-0.04  corr[w,nis]=-0.12/-0.02  corr[w,var]=0.01/0.20 | maha=2.500/3.314  logdet=-5.816/-5.748  ||grad||=2.61e+00
+[ep 005] train_nll=-3.3292  val_nll=-2.3757  lr=5.00e-04 | w(ent_norm)=0.60/0.58  w(HHI)=0.576/0.602  w_max=0.64/0.68 | corr[w,rel]=-0.02/-0.03  corr[w,nis]=-0.12/-0.03  corr[w,var]=0.00/0.22 | maha=2.489/3.368  logdet=-5.812/-5.744  ||grad||=2.66e+00
+[ep 006] train_nll=-3.3470  val_nll=-2.3362  lr=5.00e-04 | w(ent_norm)=0.60/0.58  w(HHI)=0.577/0.603  w_max=0.64/0.68 | corr[w,rel]=-0.02/-0.04  corr[w,nis]=-0.13/-0.01  corr[w,var]=0.00/0.21 | maha=2.469/3.407  logdet=-5.810/-5.743  ||grad||=2.78e+00
+[early-stop] no val improvement for 5 epochs (best ep 1)
+[OK] FusionNet trained. Artifacts in: /home/nick/Thesis/outputs_cv_byexp_nozig/fold_4/models/fusionnet_by_time
+[EVAL] Test on default_3_random3_1 -> /home/nick/Thesis/outputs_cv_byexp_nozig/fold_4/eval
+[SWARM] Target: ifo001; Trackers: ['ifo002', 'ifo003']
+[SWARM] Inferred tag IDs per robot: {'ifo001': [10, 11], 'ifo002': [20, 21], 'ifo003': [30, 31]}

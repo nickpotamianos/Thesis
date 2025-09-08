@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional, Sequence
 
 class BiasNet(nn.Module):
     """
@@ -35,15 +36,37 @@ class FusionNet(nn.Module):
     """
     def __init__(self, in_dim: int, hidden: int = 64):
         super().__init__()
+        self.in_dim = int(in_dim)
         self.enc = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
+            nn.Dropout(p=0.10),
             nn.ReLU()
         )
         self.score = nn.Linear(hidden, 1)
+        # Optional feature normalization (populated during training or by loader)
+        self.register_buffer("x_mu",  torch.zeros(1, in_dim))
+        self.register_buffer("x_std", torch.ones(1,  in_dim))
+        self._use_norm = False
+
+    def set_normalizer(self, mu: Sequence[float], std: Sequence[float]) -> None:
+        """
+        Install per-feature mean/std so training-time normalization is reproduced at inference.
+        """
+        mu = torch.as_tensor(mu, dtype=torch.float32).reshape(1, -1)
+        std = torch.as_tensor(std, dtype=torch.float32).reshape(1, -1)
+        std = torch.clamp(std, min=1e-6)
+        if mu.shape[1] != self.in_dim or std.shape[1] != self.in_dim:
+            raise ValueError(f"Normalizer dim mismatch: expected {self.in_dim}, got {mu.shape[1]}")
+        with torch.no_grad():
+            self.x_mu.copy_(mu)
+            self.x_std.copy_(std)
+        self._use_norm = True
 
     def forward(self, X):  # X: (N_nodes, d)
+        if self._use_norm:
+            X = (X - self.x_mu) / self.x_std
         H = self.enc(X)                   # (N,h)
         s = self.score(H).squeeze(-1)     # (N,)
         w = F.softmax(s, dim=0)           # (N,)

@@ -175,6 +175,7 @@ def build_biasnet_samples(
                 "features": feat.tolist(),
                 "bias": float(z_agg - true_range),
                 "meta": {
+                    "exp": str(exp_name),
                     "timestamp": float(t),
                     "tracker": trk,
                     "target": tgt,

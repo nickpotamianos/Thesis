@@ -15,13 +15,12 @@ from swarm_ml.features import se_translation_from_matrix
 from swarm_ml.planning import suggest_vantage_moves, suggest_vantage_moves_eig
 
 def _load_fusionnet(path_dir: str):
-    if path_dir is None:
-        return None
     import os, json, torch
     from swarm_ml.models import FusionNet
     with open(os.path.join(path_dir, "fusionnet_meta.json"), "r") as f:
         meta = json.load(f)
     in_dim = int(meta["in_dim"])
+    x_mu, x_std = meta.get("x_mu", None), meta.get("x_std", None)
     m = FusionNet(in_dim)
     state = torch.load(os.path.join(path_dir, "fusionnet.pt"), map_location="cpu")
     m.load_state_dict(state)
@@ -31,6 +30,12 @@ def _load_fusionnet(path_dir: str):
         m.input_dim = int(in_dim)
     except Exception:
         pass
+    # Install normalizer if available
+    try:
+        if x_mu is not None and x_std is not None:
+            m.set_normalizer(x_mu, x_std)
+    except Exception as e:
+        print(f"[LOGGER] Warning: could not set FusionNet normalizer: {e}")
     return m
 
 def main():

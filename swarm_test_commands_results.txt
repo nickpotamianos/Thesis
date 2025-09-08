@@ -1,0 +1,195 @@
+# Swarm Intelligence Target Tracking - Test Commands & Results
+
+## Environment Setup
+```bash
+cd /home/nick/Thesis
+source miluv_env/bin/activate
+```
+
+## Test 1: Single-tracker vs Multi-tracker Fusion
+
+### Commands:
+```bash
+# Single tracker (k=1)
+python swarm_target_tracking.py \
+  --exp default_3_random_0 \
+  --use_height_tf \
+  --ci_method grid --ci_objective logdet --ci_grid 0.1 \
+  --budget_k 1 \
+  --out outputs_swarm/baseline_k1
+
+# Multi-tracker (swarm)
+python swarm_target_tracking.py \
+  --exp default_3_random_0 \
+  --use_height_tf \
+  --ci_method grid --ci_objective logdet --ci_grid 0.1 \
+  --out outputs_swarm/swarm_all
+```
+
+### Results:
+| Configuration | RMSE_3D | NEES | Improvement |
+|---------------|---------|------|-------------|
+| Single tracker | 0.934m | 13.708 | - |
+| Multi-tracker | 0.769m | 13.701 | **-17.7%** |
+
+---
+
+## Test 2: FusionNet vs Fixed CI Methods
+
+### Commands:
+```bash
+# Collect fusion training data
+python swarm_target_tracking.py \
+  --exp default_3_random_0 \
+  --use_height_tf \
+  --collect_fusion \
+  --out outputs_swarm
+
+# Train FusionNet
+python -m swarm_ml.train_fusionnet_cli \
+  --snaps outputs_swarm/default_3_random_0_ifo003/fusion_snaps.jsonl.gz \
+  --out models/fusionnet_default_3_random_0 \
+  --epochs 20 --lr 1e-3 --batch_size 64 --seed 0
+
+# Test CI methods
+python swarm_target_tracking.py \
+  --exp default_3_random_0 --use_height_tf \
+  --ci_method uniform \
+  --out outputs_swarm/ci_uniform
+
+python swarm_target_tracking.py \
+  --exp default_3_random_0 --use_height_tf \
+  --ci_method grid --ci_objective logdet --ci_grid 0.1 \
+  --out outputs_swarm/ci_grid
+
+python swarm_target_tracking.py \
+  --exp default_3_random_0 --use_height_tf \
+  --ci_method learned --fusionnet_dir models/fusionnet_default_3_random_0 \
+  --out outputs_swarm/ci_learned
+```
+
+### Results:
+| CI Method | RMSE_3D | NEES | Performance |
+|-----------|---------|------|-------------|
+| Uniform CI | 0.751m | 10.564 | Good baseline |
+| Grid CI | 0.769m | 13.701 | Standard |
+| **Learned CI** | **0.746m** | **9.068** | **Best centralized** |
+
+---
+
+## Test 3: Centralized vs Decentralized (Fair Comparison)
+
+### Commands:
+```bash
+# Centralized baseline
+python swarm_target_tracking.py \
+  --exp default_3_random_0 \
+  --use_height_tf \
+  --ci_method grid --ci_objective logdet \
+  --out outputs_swarm/centralized_baseline
+
+# Centralized with full features
+python swarm_target_tracking.py \
+  --exp default_3_random_0 \
+  --use_height_tf --use_los --online_tune \
+  --ci_method grid --ci_objective logdet \
+  --out outputs_swarm/centralized_full_features
+
+# Decentralized (complete script)
+python run_complete_test3.py
+
+# Decentralized with minimal features (fair comparison)
+python run_fair_test3.py
+```
+
+### Decentralized Script Commands (internal):
+```bash
+# Logger
+python -m agents.logger \
+  --exp default_3_random_0 --target ifo003 \
+  --method gossip --rounds 3 --ci_objective logdet \
+  --fanout --planner none \
+  --out outputs_swarm/decentralized
+
+# Robot nodes
+python -m agents.robot_node \
+  --id ifo001 --target ifo003 --exp default_3_random_0 \
+  --use_height_tf --use_los --online_tune --control_mode none
+
+python -m agents.robot_node \
+  --id ifo002 --target ifo003 --exp default_3_random_0 \
+  --use_height_tf --use_los --online_tune --control_mode none
+```
+
+### Results:
+| Approach | Features | RMSE_3D | NEES | Improvement |
+|----------|----------|---------|------|------------|
+| Centralized (baseline) | `--use_height_tf` | 0.769m | 13.701 | - |
+| **Decentralized (minimal)** | `--use_height_tf` | **0.632m** | **4.327** | **-17.8%** |
+| Centralized (full) | `--use_height_tf --use_los --online_tune` | 0.756m | 13.773 | - |
+| **Decentralized (full)** | `--use_height_tf --use_los --online_tune` | **0.629m** | **4.200** | **-16.8%** |
+
+---
+
+## Original Health Check (Multiple Scenarios)
+
+### Commands:
+```bash
+# Baseline batch
+python swarm_batch_run.py \
+  --exps default_3_random_0 default_3_random2_0 default_3_random3_2 \
+  --common --ci_method grid --out outputs_swarm_baseline
+
+# Swarm intelligence batch  
+python swarm_batch_run.py \
+  --exps default_3_random_0 default_3_random2_0 default_3_random3_2 \
+  --common --ci_method grid --use_los --online_tune --use_height_tf \
+  --out outputs_swarm_swarmint
+
+# Evaluation
+python swarm_eval_table.py --root outputs_swarm_baseline
+python swarm_eval_table.py --root outputs_swarm_swarmint
+```
+
+### Results:
+| Scenario | Baseline RMSE_3D | Swarm RMSE_3D | Improvement |
+|----------|------------------|---------------|-------------|
+| default_3_random_0 | 1.226m | 0.745m | **-39.2%** ✅ |
+| default_3_random2_0 | 0.802m | 0.725m | **-9.6%** ✅ |
+| default_3_random3_2 | 1.894m | 2.601m | **+37.3%** ❌ |
+
+---
+
+## Final Performance Rankings
+
+| Rank | Configuration | RMSE_3D | Architecture | Key Features |
+|------|---------------|---------|--------------|--------------|
+| **🥇 1st** | **Decentralized (full)** | **0.629m** | Gossip | `--use_height_tf --use_los --online_tune` |
+| **🥈 2nd** | **Decentralized (minimal)** | **0.632m** | Gossip | `--use_height_tf` |
+| **🥉 3rd** | **Learned CI** | **0.746m** | Centralized | `--use_height_tf + FusionNet` |
+| 4th | Uniform CI | 0.751m | Centralized | `--use_height_tf` |
+| 5th | Centralized (full) | 0.756m | Centralized | `--use_height_tf --use_los --online_tune` |
+| 6th | Grid CI | 0.769m | Centralized | `--use_height_tf` |
+| 7th | Single tracker | 0.934m | Single | `--use_height_tf` |
+
+---
+
+## Key Insights
+
+### ✅ Proven Swarm Advantages:
+1. **Multi-tracker fusion**: 17.7% improvement over single tracker
+2. **Learned optimization**: 3% improvement from FusionNet
+3. **Gossip architecture**: 17-18% improvement over centralized
+4. **Perfect coordination**: 6751/6751 timestamps processed (100%)
+
+### 🔬 Communication Stats (Decentralized):
+- Messages: ifo001=7102, ifo002=6751  
+- Missing data: 0 (`missing_at_fuse={}`)
+- Gossip rounds: 3
+- Better calibration: NEES ~4.2 vs ~13.7
+
+### 🎯 Best Overall Result:
+**Decentralized gossip with full features: 0.629m RMSE_3D**
+- 32.6% better than single tracker
+- 18.2% better than centralized baseline
+- 4x better NEES calibration (4.2 vs 13.7)

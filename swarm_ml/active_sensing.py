@@ -10,6 +10,9 @@ def expected_trace_reduction(mu: np.ndarray, P: np.ndarray,
     """
     _, H = TargetIF._range_linearize(mu, tracker_p)
     S = float(H @ P @ H.T + R)  # scalar
+    # numerical guard: ensure strictly positive S
+    if not np.isfinite(S) or S <= 1e-12:
+        S = 1e-12
     KPH = (P @ H.T) * (1.0 / S)  # (6,1)
     P_new = P - KPH @ (H @ P)    # Joseph not needed for scalar, deterministic linearization
     return float(np.trace(P) - np.trace(P_new))

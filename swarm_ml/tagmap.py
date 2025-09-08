@@ -73,12 +73,19 @@ def robust_range_aggregate(pair_df: pd.DataFrame,
     R_eff = base_var / m_eff
     meta = {"m": int(m), "m_eff": float(m_eff)}
     # Optional dispersion-aware inflation using IQR
-    if use_dispersion and m >= 3:
-        q25, q75 = np.percentile(zs, [25, 75])
-        iqr = float(max(1e-9, q75 - q25))
-        infl = 1.0 + float(disp_gain) * float(min(1.0, iqr / max(1e-9, disp_tau)))
-        R_eff *= infl
-        meta.update({"iqr": iqr, "R_infl": infl})
+    if use_dispersion:
+        if m >= 3:
+            q25, q75 = np.percentile(zs, [25, 75])
+            iqr = float(max(1e-9, q75 - q25))
+        elif m == 2:
+            # IQR-like proxy for two points
+            iqr = float(abs(zs[1] - zs[0]))
+        else:
+            iqr = 0.0
+        if iqr > 0.0:
+            infl = 1.0 + float(disp_gain) * float(min(1.0, iqr / max(1e-9, disp_tau)))
+            R_eff *= infl
+            meta.update({"iqr": iqr, "R_infl": infl})
     return z_agg, float(R_eff), meta
 
 def robust_tracker_sensor_position(pair_df: pd.DataFrame,

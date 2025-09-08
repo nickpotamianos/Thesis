@@ -5,7 +5,6 @@ import numpy as np
 from numpy.linalg import inv
 
 @dataclass
-@dataclass
 class CIFuserConfig:
     objective: str = "logdet"   # "logdet" or "trace"
     grid_step: float = 0.1      # weight grid for small N; safe & reproducible

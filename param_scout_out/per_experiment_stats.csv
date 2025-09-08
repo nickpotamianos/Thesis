@@ -1,0 +1,4 @@
+exp,target,n_row_residuals,base_uwb_std,base_uwb_var,pair_corr_rho,huber_delta,iqr_median,iqr_p90,sigma_a_xy,sigma_a_z,m_hist
+default_3_random3_0b,ifo003,9736,0.1128631381599999,0.012738087955323227,0.98,0.3,0.0,0.0,0.4,0.2,{2: 4868}
+default_3_random3_1,ifo003,9128,0.10388783445410256,0.010792682147563019,0.98,0.3,0.0,0.0,0.4,0.2,{2: 4564}
+default_3_random3_2,ifo003,8212,0.11039072522169226,0.012186112214971163,0.98,0.3,0.0,0.0,0.4,0.2,{2: 4106}
