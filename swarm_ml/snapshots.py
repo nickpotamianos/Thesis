@@ -51,17 +51,21 @@ class SnapshotCollector:
                  base_var=1.0,
                  pair_corr=0.0,
                  huber_delta=1.0,
-                 los_verbose=False):
+                 los_verbose=False,
+                 height_series: Optional[Dict[str, np.ndarray]] = None):
         self.ts = np.asarray(query_timestamps, dtype=float)
         self.roles = roles
         self.tag_map = tag_map
         self.gt_T = gt_T_by_robot
+        # Stable tracker vocabulary for one-hot identity features
+        self.tracker_vocab = sorted(list(roles.trackers))
         self.exp_name = exp_name
         self.tag_moment_arms = tag_moment_arms
         self.base_var = float(base_var)
         self.pair_corr = float(pair_corr)
         self.huber_delta = float(huber_delta)
         self.los_adapter = LOSAdapter(LOSConfig(verbose=los_verbose))
+        self.height_series = height_series  # dict: robot -> np.ndarray aligned with self.ts
 
         # precompute GT positions per robot
         self.gt_pos = {r: np.asarray([se_translation_from_matrix(T) for T in mats], dtype=float)
@@ -87,13 +91,50 @@ class SnapshotCollector:
         p_tgt = self.gt_pos[tgt][i]
         true_range = float(np.linalg.norm(p_tgt - eff_sensor_pos_used))
 
+        # Δz from PX4 height if available and requested
+        tgt = self.roles.target
+        h_trk = None; h_tgt = None
+        if self.height_series is not None:
+            try:
+                h_trk = float(self.height_series.get(trk, [None] * len(self.ts))[i])
+                h_tgt = float(self.height_series.get(tgt, [None] * len(self.ts))[i])
+            except (IndexError, TypeError, ValueError):
+                h_trk = None; h_tgt = None
+
+        # Keep LOS neutral (0.5) if not provided
         feat = build_measurement_features(
             tracker_pos=np.asarray(eff_sensor_pos_used, dtype=float),
-            target_pred_pos=None,
+            target_pred_pos=None,               # training parity: no bearing/dist inputs
             uwb_range=float(z_agg),
             los_score=None if los_score is None else float(los_score),
+            height_tracker=h_trk,
+            height_target=h_tgt
         )
         feat = np.asarray(feat, dtype=float)
+
+        # --- Pair-quality stats for BiasNet + identity one-hot ---
+        from swarm_ml.tagmap import robust_range_aggregate
+        # recompute pair variance/meta using the same settings as runtime
+        _, R_pair, meta_pairs = robust_range_aggregate(
+            pair_df, base_var=self.base_var, rho=self.pair_corr, huber_delta=self.huber_delta
+        )
+        m_eff = float(meta_pairs.get("m_eff", 1.0))
+        # Prefer an IQR from the rows we have at this t (m=2 supported)
+        if pair_df is not None and not pair_df.empty:
+            zs = pair_df["range"].to_numpy(dtype=float)
+            if zs.size >= 3:
+                q25, q75 = np.percentile(zs, [25, 75]); iqr = float(max(0.0, q75 - q25))
+            elif zs.size == 2:
+                iqr = float(abs(zs[1] - zs[0]))
+            else:
+                iqr = 0.0
+        else:
+            iqr = 0.0
+        # one-hot identity for tracker
+        onehot = np.zeros(len(self.tracker_vocab), dtype=float)
+        if trk in self.tracker_vocab:
+            onehot[self.tracker_vocab.index(trk)] = 1.0
+        feat = np.hstack([feat, [float(R_pair), m_eff, iqr], onehot])
 
         self._bias_jsonl.append({
             "features": feat.tolist(),
@@ -105,7 +146,8 @@ class SnapshotCollector:
                 "target": tgt,
                 "z_agg": float(z_agg),
                 "true_range": true_range,
-                "los": None if los_score is None else float(los_score)
+                "los": None if los_score is None else float(los_score),
+                "R_pair": float(R_pair)
             }
         })
 

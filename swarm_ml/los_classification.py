@@ -23,15 +23,6 @@ def _score_from_iqr(zs: np.ndarray) -> float:
         shrink = 0.25  # 25% of the deviation from 0.5 when m=2
         return 0.5 + shrink * (p_raw - 0.5)
 
-    # Use an "IQR-like" spread for small m as well
-    if m == 2:
-        iqr = abs(float(zs[1] - zs[0]))
-        # gentle logistic and heavy shrink so we don't overreact with 2 pts
-        k, x0 = 6.0, 0.12
-        p_raw = 1.0 / (1.0 + np.exp(k * (iqr - x0)))
-        p_raw = float(np.clip(p_raw, 0.05, 0.95))
-        shrink = 0.25  # 25% of the deviation from 0.5 when m=2
-        return 0.5 + shrink * (p_raw - 0.5)
 
     q25, q75 = np.percentile(zs, [25, 75])
     iqr = max(1e-6, float(q75 - q25))

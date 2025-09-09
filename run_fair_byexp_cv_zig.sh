@@ -220,9 +220,9 @@ evaluate_on_exp() {
 
     # BN only - uses grid CI with bias correction
     python "$ROOT/swarm_target_tracking.py" --exp "$TEST_EXP" --target "$tgt" "${COMMON_ARGS[@]}" \
-      --biasnet_dir "$MODEL_DIR/biasnet_by_exp"   --out "$EVAL_DIR/bn_by_exp"
+      --bias_gain 0.6 --biasnet_dir "$MODEL_DIR/biasnet_by_exp"   --out "$EVAL_DIR/bn_by_exp"
     python "$ROOT/swarm_target_tracking.py" --exp "$TEST_EXP" --target "$tgt" "${COMMON_ARGS[@]}" \
-      --biasnet_dir "$MODEL_DIR/biasnet_by_time"  --out "$EVAL_DIR/bn_by_time"
+      --bias_gain 0.6 --biasnet_dir "$MODEL_DIR/biasnet_by_time"  --out "$EVAL_DIR/bn_by_time"
 
     # FN only - OVERRIDE to learned CI
     python "$ROOT/swarm_target_tracking.py" --exp "$TEST_EXP" --target "$tgt" "${COMMON_ARGS[@]}" \
@@ -232,9 +232,9 @@ evaluate_on_exp() {
 
     # BN+FN (matched splits) - OVERRIDE to learned CI
     python "$ROOT/swarm_target_tracking.py" --exp "$TEST_EXP" --target "$tgt" "${COMMON_ARGS[@]}" \
-      --ci_method learned --biasnet_dir "$MODEL_DIR/biasnet_by_exp"   --fusionnet_dir "$MODEL_DIR/fusionnet_by_exp"   --out "$EVAL_DIR/bnfn_by_exp"
+      --ci_method learned --bias_gain 0.6 --biasnet_dir "$MODEL_DIR/biasnet_by_exp"   --fusionnet_dir "$MODEL_DIR/fusionnet_by_exp"   --out "$EVAL_DIR/bnfn_by_exp"
     python "$ROOT/swarm_target_tracking.py" --exp "$TEST_EXP" --target "$tgt" "${COMMON_ARGS[@]}" \
-      --ci_method learned --biasnet_dir "$MODEL_DIR/biasnet_by_time"  --fusionnet_dir "$MODEL_DIR/fusionnet_by_time"  --out "$EVAL_DIR/bnfn_by_time"
+      --ci_method learned --bias_gain 0.6 --biasnet_dir "$MODEL_DIR/biasnet_by_time"  --fusionnet_dir "$MODEL_DIR/fusionnet_by_time"  --out "$EVAL_DIR/bnfn_by_time"
 
     # Per-scenario summaries
     for SCEN in "$EVAL_DIR"/*; do

@@ -44,7 +44,7 @@ class BiasNetDataset(Dataset):
         except Exception:
             w_val = 1.0
         w = torch.tensor(w_val, dtype=torch.float32)
-        return x, y, w
+        return {"features": x, "bias": y, "weight": w}
 
 
 def _index_for_time(ts: np.ndarray, t: float) -> int:
@@ -91,13 +91,16 @@ def build_biasnet_samples(
       - distance to target GT body center (consistent with runtime parametrization)
     """
     if los_adapter is None:
-        los_adapter = LOSAdapter(LOSConfig(verbose=False))
+        # Default experiments have no obstacles; keep LOS neutral unless explicitly provided
+        # (i.e., do not auto-enable a classifier here).
+        pass
 
     gt_pos = _gt_positions_from_T(gt_T_by_robot)
 
     samples: List[Dict] = []
     tgt = roles.target
     trks = roles.trackers
+    tracker_vocab = sorted(list(trks))
 
     # Pre-group for faster per‑t timestamp access
     uwb_by_t = dict(tuple(uwb_range_df.groupby("timestamp"))) if "timestamp" in uwb_range_df.columns else {}
@@ -148,8 +151,8 @@ def build_biasnet_samples(
             # True geometric range
             true_range = float(np.linalg.norm(p_tgt - eff_sensor_pos_gt))
 
-            # Optional LOS score
-            los_score = los_adapter.score(df_pair)  # may be None
+            # Optional LOS score (neutral 0.5 when los_adapter is None or disabled)
+            los_score = los_adapter.score(df_pair) if los_adapter is not None else None
 
             # Optional height difference (z_tgt - z_trk)
             if height_series is not None and trk in height_series and tgt in height_series:
@@ -158,7 +161,7 @@ def build_biasnet_samples(
                 dz = 0.0
 
             # Build feature vector (keep layout consistent with runtime builder)
-            feat = build_measurement_features(
+            feat_base = build_measurement_features(
                 tracker_pos=eff_sensor_pos_gt,
                 target_pred_pos=None,
                 uwb_range=float(z_agg),
@@ -167,9 +170,26 @@ def build_biasnet_samples(
                 height_tracker=None,
                 height_target=None
             )
-            feat = np.asarray(feat, dtype=float)
-            if feat.shape[0] >= 7:
-                feat[6] = dz  # overwrite 'dz' slot if present
+            feat_base = np.asarray(feat_base, dtype=float)
+            if feat_base.shape[0] >= 7:
+                feat_base[6] = dz  # overwrite 'dz' slot if present
+
+            # Pair-quality statistics (must match runtime)
+            _, R_pair2, meta_pairs = robust_range_aggregate(
+                df_pair, base_var=base_var, rho=pair_corr, huber_delta=huber_delta
+            )
+            m_eff = float(meta_pairs.get("m_eff", 1.0))
+            zs = df_pair["range"].to_numpy(dtype=float)
+            if zs.size >= 3:
+                q25, q75 = np.percentile(zs, [25, 75]); iqr = float(max(0.0, q75 - q25))
+            elif zs.size == 2:
+                iqr = float(abs(zs[1] - zs[0]))
+            else:
+                iqr = 0.0
+            onehot = np.zeros(len(tracker_vocab), dtype=float)
+            if trk in tracker_vocab:
+                onehot[tracker_vocab.index(trk)] = 1.0
+            feat = np.hstack([feat_base, [float(R_pair2), m_eff, iqr], onehot])
 
             samples.append({
                 "features": feat.tolist(),
@@ -181,7 +201,7 @@ def build_biasnet_samples(
                     "target": tgt,
                     "z_agg": float(z_agg),
                     "true_range": true_range,
-                    "R_pair": float(R_pair),
+                    "R_pair": float(R_pair2),
                     "los": None if los_score is None else float(los_score),
                 }
             })

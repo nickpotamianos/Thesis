@@ -27,6 +27,8 @@ class AdapterConfig:
     # New: LOS/geometry influences
     los_influence: float = 0.5     # controls how strongly LOS adjusts reliability
     geom_influence: float = 0.5    # controls how strongly |e_z| adjusts reliability
+    # How strongly to trust the learned bias on each step (0..1)
+    bias_model_gain: float = 0.0
     # Ownership of innovation-driven R scaling: if False, an external tuner owns R scaling.
     own_rscale: bool = True
 
@@ -67,7 +69,11 @@ class MeasureAdapter:
         if self.bias_model is not None and features is not None:
             pred = self.bias_model.predict(features)
             bias_model = float(np.clip(pred, -self.cfg.bias_clip, self.cfg.bias_clip))
-        bias = float(np.clip(bias_model + bias_est, -self._bias_clip, self._bias_clip))
+        # --- FIX: convex blend (no double-counting) ---
+        # gamma=0 -> EMA only; gamma=1 -> model only
+        gamma = float(np.clip(getattr(self.cfg, "bias_model_gain", 0.0), 0.0, 1.0))
+        bias_blend = gamma * bias_model + (1.0 - gamma) * bias_est
+        bias = float(np.clip(bias_blend, -self._bias_clip, self._bias_clip))
         z_corr = float(z - bias)
 
         # Reliability from LOS score (prob in [0,1])
@@ -101,6 +107,7 @@ class MeasureAdapter:
             "bias": bias,
             "bias_online": bias_est,
             "bias_model": bias_model,
+            "bias_gamma": gamma,
             "reliability": rrel,
             "R_eff": R_eff,
             "z_in": z,
@@ -126,5 +133,10 @@ class MeasureAdapter:
             self._rscale[key] = float(np.clip(ema, self.cfg.min_scale, self.cfg.max_scale))
         # Slowly adapt online bias toward mean innovation
         b = float(self._bias_ema.get(key, 0.0))
-        b = (1.0 - self._bias_beta) * b + self._bias_beta * float(innov)
+        # --- FIX: throttle EMA when model is trusted to avoid double-counting ---
+        gamma = float(np.clip(getattr(self.cfg, "bias_model_gain", 0.0), 0.0, 1.0))
+        beta_eff = (1.0 - gamma) * self._bias_beta
+        if beta_eff > 0.0:
+            b = (1.0 - beta_eff) * b + beta_eff * float(innov)
+        # else: when gamma≈1, leave EMA as-is (model dominates)
         self._bias_ema[key] = float(np.clip(b, -self._bias_clip, self._bias_clip))

@@ -45,7 +45,7 @@ class BiasNetDataset(Dataset):
         except Exception:
             w_val = 1.0
         w = torch.tensor(w_val, dtype=torch.float32)
-        return x, y, w
+        return {"features": x, "bias": y, "weight": w}
 
 
 def _index_for_time(ts: np.ndarray, t: float) -> int:
@@ -92,13 +92,16 @@ def build_biasnet_samples(
       - distance to target GT body center (consistent with runtime parametrization)
     """
     if los_adapter is None:
-        los_adapter = LOSAdapter(LOSConfig(verbose=False))
+        # Default experiments have no obstacles; keep LOS neutral unless explicitly provided
+        # (i.e., do not auto-enable a classifier here).
+        pass
 
     gt_pos = _gt_positions_from_T(gt_T_by_robot)
 
     samples: List[Dict] = []
     tgt = roles.target
     trks = roles.trackers
+    tracker_vocab = sorted(list(trks))
 
     # Pre-group for faster per‑t timestamp access
     uwb_by_t = dict(tuple(uwb_range_df.groupby("timestamp"))) if "timestamp" in uwb_range_df.columns else {}
@@ -149,8 +152,8 @@ def build_biasnet_samples(
             # True geometric range
             true_range = float(np.linalg.norm(p_tgt - eff_sensor_pos_gt))
 
-            # Optional LOS score
-            los_score = los_adapter.score(df_pair)  # may be None
+            # Optional LOS score (neutral 0.5 when los_adapter is None or disabled)
+            los_score = los_adapter.score(df_pair) if los_adapter is not None else None
 
             # Optional height difference (z_tgt - z_trk)
             if height_series is not None and trk in height_series and tgt in height_series:
@@ -159,7 +162,7 @@ def build_biasnet_samples(
                 dz = 0.0
 
             # Build feature vector (keep layout consistent with runtime builder)
-            feat = build_measurement_features(
+            feat_base = build_measurement_features(
                 tracker_pos=eff_sensor_pos_gt,
                 target_pred_pos=None,
                 uwb_range=float(z_agg),
@@ -168,9 +171,26 @@ def build_biasnet_samples(
                 height_tracker=None,
                 height_target=None
             )
-            feat = np.asarray(feat, dtype=float)
-            if feat.shape[0] >= 7:
-                feat[6] = dz  # overwrite 'dz' slot if present
+            feat_base = np.asarray(feat_base, dtype=float)
+            if feat_base.shape[0] >= 7:
+                feat_base[6] = dz  # overwrite 'dz' slot if present
+
+            # Pair-quality statistics (must match runtime)
+            _, R_pair2, meta_pairs = robust_range_aggregate(
+                df_pair, base_var=base_var, rho=pair_corr, huber_delta=huber_delta
+            )
+            m_eff = float(meta_pairs.get("m_eff", 1.0))
+            zs = df_pair["range"].to_numpy(dtype=float)
+            if zs.size >= 3:
+                q25, q75 = np.percentile(zs, [25, 75]); iqr = float(max(0.0, q75 - q25))
+            elif zs.size == 2:
+                iqr = float(abs(zs[1] - zs[0]))
+            else:
+                iqr = 0.0
+            onehot = np.zeros(len(tracker_vocab), dtype=float)
+            if trk in tracker_vocab:
+                onehot[tracker_vocab.index(trk)] = 1.0
+            feat = np.hstack([feat_base, [float(R_pair2), m_eff, iqr], onehot])
 
             samples.append({
                 "features": feat.tolist(),
@@ -182,7 +202,7 @@ def build_biasnet_samples(
                     "target": tgt,
                     "z_agg": float(z_agg),
                     "true_range": true_range,
-                    "R_pair": float(R_pair),
+                    "R_pair": float(R_pair2),
                     "los": None if los_score is None else float(los_score),
                 }
             })
@@ -623,17 +643,21 @@ class SnapshotCollector:
                  base_var=1.0,
                  pair_corr=0.0,
                  huber_delta=1.0,
-                 los_verbose=False):
+                 los_verbose=False,
+                 height_series: Optional[Dict[str, np.ndarray]] = None):
         self.ts = np.asarray(query_timestamps, dtype=float)
         self.roles = roles
         self.tag_map = tag_map
         self.gt_T = gt_T_by_robot
+        # Stable tracker vocabulary for one-hot identity features
+        self.tracker_vocab = sorted(list(roles.trackers))
         self.exp_name = exp_name
         self.tag_moment_arms = tag_moment_arms
         self.base_var = float(base_var)
         self.pair_corr = float(pair_corr)
         self.huber_delta = float(huber_delta)
         self.los_adapter = LOSAdapter(LOSConfig(verbose=los_verbose))
+        self.height_series = height_series  # dict: robot -> np.ndarray aligned with self.ts
 
         # precompute GT positions per robot
         self.gt_pos = {r: np.asarray([se_translation_from_matrix(T) for T in mats], dtype=float)
@@ -659,13 +683,50 @@ class SnapshotCollector:
         p_tgt = self.gt_pos[tgt][i]
         true_range = float(np.linalg.norm(p_tgt - eff_sensor_pos_used))
 
+        # Δz from PX4 height if available and requested
+        tgt = self.roles.target
+        h_trk = None; h_tgt = None
+        if self.height_series is not None:
+            try:
+                h_trk = float(self.height_series.get(trk, [None] * len(self.ts))[i])
+                h_tgt = float(self.height_series.get(tgt, [None] * len(self.ts))[i])
+            except (IndexError, TypeError, ValueError):
+                h_trk = None; h_tgt = None
+
+        # Keep LOS neutral (0.5) if not provided
         feat = build_measurement_features(
             tracker_pos=np.asarray(eff_sensor_pos_used, dtype=float),
-            target_pred_pos=None,
+            target_pred_pos=None,               # training parity: no bearing/dist inputs
             uwb_range=float(z_agg),
             los_score=None if los_score is None else float(los_score),
+            height_tracker=h_trk,
+            height_target=h_tgt
         )
         feat = np.asarray(feat, dtype=float)
+
+        # --- Pair-quality stats for BiasNet + identity one-hot ---
+        from swarm_ml.tagmap import robust_range_aggregate
+        # recompute pair variance/meta using the same settings as runtime
+        _, R_pair, meta_pairs = robust_range_aggregate(
+            pair_df, base_var=self.base_var, rho=self.pair_corr, huber_delta=self.huber_delta
+        )
+        m_eff = float(meta_pairs.get("m_eff", 1.0))
+        # Prefer an IQR from the rows we have at this t (m=2 supported)
+        if pair_df is not None and not pair_df.empty:
+            zs = pair_df["range"].to_numpy(dtype=float)
+            if zs.size >= 3:
+                q25, q75 = np.percentile(zs, [25, 75]); iqr = float(max(0.0, q75 - q25))
+            elif zs.size == 2:
+                iqr = float(abs(zs[1] - zs[0]))
+            else:
+                iqr = 0.0
+        else:
+            iqr = 0.0
+        # one-hot identity for tracker
+        onehot = np.zeros(len(self.tracker_vocab), dtype=float)
+        if trk in self.tracker_vocab:
+            onehot[self.tracker_vocab.index(trk)] = 1.0
+        feat = np.hstack([feat, [float(R_pair), m_eff, iqr], onehot])
 
         self._bias_jsonl.append({
             "features": feat.tolist(),
@@ -677,7 +738,8 @@ class SnapshotCollector:
                 "target": tgt,
                 "z_agg": float(z_agg),
                 "true_range": true_range,
-                "los": None if los_score is None else float(los_score)
+                "los": None if los_score is None else float(los_score),
+                "R_pair": float(R_pair)
             }
         })
 
@@ -1448,6 +1510,7 @@ class BiasNet(nn.Module):
     """
     def __init__(self, in_dim: int, hidden: int = 64):
         super().__init__()
+        self.in_dim = int(in_dim)
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.ReLU(),
@@ -1455,8 +1518,26 @@ class BiasNet(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden, 1),
         )
+        # Optional feature normalization (mirrors FusionNet)
+        self.register_buffer("x_mu",  torch.zeros(1, in_dim))
+        self.register_buffer("x_std", torch.ones(1,  in_dim))
+        self._use_norm = False
+
+    def set_normalizer(self, mu, std) -> None:
+        mu  = torch.as_tensor(mu,  dtype=torch.float32).reshape(1, -1)
+        std = torch.as_tensor(std, dtype=torch.float32).reshape(1, -1)
+        std = torch.clamp(std, min=1e-6)
+        if mu.shape[1] != self.in_dim or std.shape[1] != self.in_dim:
+            raise ValueError(f"BiasNet normalizer dim mismatch: expected {self.in_dim}, "
+                             f"got mu={mu.shape[1]} std={std.shape[1]}")
+        with torch.no_grad():
+            self.x_mu.copy_(mu)
+            self.x_std.copy_(std)
+        self._use_norm = True
 
     def forward(self, x):
+        if self._use_norm:
+            x = (x - self.x_mu) / self.x_std
         return self.net(x).squeeze(-1)  # (B,)
 
     def predict(self, x_np):
@@ -2367,15 +2448,6 @@ def _score_from_iqr(zs: np.ndarray) -> float:
         shrink = 0.25  # 25% of the deviation from 0.5 when m=2
         return 0.5 + shrink * (p_raw - 0.5)
 
-    # Use an "IQR-like" spread for small m as well
-    if m == 2:
-        iqr = abs(float(zs[1] - zs[0]))
-        # gentle logistic and heavy shrink so we don't overreact with 2 pts
-        k, x0 = 6.0, 0.12
-        p_raw = 1.0 / (1.0 + np.exp(k * (iqr - x0)))
-        p_raw = float(np.clip(p_raw, 0.05, 0.95))
-        shrink = 0.25  # 25% of the deviation from 0.5 when m=2
-        return 0.5 + shrink * (p_raw - 0.5)
 
     q25, q75 = np.percentile(zs, [25, 75])
     iqr = max(1e-6, float(q75 - q25))
@@ -2450,6 +2522,8 @@ class AdapterConfig:
     # New: LOS/geometry influences
     los_influence: float = 0.5     # controls how strongly LOS adjusts reliability
     geom_influence: float = 0.5    # controls how strongly |e_z| adjusts reliability
+    # How strongly to trust the learned bias on each step (0..1)
+    bias_model_gain: float = 0.0
     # Ownership of innovation-driven R scaling: if False, an external tuner owns R scaling.
     own_rscale: bool = True
 
@@ -2490,7 +2564,11 @@ class MeasureAdapter:
         if self.bias_model is not None and features is not None:
             pred = self.bias_model.predict(features)
             bias_model = float(np.clip(pred, -self.cfg.bias_clip, self.cfg.bias_clip))
-        bias = float(np.clip(bias_model + bias_est, -self._bias_clip, self._bias_clip))
+        # --- FIX: convex blend (no double-counting) ---
+        # gamma=0 -> EMA only; gamma=1 -> model only
+        gamma = float(np.clip(getattr(self.cfg, "bias_model_gain", 0.0), 0.0, 1.0))
+        bias_blend = gamma * bias_model + (1.0 - gamma) * bias_est
+        bias = float(np.clip(bias_blend, -self._bias_clip, self._bias_clip))
         z_corr = float(z - bias)
 
         # Reliability from LOS score (prob in [0,1])
@@ -2524,6 +2602,7 @@ class MeasureAdapter:
             "bias": bias,
             "bias_online": bias_est,
             "bias_model": bias_model,
+            "bias_gamma": gamma,
             "reliability": rrel,
             "R_eff": R_eff,
             "z_in": z,
@@ -2549,7 +2628,12 @@ class MeasureAdapter:
             self._rscale[key] = float(np.clip(ema, self.cfg.min_scale, self.cfg.max_scale))
         # Slowly adapt online bias toward mean innovation
         b = float(self._bias_ema.get(key, 0.0))
-        b = (1.0 - self._bias_beta) * b + self._bias_beta * float(innov)
+        # --- FIX: throttle EMA when model is trusted to avoid double-counting ---
+        gamma = float(np.clip(getattr(self.cfg, "bias_model_gain", 0.0), 0.0, 1.0))
+        beta_eff = (1.0 - gamma) * self._bias_beta
+        if beta_eff > 0.0:
+            b = (1.0 - beta_eff) * b + beta_eff * float(innov)
+        # else: when gamma≈1, leave EMA as-is (model dominates)
         self._bias_ema[key] = float(np.clip(b, -self._bias_clip, self._bias_clip))
 
 
@@ -2719,8 +2803,7 @@ def rts_smooth(mu_f, P_f, dts, noise: CVNoise):
     return np.array(mu_s), np.array(P_s)
 
 ### train_biasnet.py
-# swarm_ml/train_biasnet.py
-import argparse, os, json, random
+import os, json, random
 import numpy as np, torch
 from torch.utils.data import DataLoader
 from .models import BiasNet
@@ -2730,6 +2813,17 @@ def train_biasnet(train_samples, val_samples, in_dim, out_dir, lr=1e-3, epochs=3
     torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
     model = BiasNet(in_dim=in_dim)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
+
+    # install normalizer from train set
+    try:
+        X_train = np.asarray([s["features"] for s in train_samples], dtype=float)
+        mu = X_train.mean(axis=0)
+        sd = X_train.std(axis=0)
+        sd[sd < 1e-6] = 1.0
+        model.set_normalizer(mu, sd)
+        print(f"[BiasNet norm] feature_mean[min,max]=({mu.min():.3f},{mu.max():.3f}) feature_std[min,max]=({sd.min():.3f},{sd.max():.3f})")
+    except Exception as e:
+        print(f"[BiasNet norm] Warning: failed to compute/install normalizer: {e}")
 
     train_ds = BiasNetDataset(train_samples)
     val_ds = BiasNetDataset(val_samples)
@@ -2742,43 +2836,40 @@ def train_biasnet(train_samples, val_samples, in_dim, out_dir, lr=1e-3, epochs=3
         model.train()
         tr_loss = 0.0
         for batch in train_loader:
-            # Support (x,y,w) tuples from dataset
-            if isinstance(batch, (list, tuple)) and len(batch) == 3:
-                xb, yb, wb = batch
-            else:
-                xb, yb = batch
-                wb = torch.ones_like(yb)  # default unit weights
-
+            x, y = batch["features"], batch["bias"]
+            pred = model(x)
+            loss = torch.nn.functional.mse_loss(pred, y)
             opt.zero_grad()
-            yhat = model(xb)
-            # Weighted SmoothL1; normalize weights to keep scale stable
-            per = torch.nn.functional.smooth_l1_loss(yhat, yb, reduction='none')
-            wnorm = wb / (wb.mean() + 1e-8)
-            loss = (wnorm * per).mean()
             loss.backward()
             opt.step()
-            tr_loss += loss.item() * xb.size(0)
-        tr_loss /= len(train_ds)
+            tr_loss += loss.item()
+        tr_loss /= len(train_loader)
 
         model.eval()
         va_loss = 0.0
         with torch.no_grad():
             for batch in val_loader:
-                if isinstance(batch, (list, tuple)) and len(batch) == 3:
-                    xb, yb, _ = batch
-                else:
-                    xb, yb = batch
-                yhat = model(xb)
-                va_loss += torch.nn.functional.smooth_l1_loss(yhat, yb).item() * xb.size(0)
-        va_loss /= len(val_ds)
+                x, y = batch["features"], batch["bias"]
+                pred = model(x)
+                loss = torch.nn.functional.mse_loss(pred, y)
+                va_loss += loss.item()
+        va_loss /= len(val_loader)
 
         print(f"[ep {ep+1:03d}] train={tr_loss:.4f} val={va_loss:.4f}")
+
         if va_loss < best_val:
             best_val = va_loss
             torch.save(model.state_dict(), os.path.join(out_dir, "biasnet.pt"))
 
+    # Save meta + normalizer for runtime parity
+    meta = {"in_dim": in_dim}
+    try:
+        meta["x_mu"] = model.x_mu.squeeze(0).cpu().tolist()
+        meta["x_std"] = model.x_std.squeeze(0).cpu().tolist()
+    except Exception:
+        pass
     with open(os.path.join(out_dir, "biasnet_meta.json"), "w") as f:
-        json.dump({"in_dim": in_dim}, f, indent=2)
+        json.dump(meta, f, indent=2)
     return model
 
 
@@ -3118,19 +3209,8 @@ import miluv.utils as utils
 # EKF models (authors')
 try:
     import examples.ekfutils.imu_three_robots_models as model
-except Exce        # This node's local measurement set: only rows originated by this robot
-        pair_df = pd.DataFrame(columns=["timestamp"])  # default empty
-        if df_t is not None and not df_t.empty:
-            df_r = df_t[df_t["robot"] == args.id]
-            if not df_r.empty:
-                pair_df = select_pair_rows(df_r, trk_tags=tag_map.get(args.id, []),
-                                           tgt_tags=tag_map.get(args.target, []))
-
-        # Optional LOS/IQR window
-        pair_df_los = pair_df
-        if args.los_window and args.los_window > 0.0:
-            t0, t1 = float(t - args.los_window), float(t + args.los_window)
-            df_win = uwb_range[(uwb_range["timestamp"] >= t0) &
+except Exception:
+    import imu_three_robots_models as model  # local fallback
                                (uwb_range["timestamp"] <= t1) &
                                (uwb_range["robot"] == args.id)]
             pair_df_los = select_pair_rows(df_win,
@@ -3167,8 +3247,16 @@ def _load_biasnet(path_dir: str):
         meta = json.load(f)
     in_dim = int(meta["in_dim"])
     m = BiasNet(in_dim)
-    state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu")
+    state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu", weights_only=True)
     m.load_state_dict(state)
+    # Restore normalizer if present
+    try:
+        x_mu  = meta.get("x_mu", None)
+        x_std = meta.get("x_std", None)
+        if x_mu is not None and x_std is not None:
+            m.set_normalizer(x_mu, x_std)
+    except Exception:
+        pass
     m.eval()
     return m
 
@@ -3192,6 +3280,7 @@ def main():
     ap.add_argument("--use_cir", action="store_true")
     ap.add_argument("--los_verbose", action="store_true")
     ap.add_argument("--biasnet_dir", default=None)
+    ap.add_argument("--bias_gain", type=float, default=0.6, help="Trust in learned bias (0..1)")
     ap.add_argument("--use_height_tf", action="store_true")
     ap.add_argument("--height_std", type=float, default=0.07)
     ap.add_argument("--r_floor_blend", type=float, default=0.5,
@@ -3288,6 +3377,7 @@ def main():
         base_range_var=base_var,
         los_influence=args.los_influence,
         geom_influence=args.geom_influence,
+        bias_model_gain=args.bias_gain,
         # If an OnlineTuner is active, delegate R scaling to it.
         own_rscale=(not args.online_tune)
     )
@@ -3480,13 +3570,51 @@ def main():
                     h_trk = None; h_tgt = None
 
             # features (use fused target prediction if available)
+            # BiasNet features: LOS neutral unless --use_los; include Δz when --use_height_tf
+            h_trk_feat = None; h_tgt_feat = None
+            if args.use_height_tf and height_at_q:
+                try:
+                    h_trk_feat = float(height_at_q[args.id][i])
+                    h_tgt_feat = float(height_at_q[args.target][i])
+                except (KeyError, IndexError, TypeError, ValueError):
+                    h_trk_feat = None; h_tgt_feat = None
+
             feat = build_measurement_features(
                 tracker_pos=eff_sensor_pos,
-                target_pred_pos=None,          # match training (no geometry inputs)
+                target_pred_pos=None,          # no bearing/dist inputs
                 uwb_range=float(z_agg),
-                los_score=los_score,
-                height_tracker=h_trk, height_target=h_tgt
+                los_score=los_score if args.use_los else None,
+                height_tracker=h_trk_feat,
+                height_target=h_tgt_feat
             )
+            
+            # --- Extend with pair-quality & identity (must match collector) ---
+            # Need to import robust_range_aggregate for pair analysis
+            from swarm_ml.tagmap import robust_range_aggregate
+            _, R_pair_agent, meta_pairs_agent = robust_range_aggregate(
+                pair_df, base_var=base_var, rho=args.pair_corr, huber_delta=args.huber_delta
+            )
+            m_eff = float(meta_pairs_agent.get("m_eff", 1.0))
+            # IQR from windowed or current pair data
+            if pair_df_los is not None and not pair_df_los.empty:
+                zs_los = pair_df_los["range"].to_numpy(dtype=float)
+                if zs_los.size >= 3:
+                    q25, q75 = np.percentile(zs_los, [25, 75]); iqr = float(max(0.0, q75 - q25))
+                elif zs_los.size == 2:
+                    iqr = float(abs(zs_los[1] - zs_los[0]))
+                else:
+                    iqr = float(meta_pairs_agent.get("iqr", 0.0))
+            else:
+                iqr = float(meta_pairs_agent.get("iqr", 0.0))
+            # Create tracker vocabulary and one-hot encoding
+            tracker_vocab = sorted([args.id])  # In robot_node, only self is tracker
+            if args.target in robots:  # Handle case where target could be tracker too
+                all_trackers = [r for r in robots if r != args.target]
+                tracker_vocab = sorted(all_trackers)
+            onehot = np.zeros(len(tracker_vocab), dtype=float)
+            if args.id in tracker_vocab:
+                onehot[tracker_vocab.index(args.id)] = 1.0
+            feat = np.hstack([feat, [float(R_pair_agent), m_eff, iqr], onehot])
 
             # tuner pre-setup (R scale & gate)
             link = (args.id, args.target)
@@ -4072,8 +4200,17 @@ def load_biasnet(path_dir: str):
         meta = json.load(f)
     in_dim = int(meta["in_dim"])
     model = BiasNet(in_dim)
-    state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu")
+    state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu", weights_only=True)
     model.load_state_dict(state)
+    # Restore normalizer if present
+    try:
+        x_mu  = meta.get("x_mu", None)
+        x_std = meta.get("x_std", None)
+        if x_mu is not None and x_std is not None:
+            model.set_normalizer(x_mu, x_std)
+            print(f"[SWARM] BiasNet normalizer restored: {len(x_mu)} features")
+    except Exception as e:
+        print(f"[SWARM] Warning: could not set BiasNet normalizer: {e}")
     model.eval()
     return model
 
@@ -4201,6 +4338,7 @@ def main(args):
         base_range_var=base_var,
         los_influence=args.los_influence,
         geom_influence=args.geom_influence,
+        bias_model_gain=args.bias_gain,
         ema_alpha=args.ema_alpha,
         min_scale=args.r_min_scale,
         max_scale=args.r_max_scale,
@@ -4273,7 +4411,8 @@ def main(args):
             base_var=base_var,
             pair_corr=args.pair_corr,
             huber_delta=args.huber_delta,
-            los_verbose=args.los_verbose
+            los_verbose=args.los_verbose,
+            height_series=(height_at_q if args.use_height_tf else None)
         )
 
     mu_star_seq, P_star_seq = [], []
@@ -4444,10 +4583,28 @@ def main(args):
                 tracker_pos=eff_sensor_pos,
                 target_pred_pos=None,          # match training (no geometry inputs)
                 uwb_range=z_agg_center,
-                los_score=los_score,
-                height_tracker=h_trk,
-                height_target=h_tgt
+                los_score=los_score if args.use_los else None,
+                height_tracker=(float(height_at_q[trk][i])             if (args.use_height_tf and height_at_q and (trk in height_at_q)) else None),
+                height_target=(float(height_at_q[roles.target][i])     if (args.use_height_tf and height_at_q and (roles.target in height_at_q)) else None)
             )
+            
+            # --- Extend with pair-quality & identity (must match collector) ---
+            m_eff = float(meta_pairs.get("m_eff", 1.0))
+            # IQR from the windowed set if present, else meta / safe fallback
+            if pair_df_los is not None and not pair_df_los.empty:
+                zs_los = pair_df_los["range"].to_numpy(dtype=float)
+                if zs_los.size >= 3:
+                    q25, q75 = np.percentile(zs_los, [25, 75]); iqr = float(max(0.0, q75 - q25))
+                elif zs_los.size == 2:
+                    iqr = float(abs(zs_los[1] - zs_los[0]))
+                else:
+                    iqr = float(meta_pairs.get("iqr", 0.0))
+            else:
+                iqr = float(meta_pairs.get("iqr", 0.0))
+            tracker_vocab = sorted(list(roles.trackers))
+            onehot = np.zeros(len(tracker_vocab), dtype=float)
+            onehot[tracker_vocab.index(trk)] = 1.0
+            feat = np.hstack([feat, [float(R_pair), m_eff, iqr], onehot])
 
             # Per-link R scaling + gating from tuner
             link = (trk, roles.target)
@@ -4832,6 +4989,7 @@ if __name__ == "__main__":
     p.add_argument("--smooth_sigma_a_xy", type=float, default=1.0)
     p.add_argument("--smooth_sigma_a_z", type=float, default=0.7)
     p.add_argument("--biasnet_dir", default=None, help="Directory with biasnet.pt and biasnet_meta.json")
+    p.add_argument("--bias_gain", type=float, default=0.6, help="Trust in learned bias (0..1)")
     p.add_argument("--fusionnet_dir", default=None, help="Directory with fusionnet.pt and fusionnet_meta.json")
     p.add_argument("--out", default="outputs_swarm")
     p.add_argument("--collect_bias", action="store_true", help="Collect BiasNet samples during run")

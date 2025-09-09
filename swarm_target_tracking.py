@@ -96,8 +96,17 @@ def load_biasnet(path_dir: str):
         meta = json.load(f)
     in_dim = int(meta["in_dim"])
     model = BiasNet(in_dim)
-    state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu")
+    state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu", weights_only=True)
     model.load_state_dict(state)
+    # Restore normalizer if present
+    try:
+        x_mu  = meta.get("x_mu", None)
+        x_std = meta.get("x_std", None)
+        if x_mu is not None and x_std is not None:
+            model.set_normalizer(x_mu, x_std)
+            print(f"[SWARM] BiasNet normalizer restored: {len(x_mu)} features")
+    except Exception as e:
+        print(f"[SWARM] Warning: could not set BiasNet normalizer: {e}")
     model.eval()
     return model
 
@@ -225,6 +234,7 @@ def main(args):
         base_range_var=base_var,
         los_influence=args.los_influence,
         geom_influence=args.geom_influence,
+        bias_model_gain=args.bias_gain,
         ema_alpha=args.ema_alpha,
         min_scale=args.r_min_scale,
         max_scale=args.r_max_scale,
@@ -297,7 +307,8 @@ def main(args):
             base_var=base_var,
             pair_corr=args.pair_corr,
             huber_delta=args.huber_delta,
-            los_verbose=args.los_verbose
+            los_verbose=args.los_verbose,
+            height_series=(height_at_q if args.use_height_tf else None)
         )
 
     mu_star_seq, P_star_seq = [], []
@@ -468,10 +479,28 @@ def main(args):
                 tracker_pos=eff_sensor_pos,
                 target_pred_pos=None,          # match training (no geometry inputs)
                 uwb_range=z_agg_center,
-                los_score=los_score,
-                height_tracker=h_trk,
-                height_target=h_tgt
+                los_score=los_score if args.use_los else None,
+                height_tracker=(float(height_at_q[trk][i])             if (args.use_height_tf and height_at_q and (trk in height_at_q)) else None),
+                height_target=(float(height_at_q[roles.target][i])     if (args.use_height_tf and height_at_q and (roles.target in height_at_q)) else None)
             )
+            
+            # --- Extend with pair-quality & identity (must match collector) ---
+            m_eff = float(meta_pairs.get("m_eff", 1.0))
+            # IQR from the windowed set if present, else meta / safe fallback
+            if pair_df_los is not None and not pair_df_los.empty:
+                zs_los = pair_df_los["range"].to_numpy(dtype=float)
+                if zs_los.size >= 3:
+                    q25, q75 = np.percentile(zs_los, [25, 75]); iqr = float(max(0.0, q75 - q25))
+                elif zs_los.size == 2:
+                    iqr = float(abs(zs_los[1] - zs_los[0]))
+                else:
+                    iqr = float(meta_pairs.get("iqr", 0.0))
+            else:
+                iqr = float(meta_pairs.get("iqr", 0.0))
+            tracker_vocab = sorted(list(roles.trackers))
+            onehot = np.zeros(len(tracker_vocab), dtype=float)
+            onehot[tracker_vocab.index(trk)] = 1.0
+            feat = np.hstack([feat, [float(R_pair), m_eff, iqr], onehot])
 
             # Per-link R scaling + gating from tuner
             link = (trk, roles.target)
@@ -856,6 +885,7 @@ if __name__ == "__main__":
     p.add_argument("--smooth_sigma_a_xy", type=float, default=1.0)
     p.add_argument("--smooth_sigma_a_z", type=float, default=0.7)
     p.add_argument("--biasnet_dir", default=None, help="Directory with biasnet.pt and biasnet_meta.json")
+    p.add_argument("--bias_gain", type=float, default=0.6, help="Trust in learned bias (0..1)")
     p.add_argument("--fusionnet_dir", default=None, help="Directory with fusionnet.pt and fusionnet_meta.json")
     p.add_argument("--out", default="outputs_swarm")
     p.add_argument("--collect_bias", action="store_true", help="Collect BiasNet samples during run")

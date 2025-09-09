@@ -11,6 +11,7 @@ class BiasNet(nn.Module):
     """
     def __init__(self, in_dim: int, hidden: int = 64):
         super().__init__()
+        self.in_dim = int(in_dim)
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.ReLU(),
@@ -18,8 +19,26 @@ class BiasNet(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden, 1),
         )
+        # Optional feature normalization (mirrors FusionNet)
+        self.register_buffer("x_mu",  torch.zeros(1, in_dim))
+        self.register_buffer("x_std", torch.ones(1,  in_dim))
+        self._use_norm = False
+
+    def set_normalizer(self, mu, std) -> None:
+        mu  = torch.as_tensor(mu,  dtype=torch.float32).reshape(1, -1)
+        std = torch.as_tensor(std, dtype=torch.float32).reshape(1, -1)
+        std = torch.clamp(std, min=1e-6)
+        if mu.shape[1] != self.in_dim or std.shape[1] != self.in_dim:
+            raise ValueError(f"BiasNet normalizer dim mismatch: expected {self.in_dim}, "
+                             f"got mu={mu.shape[1]} std={std.shape[1]}")
+        with torch.no_grad():
+            self.x_mu.copy_(mu)
+            self.x_std.copy_(std)
+        self._use_norm = True
 
     def forward(self, x):
+        if self._use_norm:
+            x = (x - self.x_mu) / self.x_std
         return self.net(x).squeeze(-1)  # (B,)
 
     def predict(self, x_np):

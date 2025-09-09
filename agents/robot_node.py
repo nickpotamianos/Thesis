@@ -10,19 +10,8 @@ import miluv.utils as utils
 # EKF models (authors')
 try:
     import examples.ekfutils.imu_three_robots_models as model
-except Exce        # This node's local measurement set: only rows originated by this robot
-        pair_df = pd.DataFrame(columns=["timestamp"])  # default empty
-        if df_t is not None and not df_t.empty:
-            df_r = df_t[df_t["robot"] == args.id]
-            if not df_r.empty:
-                pair_df = select_pair_rows(df_r, trk_tags=tag_map.get(args.id, []),
-                                           tgt_tags=tag_map.get(args.target, []))
-
-        # Optional LOS/IQR window
-        pair_df_los = pair_df
-        if args.los_window and args.los_window > 0.0:
-            t0, t1 = float(t - args.los_window), float(t + args.los_window)
-            df_win = uwb_range[(uwb_range["timestamp"] >= t0) &
+except Exception:
+    import imu_three_robots_models as model  # local fallback
                                (uwb_range["timestamp"] <= t1) &
                                (uwb_range["robot"] == args.id)]
             pair_df_los = select_pair_rows(df_win,
@@ -59,8 +48,16 @@ def _load_biasnet(path_dir: str):
         meta = json.load(f)
     in_dim = int(meta["in_dim"])
     m = BiasNet(in_dim)
-    state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu")
+    state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu", weights_only=True)
     m.load_state_dict(state)
+    # Restore normalizer if present
+    try:
+        x_mu  = meta.get("x_mu", None)
+        x_std = meta.get("x_std", None)
+        if x_mu is not None and x_std is not None:
+            m.set_normalizer(x_mu, x_std)
+    except Exception:
+        pass
     m.eval()
     return m
 
@@ -84,6 +81,7 @@ def main():
     ap.add_argument("--use_cir", action="store_true")
     ap.add_argument("--los_verbose", action="store_true")
     ap.add_argument("--biasnet_dir", default=None)
+    ap.add_argument("--bias_gain", type=float, default=0.6, help="Trust in learned bias (0..1)")
     ap.add_argument("--use_height_tf", action="store_true")
     ap.add_argument("--height_std", type=float, default=0.07)
     ap.add_argument("--r_floor_blend", type=float, default=0.5,
@@ -180,6 +178,7 @@ def main():
         base_range_var=base_var,
         los_influence=args.los_influence,
         geom_influence=args.geom_influence,
+        bias_model_gain=args.bias_gain,
         # If an OnlineTuner is active, delegate R scaling to it.
         own_rscale=(not args.online_tune)
     )
@@ -372,13 +371,51 @@ def main():
                     h_trk = None; h_tgt = None
 
             # features (use fused target prediction if available)
+            # BiasNet features: LOS neutral unless --use_los; include Δz when --use_height_tf
+            h_trk_feat = None; h_tgt_feat = None
+            if args.use_height_tf and height_at_q:
+                try:
+                    h_trk_feat = float(height_at_q[args.id][i])
+                    h_tgt_feat = float(height_at_q[args.target][i])
+                except (KeyError, IndexError, TypeError, ValueError):
+                    h_trk_feat = None; h_tgt_feat = None
+
             feat = build_measurement_features(
                 tracker_pos=eff_sensor_pos,
-                target_pred_pos=None,          # match training (no geometry inputs)
+                target_pred_pos=None,          # no bearing/dist inputs
                 uwb_range=float(z_agg),
-                los_score=los_score,
-                height_tracker=h_trk, height_target=h_tgt
+                los_score=los_score if args.use_los else None,
+                height_tracker=h_trk_feat,
+                height_target=h_tgt_feat
             )
+            
+            # --- Extend with pair-quality & identity (must match collector) ---
+            # Need to import robust_range_aggregate for pair analysis
+            from swarm_ml.tagmap import robust_range_aggregate
+            _, R_pair_agent, meta_pairs_agent = robust_range_aggregate(
+                pair_df, base_var=base_var, rho=args.pair_corr, huber_delta=args.huber_delta
+            )
+            m_eff = float(meta_pairs_agent.get("m_eff", 1.0))
+            # IQR from windowed or current pair data
+            if pair_df_los is not None and not pair_df_los.empty:
+                zs_los = pair_df_los["range"].to_numpy(dtype=float)
+                if zs_los.size >= 3:
+                    q25, q75 = np.percentile(zs_los, [25, 75]); iqr = float(max(0.0, q75 - q25))
+                elif zs_los.size == 2:
+                    iqr = float(abs(zs_los[1] - zs_los[0]))
+                else:
+                    iqr = float(meta_pairs_agent.get("iqr", 0.0))
+            else:
+                iqr = float(meta_pairs_agent.get("iqr", 0.0))
+            # Create tracker vocabulary and one-hot encoding
+            tracker_vocab = sorted([args.id])  # In robot_node, only self is tracker
+            if args.target in robots:  # Handle case where target could be tracker too
+                all_trackers = [r for r in robots if r != args.target]
+                tracker_vocab = sorted(all_trackers)
+            onehot = np.zeros(len(tracker_vocab), dtype=float)
+            if args.id in tracker_vocab:
+                onehot[tracker_vocab.index(args.id)] = 1.0
+            feat = np.hstack([feat, [float(R_pair_agent), m_eff, iqr], onehot])
 
             # tuner pre-setup (R scale & gate)
             link = (args.id, args.target)
