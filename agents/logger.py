@@ -160,7 +160,15 @@ def main():
 
         # Fuse (centralized or gossip) and record
         if args.method == "gossip":
-            mu_star, P_star, w = gossip.fuse(parts)
+            # Use learned weights when fusionnet is provided
+            if (fuser.weight_model is not None) and (len(node_feats) > 0):
+                keys = list(parts.keys())
+                X = np.vstack([node_feats[k].reshape(1, -1) for k in keys])
+                w_vec = fuser.weight_model.predict_weights(X)           # (N,)
+                w_map = {keys[i]: float(w_vec[i]) for i in range(len(keys))}
+                mu_star, P_star, w = gossip.fuse(parts, weights=w_map)
+            else:
+                mu_star, P_star, w = gossip.fuse(parts)
         else:
             method = args.method if args.method in ("uniform","grid") else "learned"
             mu_star, P_star, w = fuser.fuse(parts, method=method, node_features=node_feats if method=="learned" else None)

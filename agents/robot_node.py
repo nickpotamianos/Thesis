@@ -12,11 +12,6 @@ try:
     import examples.ekfutils.imu_three_robots_models as model
 except Exception:
     import imu_three_robots_models as model  # local fallback
-                               (uwb_range["timestamp"] <= t1) &
-                               (uwb_range["robot"] == args.id)]
-            pair_df_los = select_pair_rows(df_win,
-                                           trk_tags=tag_map.get(args.id, []),
-                                           tgt_tags=tag_map.get(args.target, []))    import imu_three_robots_models as model  # local fallback
 
 # ---- Ours ----
 from swarm_net.udp import make_tx, make_rx_nb, UdpGroup
@@ -48,7 +43,12 @@ def _load_biasnet(path_dir: str):
         meta = json.load(f)
     in_dim = int(meta["in_dim"])
     m = BiasNet(in_dim)
-    state = torch.load(os.path.join(path_dir, "biasnet.pt"), map_location="cpu", weights_only=True)
+    pt_path = os.path.join(path_dir, "biasnet.pt")
+    # Backward-compatible torch.load: weights_only is PyTorch >=2.0
+    try:
+        state = torch.load(pt_path, map_location="cpu", weights_only=True)
+    except TypeError:
+        state = torch.load(pt_path, map_location="cpu")
     m.load_state_dict(state)
     # Restore normalizer if present
     try:
@@ -307,6 +307,22 @@ def main():
             if not df_r.empty:
                 pair_df = select_pair_rows(df_r, trk_tags=tag_map.get(args.id, []),
                                            tgt_tags=tag_map.get(args.target, []))
+        # ---------- LOS/IQR window source ----------
+        # Default: use the same-timestamp pairs; widen to a small time window only if requested.
+        pair_df_los = pair_df
+        if args.los_window and args.los_window > 0.0:
+            try:
+                t0, t1 = float(t - args.los_window), float(t + args.los_window)
+                df_win = uwb_range[
+                    (uwb_range["timestamp"] >= t0) &
+                    (uwb_range["timestamp"] <= t1) &
+                    (uwb_range["robot"] == args.id)
+                ]
+                pair_df_los = select_pair_rows(df_win,
+                                               trk_tags=tag_map.get(args.id, []),
+                                               tgt_tags=tag_map.get(args.target, []))
+            except Exception:
+                pass
 
         # Local TargetIF update for this tracker
         # 1) predict (with optional Q adaptation from tuner)
@@ -390,8 +406,6 @@ def main():
             )
             
             # --- Extend with pair-quality & identity (must match collector) ---
-            # Need to import robust_range_aggregate for pair analysis
-            from swarm_ml.tagmap import robust_range_aggregate
             _, R_pair_agent, meta_pairs_agent = robust_range_aggregate(
                 pair_df, base_var=base_var, rho=args.pair_corr, huber_delta=args.huber_delta
             )
@@ -443,7 +457,7 @@ def main():
                 h0, H = tf._range_linearize(tf.mu, eff_sensor_pos)
                 from numpy.linalg import inv
                 P_pred_local = inv(tf.J)
-                S_pred = float(H @ P_pred_local @ H.T + R_eff)
+                S_pred = float((H @ P_pred_local @ H.T)[0, 0] + R_eff)
                 nu_pred = float(z_corr - h0)
                 gate_sigma = float(tuner.get_gate_sigma(link))
                 accepted = float((nu_pred * nu_pred) / S_pred) <= gate_sigma * gate_sigma

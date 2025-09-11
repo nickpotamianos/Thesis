@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-Complete Test 3: Run decentralized gossip to full completion
+Complete Decentralized Test with STRICT baseline settings
+Supports both BiasNet and FusionNet with gossip learned weights
 """
 import subprocess
 import time
 import os
 import sys
 from pathlib import Path
+
+# Optional: point this at your trained BiasNet directory (with biasnet.pt and biasnet_meta.json)
+# Using the same models as the notebook for default_3_random_0 (fold 6)
+BIASNET_DIR = os.environ.get("BIASNET_DIR", "/home/nick/Thesis/runs/20250910_004423_notebook_cv_eval/models/cv_fold_6_bn_time_byexp")
+# Optional: point this at your trained FusionNet directory 
+FUSIONNET_DIR = os.environ.get("FUSIONNET_DIR", "/home/nick/Thesis/runs/20250910_004423_notebook_cv_eval/models/cv_fold_6_fn/fusionnet_by_exp")
 
 def run_command_background(cmd, logfile):
     """Run command in background and log output"""
@@ -27,48 +34,70 @@ def main():
     # Remove old output
     subprocess.run(["rm", "-rf", "outputs_swarm/decentralized"], capture_output=True)
     
-    print("=== Starting Complete Decentralized Test ===")
+    print("=== Starting Complete Decentralized Test (STRICT) ===")
     
-    # Start logger
+    # --- LOGGER (gossip CI + objective=trace for parity; rounds=3) ---
     logger_cmd = [
         "python", "-m", "agents.logger",
         "--exp", "default_3_random_0",
         "--target", "ifo003", 
         "--method", "gossip",
         "--rounds", "3",
-        "--ci_objective", "logdet",
+        "--ci_objective", "trace",       # STRICT: objective=trace (note: gossip ignores grid search)
         "--fanout",
         "--planner", "none",
         "--out", "outputs_swarm/decentralized"
     ]
     
+    # Add FusionNet if available
+    if FUSIONNET_DIR:
+        logger_cmd.extend(["--fusionnet_dir", FUSIONNET_DIR])
+        print(f"Using FusionNet from: {FUSIONNET_DIR}")
+    
     logger_proc = run_command_background(logger_cmd, "logger.log")
     time.sleep(3)  # Let logger initialize
     
-    # Start first robot node
+    # Shared STRICT settings for nodes
+    node_common = [
+        "--use_height_tf",                # STRICT: use PX4 height (in authors' EKF and z-only TF)
+        "--uwb_std", "0.8",               # STRICT
+        "--pair_corr", "0.3",             # STRICT
+        "--sigma_a_xy", "3.0",            # STRICT
+        "--sigma_a_z",  "1.5",            # STRICT
+        "--los_influence", "0",           # STRICT: turn off LOS->reliability shaping
+        "--geom_influence", "0",          # STRICT: turn off |e_z|->reliability shaping
+        "--online_tune",                  # STRICT: enable OnlineTuner (R-scaling/Q-adapt/gating)
+        "--online_r_min_scale", "0.75",   # STRICT
+        "--online_r_max_scale", "3.0",    # STRICT (tighter than default)
+        "--gate_target", "0.90",          # STRICT
+        "--gate_sigma_init", "4.0",       # STRICT
+        "--q_adapt",                      # STRICT: allow gentle Q inflation/deflation
+        "--control_mode", "none"
+    ]
+    
+    # Optionally mount your BiasNet
+    if BIASNET_DIR:
+        node_common += ["--biasnet_dir", BIASNET_DIR, "--bias_gain", "0.6"]
+        print(f"Using BiasNet from: {BIASNET_DIR}")
+    
+    # --- NODE 1 ---
     node1_cmd = [
         "python", "-m", "agents.robot_node",
         "--id", "ifo001",
         "--target", "ifo003",
         "--exp", "default_3_random_0",
-        "--use_height_tf",
-        "--online_tune",
-        "--control_mode", "none"
-    ]
+    ] + node_common
     
     node1_proc = run_command_background(node1_cmd, "node1.log")
     time.sleep(2)
     
-    # Start second robot node  
+    # --- NODE 2 ---
     node2_cmd = [
         "python", "-m", "agents.robot_node",
         "--id", "ifo002",
         "--target", "ifo003", 
         "--exp", "default_3_random_0",
-        "--use_height_tf",
-        "--online_tune", 
-        "--control_mode", "none"
-    ]
+    ] + node_common
     
     node2_proc = run_command_background(node2_cmd, "node2.log")
     

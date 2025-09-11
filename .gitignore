@@ -16,3 +16,4 @@ data
 outputs_*
 *.pdf
 *.log
+/runs
