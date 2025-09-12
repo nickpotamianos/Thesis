@@ -39,7 +39,7 @@ def main():
     
     # --- LOGGER (gossip CI + objective=trace for parity; rounds=3) ---
     logger_cmd = [
-        "python", "-m", "agents.logger",
+        "/home/nick/Thesis/miluv_env/bin/python", "-m", "agents.logger",
         "--exp", "default_3_random_0b",
         "--target", "ifo003", 
         "--method", "gossip",
@@ -83,7 +83,7 @@ def main():
     
     # --- NODE 1 ---
     node1_cmd = [
-        "python", "-m", "agents.robot_node",
+        "/home/nick/Thesis/miluv_env/bin/python", "-m", "agents.robot_node",
         "--id", "ifo001",
         "--target", "ifo003",
         "--exp", "default_3_random_0b",
@@ -94,9 +94,9 @@ def main():
     
     # --- NODE 2 ---
     node2_cmd = [
-        "python", "-m", "agents.robot_node",
+        "/home/nick/Thesis/miluv_env/bin/python", "-m", "agents.robot_node",
         "--id", "ifo002",
-        "--target", "ifo003", 
+        "--target", "ifo003",
         "--exp", "default_3_random_0b",
     ] + node_common
     

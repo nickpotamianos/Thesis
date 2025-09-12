@@ -58,9 +58,9 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
 
-    # Load GT sequence for evaluation and define timestamps
+    # Load GT sequence for evaluation and define timestamps  
     miluv = DataLoader(args.exp, exp_dir="./data/three_robots", cir=False, barometer=False,
-                       height=False, imu="px4", cam=None, mag=False)
+                       height=True, imu="px4", cam=None, mag=False)
     data = miluv.data
     robots = list(data.keys())
     if args.target not in robots:
@@ -73,9 +73,15 @@ def main():
         trackers = sorted([r for r in robots if r != args.target])
 
     # Precompute GT target positions at the timestamps of interest
-    # Use the union of all UWB timestamps across robots
+    # Use the union of all UWB and height timestamps across robots (same as robot nodes)
     uwb_range = pd.concat([data[r]["uwb_range"].assign(robot=r) for r in robots], ignore_index=True)
-    query_timestamps = np.sort(uwb_range["timestamp"].unique())
+    height_df = pd.concat([data[r]["height"].assign(robot=r) for r in robots], ignore_index=True)
+    
+    # Query timestamps = union of UWB + height (same logic as robot_node.py)
+    query_timestamps = np.sort(np.unique(np.append(
+        uwb_range["timestamp"].to_numpy(),
+        height_df["timestamp"].to_numpy() if not height_df.empty else np.array([], dtype=float)
+    )))
     gt_se23 = utils.get_se23_poses(
         data[args.target]["mocap_quat"](query_timestamps),
         data[args.target]["mocap_pos"].derivative(nu=1)(query_timestamps),
@@ -89,6 +95,10 @@ def main():
         fuser.weight_model = _load_fusionnet(args.fusionnet_dir)
         if fuser.weight_model is None:
             raise ValueError("--fusionnet_dir is required for learned method")
+    elif args.method == "gossip" and args.fusionnet_dir is not None:
+        # Load FusionNet for gossip method when provided
+        fuser.weight_model = _load_fusionnet(args.fusionnet_dir)
+        print(f"[LOGGER] Loaded FusionNet for gossip from: {args.fusionnet_dir}")
     gossip = GossipFuser(CommsConfig(rounds=args.rounds, p_link=1.0, p_drop=0.0, seed=0))
 
     # UDP receiver
@@ -164,8 +174,11 @@ def main():
             if (fuser.weight_model is not None) and (len(node_feats) > 0):
                 keys = list(parts.keys())
                 X = np.vstack([node_feats[k].reshape(1, -1) for k in keys])
+                print(f"[LOGGER] FusionNet input at t={tb:.2f}: shape={X.shape}, features per node: {[node_feats[k].shape for k in keys]}")
                 w_vec = fuser.weight_model.predict_weights(X)           # (N,)
                 w_map = {keys[i]: float(w_vec[i]) for i in range(len(keys))}
+                if len(keys) <= 5:  # Don't spam with too many nodes
+                    print(f"[LOGGER] FusionNet weights at t={tb:.2f}: {w_map}")
                 mu_star, P_star, w = gossip.fuse(parts, weights=w_map)
             else:
                 mu_star, P_star, w = gossip.fuse(parts)

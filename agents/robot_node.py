@@ -501,7 +501,7 @@ def main():
         if me < 1e-10:
             P_i = P_i + np.eye(P_i.shape[0]) * (1e-10 - me + 1e-12)
 
-        # Node features for FusionNet (8‑vector)
+        # Node features for FusionNet (11‑vector to match training - adds R_pair, m_eff, iqr)
         var_pos = float(np.trace(P_i[:3, :3]))
         geom_ez = 0.0
         if target_pred_pos is not None:
@@ -510,8 +510,37 @@ def main():
             geom_ez = float(abs(diff[2]) / nrm)
         gate_sig = float(tf.cfg.gate_N_sigma)
         nis_ema = float(meas_ai._whiten_ema.get((args.id, args.target), 1.0))
-        X = np.array([var_pos, rel, z_agg_center, float(R_eff), geom_ez, float(los_score),
-                      gate_sig, nis_ema], dtype=float)
+        
+        # Pair-quality features to match training exactly (features 8, 9, 10)
+        R_pair_feat = float(base_var)  # fallback
+        m_eff_feat = 1.0
+        iqr_feat = 0.0
+        if pair_df is not None and not pair_df.empty:
+            try:
+                # Recompute exactly as in training
+                _, R_pair_calc, meta_calc = robust_range_aggregate(
+                    pair_df, base_var=base_var, rho=args.pair_corr, huber_delta=args.huber_delta
+                )
+                R_pair_feat = float(R_pair_calc)
+                m_eff_feat = float(meta_calc.get('m_eff', 1.0))
+                
+                # IQR calculation exactly as in training
+                zs = pair_df["range"].to_numpy(dtype=float)
+                if zs.size >= 3:
+                    q25, q75 = np.percentile(zs, [25, 75])
+                    iqr_feat = float(max(0.0, q75 - q25))
+                elif zs.size == 2:
+                    iqr_feat = float(abs(zs[1] - zs[0]))
+                else:
+                    iqr_feat = 0.0
+            except Exception:
+                pass
+        
+        # First 8 features (standard)
+        X_base = np.array([var_pos, rel, z_agg_center, float(R_eff), geom_ez, float(los_score),
+                          gate_sig, nis_ema], dtype=float)
+        # Add 3 pair-quality features
+        X = np.hstack([X_base, [R_pair_feat, m_eff_feat, iqr_feat]])
 
         # Broadcast compact message (+ our current effective sensor position 'p')
         tx({
