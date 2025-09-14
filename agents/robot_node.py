@@ -24,6 +24,7 @@ from swarm_ml.los_adapter import LOSAdapter, LOSConfig
 from swarm_ml.online_tuner import OnlineTuner, OnlineAdaptConfig
 from swarm_ml.safety import project_to_safe, SafetyLimits
 from swarm_control.bridge import ControlBridge
+from swarm_ml.active_sensing import expected_trace_reduction
 
 def _concat_with_robot(data: dict, key: str) -> pd.DataFrame:
     dfs = []
@@ -84,8 +85,10 @@ def main():
     ap.add_argument("--bias_gain", type=float, default=0.6, help="Trust in learned bias (0..1)")
     ap.add_argument("--use_height_tf", action="store_true")
     ap.add_argument("--height_std", type=float, default=0.07)
-    ap.add_argument("--r_floor_blend", type=float, default=0.5,
+    ap.add_argument("--r_floor_blend", type=float, default=0.3,
                     help="Blend factor for soft R floor with pair variance (0..1)")
+    ap.add_argument("--min_eig_gain", type=float, default=0.0,
+                    help="Skip a local update if expected trace reduction is below this threshold (0 disables).")
     # expose influences for quick A/B
     ap.add_argument("--los_influence", type=float, default=0.5)
     ap.add_argument("--geom_influence", type=float, default=0.5)
@@ -295,7 +298,7 @@ def main():
             for _, row in hrows.iterrows():
                 ekf.correct({"height": float(row["range"]), "robot": str(row["robot"])})
 
-        # Store EKF state history (not strictly required here)
+                # Store EKF state history (not strictly required here)
         for r in robots:
             ekf_history[r]["pose"].add(t, ekf.pose[r], ekf.pose_covariance[r])
             ekf_history[r]["bias"].add(t, ekf.bias[r], ekf.bias_covariance[r])
@@ -451,8 +454,15 @@ def main():
             z_agg_center = float(z_corr)
             rel = float(meta["reliability"])
 
-            # pre‑gate using predicted S with current R_eff
-            accepted = True
+            # EIG pre‑gate: drop updates that promise negligible reduction in Tr(P)
+            eig_gain = 0.0
+            try:
+                from numpy.linalg import inv
+                P_pred_local_eig = inv(tf.J)
+                eig_gain = expected_trace_reduction(tf.mu, P_pred_local_eig, eff_sensor_pos, float(R_eff))
+            except Exception:
+                pass
+            accepted = (args.min_eig_gain <= 0.0) or (eig_gain >= float(args.min_eig_gain))
             if tuner is not None:
                 h0, H = tf._range_linearize(tf.mu, eff_sensor_pos)
                 from numpy.linalg import inv
@@ -460,7 +470,7 @@ def main():
                 S_pred = float((H @ P_pred_local @ H.T)[0, 0] + R_eff)
                 nu_pred = float(z_corr - h0)
                 gate_sigma = float(tuner.get_gate_sigma(link))
-                accepted = float((nu_pred * nu_pred) / S_pred) <= gate_sigma * gate_sigma
+                accepted = accepted and (float((nu_pred * nu_pred) / S_pred) <= gate_sigma * gate_sigma)
                 tuner.after_gating(link, accepted=accepted)
 
             upd = tf.correct(z_agg_center, float(R_eff), tracker_pos=eff_sensor_pos) if accepted else {"used": False}

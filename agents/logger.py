@@ -13,6 +13,7 @@ from swarm_ml.distrib_ci import GossipFuser, CommsConfig
 from swarm_ml.evaluation_swarm import evaluate_and_save
 from swarm_ml.features import se_translation_from_matrix
 from swarm_ml.planning import suggest_vantage_moves, suggest_vantage_moves_eig
+from swarm_ml.active_sensing import expected_trace_reduction
 
 def _load_fusionnet(path_dir: str):
     import os, json, torch
@@ -48,6 +49,11 @@ def main():
     ap.add_argument("--ci_objective", choices=["logdet","trace"], default="logdet")
     ap.add_argument("--ci_grid", type=float, default=0.1)
     ap.add_argument("--rounds", type=int, default=3, help="gossip rounds if --method=gossip")
+    ap.add_argument("--budget_k", type=int, default=None,
+                    help="If set, fuse only the top‑k trackers per timestamp "
+                         "(by FusionNet weight if available, else by A‑opt info gain).")
+    ap.add_argument("--sharpen", type=float, default=0.0,
+                    help="J sharpening factor for gossip CI (0..0.3). 0=off. Raises NEES toward 1.0 without moving μ.")
     ap.add_argument("--fusionnet_dir", default=None, help="Required if --method learned")
     ap.add_argument("--out", default="outputs_decentralized")
     ap.add_argument("--timeout_ms", type=int, default=300, help="Fuse if not all trackers arrive within this gap")
@@ -99,7 +105,8 @@ def main():
         # Load FusionNet for gossip method when provided
         fuser.weight_model = _load_fusionnet(args.fusionnet_dir)
         print(f"[LOGGER] Loaded FusionNet for gossip from: {args.fusionnet_dir}")
-    gossip = GossipFuser(CommsConfig(rounds=args.rounds, p_link=1.0, p_drop=0.0, seed=0))
+    gossip = GossipFuser(CommsConfig(rounds=args.rounds, p_link=1.0, p_drop=0.0, seed=0,
+                                     sharpen=args.sharpen))
 
     # UDP receiver
     ip, port = args.udp.split(":")
@@ -157,6 +164,35 @@ def main():
                        for rid, payload in window[tb].items() if "p" in payload}
         r_eff_map   = {rid: float(payload.get("r_eff", 0.35**2))
                        for rid, payload in window[tb].items()}
+
+        # ---- Optional top‑k budgeting (drop low‑value trackers before fusion) ----
+        keep_keys = list(parts.keys())
+        if args.budget_k is not None and len(keep_keys) > args.budget_k:
+            if (fuser.weight_model is not None) and (len(node_feats) > 0):
+                keys = keep_keys
+                X = np.vstack([node_feats[k].reshape(1, -1) for k in keys])
+                w_vec = fuser.weight_model.predict_weights(X)
+                order = np.argsort(-w_vec)[:args.budget_k]
+                keep_keys = [keys[i] for i in order]
+            else:
+                # Rank by one‑step A‑optimal information gain using each node's own posterior
+                gains = []
+                for k in keep_keys:
+                    p = tracker_pos.get(k, None)
+                    R = r_eff_map.get(k, 0.35**2)
+                    if p is None:
+                        gains.append((k, 0.0)); continue
+                    try:
+                        g = expected_trace_reduction(parts[k][0], parts[k][1], p, R)
+                    except Exception:
+                        g = 0.0
+                    gains.append((k, float(max(0.0, g))))
+                keep_keys = [k for k,_ in sorted(gains, key=lambda kv: -kv[1])[:args.budget_k]]
+            # Reduce maps to the selected subset
+            parts       = {k: parts[k]       for k in keep_keys}
+            node_feats  = {k: node_feats[k]  for k in keep_keys if k in node_feats}
+            tracker_pos = {k: tracker_pos[k] for k in keep_keys if k in tracker_pos}
+            r_eff_map   = {k: r_eff_map[k]   for k in keep_keys if k in r_eff_map}
 
         # Assert FusionNet feature dimensionality matches model expectation
         if (args.method == "learned") and (fuser.weight_model is not None):

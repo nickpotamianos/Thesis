@@ -9,6 +9,7 @@ class CommsConfig:
     p_link: float = 1.0    # probability an undirected link exists
     p_drop: float = 0.0    # independent packet drop per edge per round
     seed: int = 0
+    sharpen: float = 0.0   # NEW: optional J "sharpening" (0..0.5) to counter CI over‑conservatism
 
 def _metropolis_weights(A: np.ndarray) -> np.ndarray:
     """Build row-stochastic Metropolis-Hastings weights for undirected graph A."""
@@ -90,7 +91,13 @@ class GossipFuser:
         N = len(keys)
         J_sum = N * J_bar
         h_sum = N * h_bar
-        # Add regularization for numerical stability before inversion
+        
+        # Optional: gently increase information to counter CI conservatism while keeping μ unchanged.
+        sh = float(np.clip(self.cfg.sharpen, 0.0, 0.5))
+        if sh > 0.0:
+            J_sum = (1.0 + sh) * J_sum
+            h_sum = (1.0 + sh) * h_sum
+        # Regularization for numerical stability before inversion
         J_sum_reg = J_sum + 1e-6 * np.eye(J_sum.shape[0])
         P = np.linalg.inv(J_sum_reg)
         mu = P @ h_sum
@@ -106,3 +113,4 @@ class GossipFuser:
             else:
                 w = {k: float(weights.get(k, 0.0)) / s for k in keys}
         return mu, P, w
+

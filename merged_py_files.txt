@@ -1013,6 +1013,7 @@ class CommsConfig:
     p_link: float = 1.0    # probability an undirected link exists
     p_drop: float = 0.0    # independent packet drop per edge per round
     seed: int = 0
+    sharpen: float = 0.0   # NEW: optional J "sharpening" (0..0.5) to counter CI over‑conservatism
 
 def _metropolis_weights(A: np.ndarray) -> np.ndarray:
     """Build row-stochastic Metropolis-Hastings weights for undirected graph A."""
@@ -1094,7 +1095,13 @@ class GossipFuser:
         N = len(keys)
         J_sum = N * J_bar
         h_sum = N * h_bar
-        # Add regularization for numerical stability before inversion
+        
+        # Optional: gently increase information to counter CI conservatism while keeping μ unchanged.
+        sh = float(np.clip(self.cfg.sharpen, 0.0, 0.5))
+        if sh > 0.0:
+            J_sum = (1.0 + sh) * J_sum
+            h_sum = (1.0 + sh) * h_sum
+        # Regularization for numerical stability before inversion
         J_sum_reg = J_sum + 1e-6 * np.eye(J_sum.shape[0])
         P = np.linalg.inv(J_sum_reg)
         mu = P @ h_sum
@@ -1110,6 +1117,7 @@ class GossipFuser:
             else:
                 w = {k: float(weights.get(k, 0.0)) / s for k in keys}
         return mu, P, w
+
 
 
 ### roles.py
@@ -3223,6 +3231,7 @@ from swarm_ml.los_adapter import LOSAdapter, LOSConfig
 from swarm_ml.online_tuner import OnlineTuner, OnlineAdaptConfig
 from swarm_ml.safety import project_to_safe, SafetyLimits
 from swarm_control.bridge import ControlBridge
+from swarm_ml.active_sensing import expected_trace_reduction
 
 def _concat_with_robot(data: dict, key: str) -> pd.DataFrame:
     dfs = []
@@ -3283,8 +3292,10 @@ def main():
     ap.add_argument("--bias_gain", type=float, default=0.6, help="Trust in learned bias (0..1)")
     ap.add_argument("--use_height_tf", action="store_true")
     ap.add_argument("--height_std", type=float, default=0.07)
-    ap.add_argument("--r_floor_blend", type=float, default=0.5,
+    ap.add_argument("--r_floor_blend", type=float, default=0.3,
                     help="Blend factor for soft R floor with pair variance (0..1)")
+    ap.add_argument("--min_eig_gain", type=float, default=0.0,
+                    help="Skip a local update if expected trace reduction is below this threshold (0 disables).")
     # expose influences for quick A/B
     ap.add_argument("--los_influence", type=float, default=0.5)
     ap.add_argument("--geom_influence", type=float, default=0.5)
@@ -3494,7 +3505,7 @@ def main():
             for _, row in hrows.iterrows():
                 ekf.correct({"height": float(row["range"]), "robot": str(row["robot"])})
 
-        # Store EKF state history (not strictly required here)
+                # Store EKF state history (not strictly required here)
         for r in robots:
             ekf_history[r]["pose"].add(t, ekf.pose[r], ekf.pose_covariance[r])
             ekf_history[r]["bias"].add(t, ekf.bias[r], ekf.bias_covariance[r])
@@ -3650,8 +3661,15 @@ def main():
             z_agg_center = float(z_corr)
             rel = float(meta["reliability"])
 
-            # pre‑gate using predicted S with current R_eff
-            accepted = True
+            # EIG pre‑gate: drop updates that promise negligible reduction in Tr(P)
+            eig_gain = 0.0
+            try:
+                from numpy.linalg import inv
+                P_pred_local_eig = inv(tf.J)
+                eig_gain = expected_trace_reduction(tf.mu, P_pred_local_eig, eff_sensor_pos, float(R_eff))
+            except Exception:
+                pass
+            accepted = (args.min_eig_gain <= 0.0) or (eig_gain >= float(args.min_eig_gain))
             if tuner is not None:
                 h0, H = tf._range_linearize(tf.mu, eff_sensor_pos)
                 from numpy.linalg import inv
@@ -3659,7 +3677,7 @@ def main():
                 S_pred = float((H @ P_pred_local @ H.T)[0, 0] + R_eff)
                 nu_pred = float(z_corr - h0)
                 gate_sigma = float(tuner.get_gate_sigma(link))
-                accepted = float((nu_pred * nu_pred) / S_pred) <= gate_sigma * gate_sigma
+                accepted = accepted and (float((nu_pred * nu_pred) / S_pred) <= gate_sigma * gate_sigma)
                 tuner.after_gating(link, accepted=accepted)
 
             upd = tf.correct(z_agg_center, float(R_eff), tracker_pos=eff_sensor_pos) if accepted else {"used": False}
@@ -3772,7 +3790,6 @@ def main():
 if __name__ == "__main__":
     main()
 
-
 ### logger.py
 # agent/logger.py
 import argparse, time, collections, json, os
@@ -3789,6 +3806,7 @@ from swarm_ml.distrib_ci import GossipFuser, CommsConfig
 from swarm_ml.evaluation_swarm import evaluate_and_save
 from swarm_ml.features import se_translation_from_matrix
 from swarm_ml.planning import suggest_vantage_moves, suggest_vantage_moves_eig
+from swarm_ml.active_sensing import expected_trace_reduction
 
 def _load_fusionnet(path_dir: str):
     import os, json, torch
@@ -3824,6 +3842,11 @@ def main():
     ap.add_argument("--ci_objective", choices=["logdet","trace"], default="logdet")
     ap.add_argument("--ci_grid", type=float, default=0.1)
     ap.add_argument("--rounds", type=int, default=3, help="gossip rounds if --method=gossip")
+    ap.add_argument("--budget_k", type=int, default=None,
+                    help="If set, fuse only the top‑k trackers per timestamp "
+                         "(by FusionNet weight if available, else by A‑opt info gain).")
+    ap.add_argument("--sharpen", type=float, default=0.0,
+                    help="J sharpening factor for gossip CI (0..0.3). 0=off. Raises NEES toward 1.0 without moving μ.")
     ap.add_argument("--fusionnet_dir", default=None, help="Required if --method learned")
     ap.add_argument("--out", default="outputs_decentralized")
     ap.add_argument("--timeout_ms", type=int, default=300, help="Fuse if not all trackers arrive within this gap")
@@ -3875,7 +3898,8 @@ def main():
         # Load FusionNet for gossip method when provided
         fuser.weight_model = _load_fusionnet(args.fusionnet_dir)
         print(f"[LOGGER] Loaded FusionNet for gossip from: {args.fusionnet_dir}")
-    gossip = GossipFuser(CommsConfig(rounds=args.rounds, p_link=1.0, p_drop=0.0, seed=0))
+    gossip = GossipFuser(CommsConfig(rounds=args.rounds, p_link=1.0, p_drop=0.0, seed=0,
+                                     sharpen=args.sharpen))
 
     # UDP receiver
     ip, port = args.udp.split(":")
@@ -3933,6 +3957,35 @@ def main():
                        for rid, payload in window[tb].items() if "p" in payload}
         r_eff_map   = {rid: float(payload.get("r_eff", 0.35**2))
                        for rid, payload in window[tb].items()}
+
+        # ---- Optional top‑k budgeting (drop low‑value trackers before fusion) ----
+        keep_keys = list(parts.keys())
+        if args.budget_k is not None and len(keep_keys) > args.budget_k:
+            if (fuser.weight_model is not None) and (len(node_feats) > 0):
+                keys = keep_keys
+                X = np.vstack([node_feats[k].reshape(1, -1) for k in keys])
+                w_vec = fuser.weight_model.predict_weights(X)
+                order = np.argsort(-w_vec)[:args.budget_k]
+                keep_keys = [keys[i] for i in order]
+            else:
+                # Rank by one‑step A‑optimal information gain using each node's own posterior
+                gains = []
+                for k in keep_keys:
+                    p = tracker_pos.get(k, None)
+                    R = r_eff_map.get(k, 0.35**2)
+                    if p is None:
+                        gains.append((k, 0.0)); continue
+                    try:
+                        g = expected_trace_reduction(parts[k][0], parts[k][1], p, R)
+                    except Exception:
+                        g = 0.0
+                    gains.append((k, float(max(0.0, g))))
+                keep_keys = [k for k,_ in sorted(gains, key=lambda kv: -kv[1])[:args.budget_k]]
+            # Reduce maps to the selected subset
+            parts       = {k: parts[k]       for k in keep_keys}
+            node_feats  = {k: node_feats[k]  for k in keep_keys if k in node_feats}
+            tracker_pos = {k: tracker_pos[k] for k in keep_keys if k in tracker_pos}
+            r_eff_map   = {k: r_eff_map[k]   for k in keep_keys if k in r_eff_map}
 
         # Assert FusionNet feature dimensionality matches model expectation
         if (args.method == "learned") and (fuser.weight_model is not None):
@@ -4117,7 +4170,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 ### __init__.py
 # agents module
