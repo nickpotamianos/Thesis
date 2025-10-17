@@ -17,3 +17,5 @@ outputs_*
 *.pdf
 *.log
 /runs
+.venv_svg/
+.venv

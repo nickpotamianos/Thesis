@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg width="1040" height="880" viewBox="0 0 1040 880" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .title { font: 600 26px 'Helvetica Neue', Arial, sans-serif; fill: #111; }
+      .subtitle { font: 400 15px 'Helvetica Neue', Arial, sans-serif; fill: #444; }
+      .stage { fill: #f7f7f9; stroke: #c9cad0; stroke-width: 1.1; rx: 18; }
+      .stage-title { font: 600 16px 'Helvetica Neue', Arial, sans-serif; fill: #111; }
+      .chip { fill: #fff; stroke: #555; stroke-width: 1; rx: 14; }
+      .chip-text { font: 500 13px 'Helvetica Neue', Arial, sans-serif; fill: #111; text-anchor: middle; }
+    </style>
+  </defs>
+
+  <rect x="30" y="70" width="980" height="770" rx="26" fill="#fbfbfd" stroke="#dcdde3" stroke-width="1" />
+  <text x="60" y="48" class="title">Swarm Tracking System Architecture</text>
+  <text x="60" y="68" class="subtitle">High-level flow from experiment data to decentralized operation</text>
+
+  <!-- Stage 1 -->
+  <g transform="translate(60, 110)">
+    <rect width="940" height="90" class="stage" />
+    <text x="30" y="32" class="stage-title">Stage 1 - Data &amp; Sensor Inputs</text>
+    <g transform="translate(0, 46)">
+      <rect x="80" y="0" width="180" height="44" class="chip" />
+      <text x="170" y="26" class="chip-text">MILUV Catalog</text>
+      <rect x="300" y="0" width="180" height="44" class="chip" />
+      <text x="390" y="26" class="chip-text">UWB Ranges</text>
+      <rect x="520" y="0" width="180" height="44" class="chip" />
+      <text x="610" y="26" class="chip-text">IMU / Height</text>
+      <rect x="740" y="0" width="180" height="44" class="chip" />
+      <text x="830" y="26" class="chip-text">Ground Truth</text>
+    </g>
+  </g>
+
+  <!-- Stage 2 -->
+  <g transform="translate(60, 230)">
+    <rect width="940" height="90" class="stage" />
+    <text x="30" y="32" class="stage-title">Stage 2 - Baseline EKF Stack</text>
+    <g transform="translate(0, 46)">
+      <rect x="80" y="0" width="180" height="44" class="chip" />
+      <text x="170" y="26" class="chip-text">State Alignment</text>
+      <rect x="300" y="0" width="180" height="44" class="chip" />
+      <text x="390" y="26" class="chip-text">IMU Propagation</text>
+      <rect x="520" y="0" width="180" height="44" class="chip" />
+      <text x="610" y="26" class="chip-text">UWB Innovations</text>
+      <rect x="740" y="0" width="180" height="44" class="chip" />
+      <text x="830" y="26" class="chip-text">Baseline CI Fusion</text>
+    </g>
+  </g>
+
+  <!-- Stage 3 -->
+  <g transform="translate(60, 350)">
+    <rect width="940" height="90" class="stage" />
+    <text x="30" y="32" class="stage-title">Stage 3 - Machine Learning Enhancements</text>
+    <g transform="translate(0, 46)">
+      <rect x="80" y="0" width="180" height="44" class="chip" />
+      <text x="170" y="26" class="chip-text">BiasNet Calibration</text>
+      <rect x="300" y="0" width="180" height="44" class="chip" />
+      <text x="390" y="26" class="chip-text">Feature Builder</text>
+      <rect x="520" y="0" width="180" height="44" class="chip" />
+      <text x="610" y="26" class="chip-text">FusionNet Weights</text>
+      <rect x="740" y="0" width="180" height="44" class="chip" />
+      <text x="830" y="26" class="chip-text">Online Tuner</text>
+    </g>
+  </g>
+
+  <!-- Stage 4 -->
+  <g transform="translate(60, 470)">
+    <rect width="940" height="90" class="stage" />
+    <text x="30" y="32" class="stage-title">Stage 4 - Distributed Target Tracking</text>
+    <g transform="translate(0, 46)">
+      <rect x="80" y="0" width="180" height="44" class="chip" />
+      <text x="170" y="26" class="chip-text">Tracker Filters</text>
+      <rect x="300" y="0" width="180" height="44" class="chip" />
+      <text x="390" y="26" class="chip-text">Shared Features</text>
+      <rect x="520" y="0" width="180" height="44" class="chip" />
+      <text x="610" y="26" class="chip-text">Quality Monitors</text>
+      <rect x="740" y="0" width="180" height="44" class="chip" />
+      <text x="830" y="26" class="chip-text">Tracker Budget</text>
+    </g>
+  </g>
+
+  <!-- Stage 5 -->
+  <g transform="translate(60, 590)">
+    <rect width="940" height="90" class="stage" />
+    <text x="30" y="32" class="stage-title">Stage 5 - Fusion &amp; Evaluation</text>
+    <g transform="translate(0, 46)">
+      <rect x="80" y="0" width="180" height="44" class="chip" />
+      <text x="170" y="26" class="chip-text">ML CI Fusion</text>
+      <rect x="300" y="0" width="180" height="44" class="chip" />
+      <text x="390" y="26" class="chip-text">Cross-Validation</text>
+      <rect x="520" y="0" width="180" height="44" class="chip" />
+      <text x="610" y="26" class="chip-text">Single-k Ablations</text>
+      <rect x="740" y="0" width="180" height="44" class="chip" />
+      <text x="830" y="26" class="chip-text">Metric Reports</text>
+    </g>
+  </g>
+
+  <!-- Stage 6 -->
+  <g transform="translate(60, 710)">
+    <rect width="940" height="90" class="stage" />
+    <text x="30" y="32" class="stage-title">Stage 6 - Decentralized Execution</text>
+    <g transform="translate(0, 46)">
+      <rect x="80" y="0" width="180" height="44" class="chip" />
+      <text x="170" y="26" class="chip-text">Consensus CI</text>
+      <rect x="300" y="0" width="180" height="44" class="chip" />
+      <text x="390" y="26" class="chip-text">UDP Broadcast</text>
+      <rect x="520" y="0" width="180" height="44" class="chip" />
+      <text x="610" y="26" class="chip-text">Active Sensing</text>
+      <rect x="740" y="0" width="180" height="44" class="chip" />
+      <text x="830" y="26" class="chip-text">Decentralized Outputs</text>
+    </g>
+  </g>
+</svg>

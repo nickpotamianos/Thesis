@@ -38,7 +38,7 @@ except Exception:
     import imu_three_robots_models as model  # fallback to local path if exported
 
 # ---- Our modules (new) ----
-from swarm_ml.roles import get_roles
+from swarm_ml.roles import get_roles, Roles
 from swarm_ml.features import se_translation_from_matrix, build_measurement_features
 from swarm_ml.measure_adapter import MeasureAdapter, AdapterConfig
 from swarm_ml.target_filter import TargetIF, IFConfig
@@ -138,17 +138,44 @@ def main(args):
         mag=False
     )
     data = miluv.data
-    robots = list(data.keys())
+    all_robots = list(data.keys())
+
+    requested_robots = None
+    if getattr(args, "robots", None):
+        requested_robots = {r.strip() for r in args.robots.split(",") if r.strip()}
+        if args.target:
+            requested_robots.add(args.target)
+
+    robots = [r for r in all_robots if (requested_robots is None or r in requested_robots)]
+    if args.target and args.target not in robots:
+        raise ValueError(
+            f"Target '{args.target}' must be included in active robot set; active={robots}"
+        )
+
+    inactive = sorted(set(all_robots) - set(robots))
+    print(f"[SWARM] Active robots: {robots}")
+    if inactive:
+        print(f"[SWARM] Ignoring robots: {inactive}")
 
     # Inter-robot UWB ranges + (optional) height
     uwb_range = _concat_with_robot(data, "uwb_range")
     height_df = _concat_with_robot(data, "height") if (args.use_height or args.use_height_tf) else pd.DataFrame(columns=["timestamp"])
 
+    if requested_robots is not None:
+        if "robot" in uwb_range.columns and not uwb_range.empty:
+            uwb_range = uwb_range[uwb_range["robot"].isin(robots)].reset_index(drop=True)
+        if "robot" in height_df.columns and not height_df.empty:
+            height_df = height_df[height_df["robot"].isin(robots)].reset_index(drop=True)
+
     # Query timestamps (union of UWB and height times)
-    query_timestamps = np.sort(np.unique(np.append(
-        uwb_range["timestamp"].to_numpy(),
-        height_df["timestamp"].to_numpy() if not height_df.empty else np.array([], dtype=float)
-    )))
+    query_timestamps = np.sort(
+        np.unique(
+            np.append(
+                uwb_range["timestamp"].to_numpy(),
+                height_df["timestamp"].to_numpy() if not height_df.empty else np.array([], dtype=float),
+            )
+        )
+    )
 
     # IMU at query timestamps (authors' API)
     imu_at_q = {
@@ -186,11 +213,16 @@ def main(args):
     ekf = model.EKF(
         {robot: gt_se23[robot][0] for robot in robots},  # authors' initialization from GT
         miluv.anchors,
-        miluv.tag_moment_arms
+        miluv.tag_moment_arms,
     )
 
     # ----------------- Our swarm setup -----------------
     roles = get_roles(exp_name, robots, default_target=args.target, uwb_range_df=uwb_range)
+    if args.fixed_tracker is not None:
+        if args.fixed_tracker not in roles.trackers:
+            raise ValueError(f"Requested fixed tracker '{args.fixed_tracker}' not available; trackers={roles.trackers}")
+        roles = Roles(target=roles.target, trackers=[args.fixed_tracker], tag_ids_by_robot=roles.tag_ids_by_robot)
+        print(f"[SWARM] Fixed tracker enforced: {roles.trackers[0]}")
     print(f"[SWARM] Target: {roles.target}; Trackers: {roles.trackers}")
 
     # Infer tag IDs per robot for proper tracker↔target filtering
@@ -756,6 +788,30 @@ def main(args):
     gt_tgt_pos = np.array([se_translation_from_matrix(T) for T in gt_se23[roles.target]])
     rm, nees_val = evaluate_and_save(np.array(mu_star_seq), np.array(P_star_seq), gt_tgt_pos, out_dir)
 
+    tracker_rows = []
+    for trk in roles.trackers:
+        ts_hist, pose_hist, _ = ekf_history[trk]["pose"].get()
+        gt_hist = gt_se23.get(trk)
+        if gt_hist is None or pose_hist.shape[0] == 0 or len(gt_hist) != pose_hist.shape[0]:
+            print(f"[SWARM] Warning: tracker {trk} pose history mismatch (est={pose_hist.shape[0]}, gt={len(gt_hist) if gt_hist is not None else 0})")
+            continue
+        est_pos = np.array([se_translation_from_matrix(T) for T in pose_hist])
+        gt_pos = np.array([se_translation_from_matrix(T) for T in gt_hist])
+        err = est_pos - gt_pos
+        rmse_xyz = np.sqrt(np.mean(err**2, axis=0))
+        rmse_3d = np.sqrt(np.mean(np.sum(err**2, axis=1)))
+        row = {
+            "tracker": trk,
+            "rmse_x": float(rmse_xyz[0]),
+            "rmse_y": float(rmse_xyz[1]),
+            "rmse_z": float(rmse_xyz[2]),
+            "rmse_3d": float(rmse_3d),
+        }
+        tracker_rows.append(row)
+        print(f"[SWARM] Tracker {trk} RMSE (m): {{'rmse_x': {row['rmse_x']}, 'rmse_y': {row['rmse_y']}, 'rmse_z': {row['rmse_z']}, 'rmse_3d': {row['rmse_3d']}}}")
+    if tracker_rows:
+        pd.DataFrame(tracker_rows).to_csv(os.path.join(out_dir, "tracker_summary.csv"), index=False)
+
     with open(os.path.join(out_dir, "roles.json"), "w") as f:
         json.dump({
             "target": roles.target,
@@ -846,6 +902,11 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--exp", required=True, help="Experiment name, e.g., default_3_random_0")
     p.add_argument("--target", default=None, help="Robot id to treat as target (default: last in sort)")
+    p.add_argument(
+        "--robots",
+        default=None,
+        help="Comma-separated list of robot ids to include in the EKF (target will be auto-included if missing)",
+    )
     p.add_argument("--use_height", action="store_true", help="Include height correction in authors' EKF")
     p.add_argument("--use_height_tf", action="store_true", help="Use PX4 height to update the target filter (z-only)")
     p.add_argument("--height_std", type=float, default=0.07, help="Std dev (m) of PX4 height per sensor; used for R_h")
@@ -899,6 +960,8 @@ if __name__ == "__main__":
     p.add_argument("--comm_seed", type=int, default=0, help="Seed for comms graph randomness")
     p.add_argument("--budget_k", type=int, default=None,
                    help="If set, only the top-k trackers (by FusionNet weight or reliability) update and fuse")
+    p.add_argument("--fixed_tracker", default=None,
+                   help="If set, restrict the run to this tracker id for the entire experiment")
     p.add_argument("--planner", choices=["heuristic","eig"], default="heuristic")
     p.add_argument("--control_mode", choices=["none","sim","mavsdk"], default="none")
     p.add_argument("--control_rate", type=int, default=5)

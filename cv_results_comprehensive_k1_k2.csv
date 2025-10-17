@@ -1,0 +1,5 @@
+scenario,Method,Budget_K,RMSE_3D_Mean,RMSE_3D_Std,RMSE_CI_Lower,RMSE_CI_Upper,NEES_Mean,NEES_Std,N_Folds
+Baseline_Grid_K1,Baseline,1,1.074,0.5735,0.6491,1.4989,1.7226,0.763,7
+Baseline_Grid,Baseline,2,1.0712,0.7652,0.5043,1.6381,1.7942,1.323,7
+BiasNet+FusionNet_ByExp_K1,BiasNet+FusionNet,1,1.0569,0.5895,0.6202,1.4936,1.7151,0.7711,7
+BiasNet+FusionNet_ByExp,BiasNet+FusionNet,2,0.8882,0.6873,0.379,1.3974,1.337,0.7919,7
